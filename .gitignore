@@ -4,4 +4,4 @@ __pycache__/
 *.m3u
 .env
 *.log
-'@ | Out-File -Encoding utf8 .gitignore
+Out-File -Encoding utf8 .gitignore
