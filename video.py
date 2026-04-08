@@ -1,18 +1,21 @@
+"""
+video.py - FastAPI uygulama
+Her endpoint state modulunu kullanir (server.py ile ayni state).
+"""
 import os
 import sqlite3
-import logging
 import threading
 
 from fastapi import FastAPI, Request, Query, HTTPException
-from fastapi.responses import PlainTextResponse, RedirectResponse, JSONResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse
 
-DB_PATH = os.environ.get("DB_PATH", "/tmp/vxparser.db")
+import state
 
-app = FastAPI(title="VxParser IPTV Proxy", version="5.0.0")
+app = FastAPI(title="VxParser IPTV Proxy", version="6.0.0")
 
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(state.DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -23,17 +26,18 @@ def get_base_host(request: Request) -> str:
     return f"{proto}://{host}"
 
 
+# ============================================================
+# DURUM
+# ============================================================
+
 @app.get("/")
 async def root():
-    import server
     return {
-        "status": "ready" if server.DATA_READY else "loading",
-        "error": server.STARTUP_ERROR,
-        "load_time": round(server.LOAD_TIME, 1) if server.DATA_READY else None,
-        "message": (
-            "Hazir!" if server.DATA_READY
-            else "Kanallar yukleniyor, 30-60sn bekle..."
-        ),
+        "status": "ready" if state.DATA_READY else "loading",
+        "error": state.STARTUP_ERROR,
+        "load_time": round(state.LOAD_TIME, 1) if state.DATA_READY else None,
+        "message": "Hazir!" if state.DATA_READY else "Kanallar yukleniyor, 30-60sn bekle...",
+        "logs_count": len(state.STARTUP_LOGS),
     }
 
 
@@ -43,28 +47,28 @@ async def health():
 
 
 # ============================================================
-# DEBUG - Baslangic loglarini goster
+# DEBUG - Adim adim loglar
 # ============================================================
 
 @app.get("/debug")
 async def debug():
-    """Startup loglarini goster - hata ayiklama icin"""
-    import server
     return {
-        "data_ready": server.DATA_READY,
-        "error": server.STARTUP_ERROR,
-        "vavoo_token": bool(server._vavoo_sig),
-        "lokke_token": bool(server._watched_sig),
-        "startup_logs": server.STARTUP_LOGS,
+        "data_ready": state.DATA_READY,
+        "error": state.STARTUP_ERROR,
+        "vavoo_token": bool(state._vavoo_sig),
+        "lokke_token": bool(state._watched_sig),
+        "startup_logs": state.STARTUP_LOGS,
+        "db_path": state.DB_PATH,
     }
 
 
 # ============================================================
-# CHANNEL RESOLVE - 3 yontemli
+# CHANNEL RESOLVE
 # ============================================================
 
 @app.get("/channel/{sid}")
 async def channel(sid: str):
+    # server modulunu import et (main thread olarak)
     import server
     resolved = server.resolve_channel(sid)
     if resolved:
@@ -91,8 +95,7 @@ async def get_playlist(
     c.execute(
         "SELECT c.lid, c.name, c.url, c.hls, c.logo, "
         "COALESCE(cat.name, 'Sonstige') as group_name "
-        "FROM channels c "
-        "LEFT JOIN categories cat ON c.cid = cat.cid "
+        "FROM channels c LEFT JOIN categories cat ON c.cid = cat.cid "
         "ORDER BY COALESCE(cat.sort_order, 9999), c.name"
     )
     channels = c.fetchall()
@@ -105,10 +108,7 @@ async def get_playlist(
         group = ch["group_name"]
         name = ch["name"]
         stream_url = f"{host}/channel/{lid}"
-        lines.append(
-            f'#EXTINF:-1 tvg-id="{lid}" tvg-logo="{logo}" '
-            f'group-title="{group}",{name}'
-        )
+        lines.append(f'#EXTINF:-1 tvg-id="{lid}" tvg-logo="{logo}" group-title="{group}",{name}')
         lines.append(stream_url)
 
     return PlainTextResponse(content="\n".join(lines), media_type="audio/x-mpegurl")
@@ -159,11 +159,8 @@ async def player_api(
         cats = c.fetchone()[0]
         conn.close()
         return {
-            "user_info": {
-                "username": username, "status": "Active",
-                "exp_date": "2099-01-01", "max_connections": 1,
-            },
-            "server_info": {"port": os.environ.get("PORT", "10000")},
+            "user_info": {"username": username, "status": "Active", "exp_date": "2099-01-01", "max_connections": 1},
+            "server_info": {"port": str(state.PORT)},
             "available_channels": total,
             "available_categories": cats,
         }
@@ -175,20 +172,20 @@ async def player_api(
 
 @app.get("/reload")
 async def reload_channels():
-    import server
-    server.DATA_READY = False
-    server.STARTUP_ERROR = None
-    server.STARTUP_LOGS.clear()
+    state.DATA_READY = False
+    state.STARTUP_ERROR = None
+    state.STARTUP_LOGS.clear()
 
     def do_reload():
+        import server
         try:
             server.init_db()
             server.fetch_vavoo_channels()
             server.fetch_hls_links()
             server.remap_groups()
-            server.DATA_READY = True
+            state.DATA_READY = True
         except Exception as e:
-            server.STARTUP_ERROR = str(e)
+            state.STARTUP_ERROR = str(e)
 
     threading.Thread(target=do_reload, daemon=True).start()
     return {"status": "reloading", "message": "Yukleniyor... 30-60sn bekle"}
@@ -200,7 +197,6 @@ async def reload_channels():
 
 @app.get("/stats")
 async def stats():
-    import server
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM channels")
@@ -221,9 +217,9 @@ async def stats():
         "total_channels": total,
         "total_categories": cats,
         "hls_channels": hls_count,
-        "vavoo_token": bool(server._vavoo_sig),
-        "lokke_token": bool(server._watched_sig),
-        "error": server.STARTUP_ERROR,
+        "vavoo_token": bool(state._vavoo_sig),
+        "lokke_token": bool(state._watched_sig),
+        "error": state.STARTUP_ERROR,
         "groups": groups,
-        "data_ready": server.DATA_READY,
+        "data_ready": state.DATA_READY,
     }
