@@ -265,7 +265,7 @@ def fetch_vavoo_channels():
         if not name_clean:
             continue
 
-        c.execute("INSERT OR REPLACE INTO channels(name,grp,cid,logo,url,hls,sort_order) VALUES(?,?,0,?,?,9999)", (name_clean, ch.get("group", ""), logo, url))
+        c.execute("INSERT OR REPLACE INTO channels(name,grp,cid,logo,url,hls,sort_order) VALUES(?,?,?,?,?,?,?)", (name_clean, ch.get("group", ""), 0, logo, url, "", 9999))
         added += 1
         if is_tr:
             tr_count += 1
