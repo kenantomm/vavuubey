@@ -4,12 +4,11 @@ import logging
 import threading
 
 from fastapi import FastAPI, Request, Query, HTTPException
-from fastapi.responses import PlainTextResponse, RedirectResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse, JSONResponse
 
 DB_PATH = os.environ.get("DB_PATH", "/tmp/vxparser.db")
-M3U_PATH = os.environ.get("M3U_PATH", "/tmp/playlist.m3u")
 
-app = FastAPI(title="VxParser IPTV Proxy", version="4.0.0")
+app = FastAPI(title="VxParser IPTV Proxy", version="5.0.0")
 
 
 def get_db():
@@ -19,11 +18,6 @@ def get_db():
 
 
 def get_base_host(request: Request) -> str:
-    """
-    Request'ten otomatik host URL'si al.
-    Render, localhost, her yerde calisir.
-    X-Forwarded-Proto + Host header'i kullanir.
-    """
     proto = request.headers.get("x-forwarded-proto", "https")
     host = request.headers.get("host", "localhost:10000")
     return f"{proto}://{host}"
@@ -49,6 +43,23 @@ async def health():
 
 
 # ============================================================
+# DEBUG - Baslangic loglarini goster
+# ============================================================
+
+@app.get("/debug")
+async def debug():
+    """Startup loglarini goster - hata ayiklama icin"""
+    import server
+    return {
+        "data_ready": server.DATA_READY,
+        "error": server.STARTUP_ERROR,
+        "vavoo_token": bool(server._vavoo_sig),
+        "lokke_token": bool(server._watched_sig),
+        "startup_logs": server.STARTUP_LOGS,
+    }
+
+
+# ============================================================
 # CHANNEL RESOLVE - 3 yontemli
 # ============================================================
 
@@ -62,7 +73,7 @@ async def channel(sid: str):
 
 
 # ============================================================
-# M3U PLAYLIST - HOST OTOMATIK ALINIR!
+# M3U PLAYLIST
 # ============================================================
 
 @app.get("/get.php")
@@ -73,7 +84,6 @@ async def get_playlist(
     type: str = Query("m3u_plus"),
     output: str = Query("m3u_plus"),
 ):
-    # HOST'U OTOMATIK AL - environment variable GEREKMEZ!
     host = get_base_host(request)
 
     conn = get_db()
@@ -94,10 +104,7 @@ async def get_playlist(
         logo = ch["logo"] or ""
         group = ch["group_name"]
         name = ch["name"]
-
-        # HER ZAMAN TAM URL: https://vavuubey.onrender.com/channel/123
         stream_url = f"{host}/channel/{lid}"
-
         lines.append(
             f'#EXTINF:-1 tvg-id="{lid}" tvg-logo="{logo}" '
             f'group-title="{group}",{name}'
@@ -163,43 +170,6 @@ async def player_api(
 
 
 # ============================================================
-# M3U DOSYA INDIRME - HOST OTOMATIK
-# ============================================================
-
-@app.get("/playlist.m3u")
-async def download_playlist(request: Request):
-    host = get_base_host(request)
-
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "SELECT c.name, c.lid, c.logo, "
-        "COALESCE(cat.name, 'Sonstige') as group_name "
-        "FROM channels c LEFT JOIN categories cat ON c.cid = cat.cid "
-        "ORDER BY COALESCE(cat.sort_order, 9999), c.name"
-    )
-    channels = c.fetchall()
-    conn.close()
-
-    lines = ["#EXTM3U"]
-    for ch in channels:
-        logo = ch["logo"] or ""
-        group = ch["group_name"]
-        name = ch["name"]
-        lid = ch["lid"]
-        stream_url = f"{host}/channel/{lid}"
-
-        lines.append(f'#EXTINF:-1 tvg-logo="{logo}" group-title="{group}",{name}')
-        lines.append(stream_url)
-
-    return PlainTextResponse(
-        content="\n".join(lines),
-        media_type="audio/x-mpegurl",
-        headers={"Content-Disposition": "attachment; filename=playlist.m3u"},
-    )
-
-
-# ============================================================
 # RELOAD
 # ============================================================
 
@@ -208,6 +178,7 @@ async def reload_channels():
     import server
     server.DATA_READY = False
     server.STARTUP_ERROR = None
+    server.STARTUP_LOGS.clear()
 
     def do_reload():
         try:
@@ -215,7 +186,6 @@ async def reload_channels():
             server.fetch_vavoo_channels()
             server.fetch_hls_links()
             server.remap_groups()
-            server.generate_m3u_static()
             server.DATA_READY = True
         except Exception as e:
             server.STARTUP_ERROR = str(e)
@@ -253,6 +223,7 @@ async def stats():
         "hls_channels": hls_count,
         "vavoo_token": bool(server._vavoo_sig),
         "lokke_token": bool(server._watched_sig),
+        "error": server.STARTUP_ERROR,
         "groups": groups,
         "data_ready": server.DATA_READY,
     }

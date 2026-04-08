@@ -6,12 +6,15 @@ import random
 import time
 import re
 import base64
-import ssl
 import logging
 import threading
 import traceback
 
 import requests
+import urllib3
+
+# SSL UYARILARINI KAPAT - Vavoo SSL sertifikasi sorunlu olabilir
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,6 +30,15 @@ DATA_READY = False
 STARTUP_ERROR = None
 LOAD_TIME = 0
 
+# Startup loglarini kaydet (debug icin)
+STARTUP_LOGS = []
+
+def slog(msg):
+    """Log yaz ve STARTUP_LOGS'a ekle"""
+    log.info(msg)
+    STARTUP_LOGS.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+
+
 # ============================================================
 # 1. STANDART VAVOO TOKEN (ping2)
 # ============================================================
@@ -39,34 +51,40 @@ def get_auth_signature():
     if _vavoo_sig and (time.time() - _vavoo_sig_time) < 1800:
         return _vavoo_sig
 
-    log.info("Vavoo Token (ping2) aliniyor...")
+    slog("Vavoo Token (ping2) aliniyor...")
     headers = {"User-Agent": "VAVOO/2.6", "Accept": "application/json"}
     try:
+        # veclist cek
         vec_req = requests.get(
             "http://mastaaa1987.github.io/repo/veclist.json",
-            headers=headers,
-            timeout=10,
+            headers=headers, timeout=10, verify=False,
         )
         veclist = vec_req.json()["value"]
+        slog(f"veclist: {len(veclist)} vec yuklendi")
+
         sig = None
-        for _ in range(5):
+        for attempt in range(5):
             vec = {"vec": random.choice(veclist)}
             req = requests.post(
                 "https://www.vavoo.tv/api/box/ping2",
-                data=vec,
-                headers=headers,
-                timeout=10,
+                data=vec, headers=headers, timeout=10, verify=False,
             ).json()
             if req.get("signed"):
                 sig = req["signed"]
+                slog("Vavoo Token alindi!")
                 break
+            else:
+                slog(f"ping2 deneme {attempt+1}: signed yok, cevap={list(req.keys())}")
+
         if sig:
             _vavoo_sig = sig
             _vavoo_sig_time = time.time()
-            log.info("Vavoo Token alindi!")
             return sig
+        else:
+            slog("Vavoo Token ALINAMADI! (5 deneme basarisiz)")
+
     except Exception as e:
-        log.error("Vavoo Token hatasi: %s", e)
+        slog(f"Vavoo Token HATASI: {e}")
     return None
 
 
@@ -82,7 +100,7 @@ def get_watchedsig():
     if _watched_sig and (time.time() - _watched_sig_time) < 1800:
         return _watched_sig
 
-    log.info("Lokke Imza (app/ping) aliniyor...")
+    slog("Lokke Imza (app/ping) aliniyor...")
     headers = {
         "user-agent": "okhttp/4.11.0",
         "accept": "application/json",
@@ -108,17 +126,19 @@ def get_watchedsig():
     try:
         resp = requests.post(
             "https://www.lokke.app/api/app/ping",
-            json=data, headers=headers, timeout=15,
+            json=data, headers=headers, timeout=15, verify=False,
         )
         result = resp.json()
         sig = result.get("addonSig")
         if sig:
             _watched_sig = sig
             _watched_sig_time = time.time()
-            log.info("Lokke Imzasi alindi!")
+            slog("Lokke Imzasi alindi!")
             return sig
+        else:
+            slog(f"Lokke cevap={list(result.keys())} (addonSig yok)")
     except Exception as e:
-        log.error("Lokke Imza Hatasi: %s", e)
+        slog(f"Lokke Imza HATASI: {e}")
     return None
 
 
@@ -140,13 +160,13 @@ def resolve_hls_link(link):
     try:
         r = requests.post(
             "https://vavoo.to/mediahubmx-resolve.json",
-            json=data, headers=headers, timeout=15,
+            json=data, headers=headers, timeout=15, verify=False,
         )
         result = r.json()
         if result and len(result) > 0:
             return result[0].get("url")
     except Exception as e:
-        log.error("Link cozumleme hatasi: %s", e)
+        log.error("Resolve hatasi: %s", e)
     return None
 
 
@@ -161,7 +181,6 @@ def resolve_channel(lid):
     c.execute("SELECT * FROM channels WHERE lid=?", (lid,))
     ch = c.fetchone()
     conn.close()
-
     if not ch:
         return None
 
@@ -169,26 +188,22 @@ def resolve_channel(lid):
     url = ch["url"]
     hls = ch["hls"]
 
-    # YONTEM 1: HLS + Lokke
+    # Y1: HLS + Lokke
     if hls:
-        log.info("[Y1] HLS: %s", name)
         resolved = resolve_hls_link(hls)
         if resolved:
             return resolved
 
-    # YONTEM 2: Standart Token
+    # Y2: Standart Token
     if url:
-        log.info("[Y2] Auth: %s", name)
         sig = get_auth_signature()
         if sig:
             sep = "&" if "?" in url else "?"
             return url + sep + "n=1&b=5&vavoo_auth=" + sig
 
-    # YONTEM 3: Direkt URL
+    # Y3: Direkt URL
     if url:
-        log.info("[Y3] Direct: %s", name)
         return url
-
     return None
 
 
@@ -249,7 +264,7 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_ch_cid ON channels(cid)")
     conn.commit()
     conn.close()
-    log.info("DB baslatildi: %s", DB_PATH)
+    slog("DB baslatildi: " + DB_PATH)
 
 
 # ============================================================
@@ -257,34 +272,52 @@ def init_db():
 # ============================================================
 
 def fetch_vavoo_channels():
-    log.info("Vavoo live2 cekiliyor...")
+    slog("Vavoo live2 cekiliyor...")
+
+    # Adim 1: DNS ve baglanti testi
+    try:
+        slog("Baglanti testi: vavoo.to...")
+        test = requests.get("https://www.vavoo.to/", timeout=10, verify=False, headers={"User-Agent": "VAVOO/2.6"})
+        slog(f"vavoo.to erisim basarili! Status={test.status_code}")
+    except Exception as e:
+        slog(f"vavoo.to erisim BASARISIZ: {e}")
+        return False
+
+    # Adim 2: Kanal listesini cek
     try:
         headers = {"User-Agent": "VAVOO/2.6"}
-        resp = requests.get("https://www.vavoo.to/live2/index?output=json", headers=headers, timeout=30)
+        resp = requests.get(
+            "https://www.vavoo.to/live2/index?output=json",
+            headers=headers, timeout=30, verify=False,
+        )
         resp.raise_for_status()
         channel_list = resp.json()
+        slog(f"Kanal listesi alindi: {len(channel_list) if isinstance(channel_list, list) else 'liste degil'} kayit")
     except Exception as e:
-        log.error("Vavoo live2 hatasi: %s", e)
+        slog(f"Kanal listesi cekme HATASI: {e}")
         return False
 
     if not channel_list or not isinstance(channel_list, list):
-        log.error("Gecersiz kanal listesi")
+        slog("Gecersiz kanal listesi!")
         return False
 
+    # Adim 3: TR ve DE filtrele
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     added = 0
+    tr_count = 0
+    de_count = 0
+
     for ch in channel_list:
         name = ch.get("name", "")
         group_raw = ch.get("group", "").lower()
         url = ch.get("url", "")
         logo = ch.get("logo", "")
 
-        if not any(x in group_raw for x in [
-            "turkey", "turkish", "tr", "türk", "türkei",
-            "deutschland", "german", "deutsch", "austria", "österreich",
-            "schweiz", "switzerland",
-        ]):
+        is_tr = any(x in group_raw for x in ["turkey", "turkish", "tr", "türk", "türkei"])
+        is_de = any(x in group_raw for x in ["deutschland", "german", "deutsch", "austria", "österreich", "schweiz", "switzerland"])
+
+        if not is_tr and not is_de:
             continue
 
         name_clean = re.sub(r"[^\x00-\x7F]+", "", name)
@@ -294,18 +327,23 @@ def fetch_vavoo_channels():
         c.execute("INSERT OR REPLACE INTO channels(name,grp,cid,logo,url,hls,sort_order) VALUES(?,?,0,?,?,9999)",
                   (name_clean, ch.get("group", ""), logo, url))
         added += 1
+        if is_tr:
+            tr_count += 1
+        if is_de:
+            de_count += 1
 
     conn.commit()
     conn.close()
-    log.info("Vavoo live2: %d kanal eklendi", added)
+    slog(f"Toplam: {added} kanal (TR={tr_count}, DE={de_count})")
     return True
 
 
 def fetch_hls_links():
-    log.info("MediaHubMX HLS linkleri cekiliyor...")
+    slog("MediaHubMX HLS linkleri cekiliyor...")
     sig = get_watchedsig()
     if not sig:
-        log.warning("Lokke imzasi yok, HLS atlanacak")
+        slog("Lokke imzasi YOK! HLS linkleri atlanacak.")
+        slog("HLS olmadan da Y2 (vavoo_auth) yontemi calisir.")
         return False
 
     headers = {"user-agent": "MediaHubMX/2", "accept": "application/json", "mediahubmx-signature": sig}
@@ -314,9 +352,12 @@ def fetch_hls_links():
     for group_name in ["Turkey", "Deutschland"]:
         try:
             data = {"language":"de","region":"AT","catalogId":"iptv","id":"iptv","adult":False,"sort":"name","clientVersion":"3.0.2","filter":{"group":group_name}}
-            resp = requests.post("https://www.vavoo.to/mediahubmx-catalog.json", json=data, headers=headers, timeout=20)
+            resp = requests.post(
+                "https://www.vavoo.to/mediahubmx-catalog.json",
+                json=data, headers=headers, timeout=20, verify=False,
+            )
             items = resp.json().get("items", [])
-            log.info("%s HLS: %d kayit", group_name, len(items))
+            slog(f"{group_name} HLS: {len(items)} kayit bulundu")
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
             for item in items:
@@ -328,9 +369,9 @@ def fetch_hls_links():
             conn.commit()
             conn.close()
         except Exception as e:
-            log.error("%s HLS hatasi: %s", group_name, e)
+            slog(f"{group_name} HLS HATASI: {e}")
 
-    log.info("Toplam %d HLS guncellendi", updated)
+    slog(f"Toplam {updated} HLS linki guncellendi")
     return True
 
 
@@ -369,37 +410,7 @@ def remap_groups():
                 c.execute("UPDATE channels SET cid=?,grp='DE SONSTIGE',sort_order=9998 WHERE lid=?", (row[0], lid))
     conn.commit()
     conn.close()
-    log.info("Grup remap: %d kanal", updated)
-
-
-# ============================================================
-# M3U URETIMI - BASE_HOST'A BAGIMLI DEGIL!
-# Artik video.py'de request'ten otomatik host aliniyor.
-# Bu fonksiyon sadece local M3U dosya icin (gereksiz ama tutuldu)
-# ============================================================
-
-def generate_m3u_static():
-    """M3U dosyasi uretir - /get.php endpoint'i tercih edilmeli"""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute(
-        "SELECT c.name, c.lid, c.logo, COALESCE(cat.name,'Sonstige') as group_name "
-        "FROM channels c LEFT JOIN categories cat ON c.cid=cat.cid "
-        "ORDER BY COALESCE(cat.sort_order,9999), c.name"
-    )
-    channels = c.fetchall()
-    conn.close()
-
-    lines = ["#EXTM3U"]
-    for ch in channels:
-        lines.append(f'#EXTINF:-1 tvg-logo="{ch["logo"] or ""}" group-title="{ch["group_name"]}",{ch["name"]}')
-        # Dogrudan /channel/ yolu - tarayicida calisir, IPTV icin /get.php kullanin
-        lines.append(f"/channel/{ch['lid']}")
-
-    with open(M3U_PATH, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-    log.info("M3U dosyasi uretildi: %s (%d kanal)", M3U_PATH, len(channels))
+    slog(f"Grup remap: {updated} kanal guncellendi")
 
 
 # ============================================================
@@ -410,24 +421,46 @@ def startup_sequence():
     global DATA_READY, STARTUP_ERROR
     start = time.time()
     try:
-        log.info("=== VxParser Baslangic ===")
-        log.info("PORT=%d | DB=%s", PORT, DB_PATH)
+        slog("=== VxParser Baslangic ===")
+        slog(f"PORT={PORT} | DB={DB_PATH}")
+
+        # Adim 1: Lokke imzasi al (once bu lazim)
+        slog("Adim 1/5: Lokke imzasi aliniyor...")
+        lokke = get_watchedsig()
+        slog(f"Adim 1/5: Lokke imzasi={'ALINDI' if lokke else 'BASARISIZ'}")
+
+        # Adim 2: Vavoo token al
+        slog("Adim 2/5: Vavoo ping2 token aliniyor...")
+        vavoo = get_auth_signature()
+        slog(f"Adim 2/5: Vavoo token={'ALINDI' if vavoo else 'BASARISIZ'}")
+
+        # Adim 3: DB ve kanallari cek
+        slog("Adim 3/5: DB baslatiliyor...")
         init_db()
-        fetch_vavoo_channels()
+
+        slog("Adim 3/5: Kanallar cekiliyor...")
+        fetch_ok = fetch_vavoo_channels()
+        slog(f"Adim 3/5: Kanal cekme={'BASARILI' if fetch_ok else 'BASARISIZ'}")
+
+        # Adim 4: HLS linkleri
+        slog("Adim 4/5: HLS linkleri cekiliyor...")
         fetch_hls_links()
+
+        # Adim 5: Grup remap
+        slog("Adim 5/5: Grup remap yapiliyor...")
         remap_groups()
-        generate_m3u_static()
+
         LOAD_TIME = time.time() - start
         DATA_READY = True
-        log.info("=== Hazir! (%.1fs) ===", LOAD_TIME)
+        slog(f"=== Tamamlandi! ({LOAD_TIME:.1f}s) ===")
     except Exception as e:
         STARTUP_ERROR = str(e)
-        log.error("Baslangic hatasi: %s", e)
+        slog(f"!!! BASLANGIC HATASI: {e}")
         traceback.print_exc()
 
 
 def main():
-    log.info("VxParser baslatiliyor...")
+    slog("VxParser baslatiliyor...")
     threading.Thread(target=startup_sequence, daemon=True).start()
     import uvicorn
     from video import app
