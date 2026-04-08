@@ -1,9 +1,8 @@
 services:
   - type: web
     name: vxparser
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python server.py
+    runtime: docker
+    plan: free
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.11.6"
+      - key: PORT
+        value: 7860
