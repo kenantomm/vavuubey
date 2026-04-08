@@ -1,0 +1,8 @@
+@'
+__pycache__/
+*.pyc
+*.db
+*.m3u
+.env
+*.log
+'@ | Out-File -Encoding utf8 .gitignore
