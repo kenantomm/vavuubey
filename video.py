@@ -1,6 +1,7 @@
 """
-video.py - FastAPI uygulama
-Her endpoint state modulunu kullanir (server.py ile ayni state).
+video.py - FastAPI uygulama.
+server.py'yi IMPORT ETMEZ - circular import onlemek icin.
+Hem resolve hem token fonksiyonlari state.py'den gelir.
 """
 import os
 import sqlite3
@@ -11,7 +12,7 @@ from fastapi.responses import PlainTextResponse, RedirectResponse
 
 import state
 
-app = FastAPI(title="VxParser IPTV Proxy", version="6.0.0")
+app = FastAPI(title="VxParser IPTV Proxy", version="7.0.0")
 
 
 def get_db():
@@ -47,7 +48,7 @@ async def health():
 
 
 # ============================================================
-# DEBUG - Adim adim loglar
+# DEBUG
 # ============================================================
 
 @app.get("/debug")
@@ -63,17 +64,45 @@ async def debug():
 
 
 # ============================================================
-# CHANNEL RESOLVE
+# CHANNEL TEST (debug - redirect yapmaz)
+# ============================================================
+
+@app.get("/test/{sid}")
+async def test_channel(sid: str):
+    """Kanal bilgisi ve resolve sonucunu goster (redirect yapmaz)"""
+    conn = get_db()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT lid, name, url, hls, grp FROM channels WHERE lid=?", (sid,))
+    ch = c.fetchone()
+    conn.close()
+
+    if not ch:
+        return {"error": f"Kanal {sid} bulunamadi"}
+
+    return {
+        "lid": ch["lid"],
+        "name": ch["name"],
+        "url": ch["url"],
+        "hls": ch["hls"],
+        "grp": ch["grp"],
+    }
+
+
+# ============================================================
+# CHANNEL RESOLVE - state.resolve_channel kullanir
 # ============================================================
 
 @app.get("/channel/{sid}")
-async def channel(sid: str):
-    # server modulunu import et (main thread olarak)
-    import server
-    resolved = server.resolve_channel(sid)
-    if resolved:
-        return RedirectResponse(url=resolved, status_code=302)
-    raise HTTPException(status_code=503, detail="Yayin acilamadi.")
+async def play_channel(sid: str):
+    """
+    Kanal resolve ve redirect.
+    state.resolve_channel() kullanir - server.py'ye gerek YOK.
+    """
+    url, method = state.resolve_channel(sid)
+    if url:
+        return RedirectResponse(url=url, status_code=302)
+    raise HTTPException(status_code=503, detail=method)
 
 
 # ============================================================
