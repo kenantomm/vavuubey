@@ -40,7 +40,28 @@ async def health():
 
 
 # ============================================================
-# M3U PLAYLIST (Xtream Codes uyumlu)
+# CHANNEL RESOLVE - IPTV Oynatici icin (3 yontemli)
+# ============================================================
+
+@app.get("/channel/{sid}")
+async def channel(sid: str):
+    """
+    Kanal ID'sine gore stream URL'ini coz ve yonlendir.
+    YONTEM 1: HLS + Lokke Imzasi (en stabil)
+    YONTEM 2: Standart Token (vavoo_auth parametresi)
+    YONTEM 3: Dogrudan URL (son care)
+    """
+    import server
+
+    resolved = server.resolve_channel(sid)
+    if resolved:
+        return RedirectResponse(url=resolved, status_code=302)
+
+    raise HTTPException(status_code=503, detail="Yayin acilamadi.")
+
+
+# ============================================================
+# M3U PLAYLIST - HER KANAL PROXY URL ILE
 # ============================================================
 
 @app.get("/get.php")
@@ -50,6 +71,11 @@ async def get_playlist(
     type: str = Query("m3u_plus"),
     output: str = Query("m3u_plus"),
 ):
+    """
+    M3U playlist endpoint.
+    Her kanal /channel/{lid} proxy URL'i ile sunulur.
+    IPTV oynatici kanali actiginda resolve calisir.
+    """
     conn = get_db()
     c = conn.cursor()
     c.execute(
@@ -70,13 +96,8 @@ async def get_playlist(
         group = ch["group_name"]
         name = ch["name"]
 
-        # HLS linki varsa proxy URL, yoksa dogrudan URL
-        if ch["hls"] and host:
-            stream_url = f"{host}/channel/{lid}"
-        elif ch["url"]:
-            stream_url = ch["url"]
-        else:
-            continue
+        # HER ZAMAN proxy URL - resolve endpoint'e gider
+        stream_url = f"{host}/channel/{lid}"
 
         lines.append(
             f'#EXTINF:-1 tvg-id="{lid}" tvg-logo="{logo}" '
@@ -87,22 +108,6 @@ async def get_playlist(
     return PlainTextResponse(
         content="\n".join(lines), media_type="audio/x-mpegurl"
     )
-
-
-# ============================================================
-# CHANNEL RESOLVE (IPTV oynatici icin stream cozumleme)
-# ============================================================
-
-@app.get("/channel/{sid}")
-async def channel(sid: str):
-    """Kanal ID'sine gore HLS/Stream linkini coz ve yonlendir"""
-    import server
-
-    resolved = server.resolve_channel(sid)
-    if resolved:
-        return RedirectResponse(url=resolved)
-
-    raise HTTPException(status_code=503, detail="Yayin acilamadi.")
 
 
 # ============================================================
@@ -128,6 +133,7 @@ async def player_api(
         return cats
 
     elif action == "get_live_streams":
+        host = BASE_HOST
         c = conn.cursor()
         c.execute(
             "SELECT c.lid as stream_id, c.name as name, c.logo as stream_icon, "
@@ -136,7 +142,12 @@ async def player_api(
             "LEFT JOIN categories cat ON c.cid = cat.cid "
             "ORDER BY COALESCE(cat.sort_order, 9999), c.name"
         )
-        streams = [dict(r) for r in c.fetchall()]
+        streams = []
+        for r in c.fetchall():
+            row = dict(r)
+            # Xtream formatinda stream URL
+            row["stream_url"] = f"{host}/channel/{row['stream_id']}"
+            streams.append(row)
         conn.close()
         return streams
 
@@ -169,7 +180,7 @@ async def download_playlist():
     conn = get_db()
     c = conn.cursor()
     c.execute(
-        "SELECT c.name, c.url, c.hls, c.lid, c.logo, "
+        "SELECT c.name, c.lid, c.logo, "
         "COALESCE(cat.name, 'Sonstige') as group_name "
         "FROM channels c "
         "LEFT JOIN categories cat ON c.cid = cat.cid "
@@ -185,15 +196,11 @@ async def download_playlist():
         group = ch["group_name"]
         name = ch["name"]
         lid = ch["lid"]
+        stream_url = f"{host}/channel/{lid}"
 
-        if ch["hls"] and host:
-            stream_url = f"{host}/channel/{lid}"
-        elif ch["url"]:
-            stream_url = ch["url"]
-        else:
-            continue
-
-        lines.append(f'#EXTINF:-1 tvg-logo="{logo}" group-title="{group}",{name}')
+        lines.append(
+            f'#EXTINF:-1 tvg-logo="{logo}" group-title="{group}",{name}'
+        )
         lines.append(stream_url)
 
     return PlainTextResponse(
@@ -252,15 +259,22 @@ async def stats():
     )
     groups = [{"group": r[0], "count": r[1]} for r in c.fetchall()]
 
-    # HLS istatistigi
-    c.execute("SELECT COUNT(*) FROM channels WHERE hls != '' AND hls IS NOT NULL")
+    c.execute(
+        "SELECT COUNT(*) FROM channels WHERE hls != '' AND hls IS NOT NULL"
+    )
     hls_count = c.fetchone()[0]
+
+    # Token durumu
+    vavoo_token = bool(server._vavoo_sig)
+    lokke_token = bool(server._watched_sig)
 
     conn.close()
     return {
         "total_channels": total,
         "total_categories": cats,
         "hls_channels": hls_count,
+        "vavoo_token": vavoo_token,
+        "lokke_token": lokke_token,
         "groups": groups,
         "data_ready": server.DATA_READY,
     }

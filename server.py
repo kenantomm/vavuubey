@@ -22,23 +22,237 @@ log = logging.getLogger("vxparser")
 PORT = int(os.environ.get("PORT", 10000))
 DB_PATH = os.environ.get("DB_PATH", "/tmp/vxparser.db")
 M3U_PATH = os.environ.get("M3U_PATH", "/tmp/playlist.m3u")
-BASE_HOST = os.environ.get("BASE_HOST", "")  # Render URL, örn: https://vavuubey.onrender.com
+BASE_HOST = os.environ.get("BASE_HOST", "")
 
 DATA_READY = False
 STARTUP_ERROR = None
 LOAD_TIME = 0
 
-urllib3_installed = False
-try:
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    urllib3_installed = True
-except ImportError:
-    pass
+# ============================================================
+# 1. STANDART VAVOO TOKEN (ping2) - api.py/vavoo.py'den portlandi
+# ============================================================
+_vavoo_sig = None
+_vavoo_sig_time = 0
+
+
+def get_auth_signature():
+    """Vavoo ping2 token al (standart auth)"""
+    global _vavoo_sig, _vavoo_sig_time
+
+    # Cache: 30 dakika
+    if _vavoo_sig and (time.time() - _vavoo_sig_time) < 1800:
+        return _vavoo_sig
+
+    log.info("Vavoo Token (ping2) aliniyor...")
+    headers = {"User-Agent": "VAVOO/2.6", "Accept": "application/json"}
+    try:
+        # vec listesini al
+        vec_req = requests.get(
+            "http://mastaaa1987.github.io/repo/veclist.json",
+            headers=headers,
+            timeout=10,
+        )
+        veclist = vec_req.json()["value"]
+        sig = None
+        for _ in range(5):
+            vec = {"vec": random.choice(veclist)}
+            req = requests.post(
+                "https://www.vavoo.tv/api/box/ping2",
+                data=vec,
+                headers=headers,
+                timeout=10,
+            ).json()
+            if req.get("signed"):
+                sig = req["signed"]
+                break
+        if sig:
+            _vavoo_sig = sig
+            _vavoo_sig_time = time.time()
+            log.info("Vavoo Token basariyla alindi!")
+            return sig
+    except Exception as e:
+        log.error("Vavoo Token hatasi: %s", e)
+    return None
+
+
+# ============================================================
+# 2. LOKKE / WATCHED IMZA (app/ping)
+# ============================================================
+_watched_sig = None
+_watched_sig_time = 0
+
+
+def get_watchedsig():
+    """Lokke imzasi al (MediaHubMX icin gerekli)"""
+    global _watched_sig, _watched_sig_time
+
+    if _watched_sig and (time.time() - _watched_sig_time) < 1800:
+        return _watched_sig
+
+    log.info("Lokke Imza (app/ping) aliniyor...")
+    headers = {
+        "user-agent": "okhttp/4.11.0",
+        "accept": "application/json",
+        "content-type": "application/json; charset=utf-8",
+    }
+    data = {
+        "token": "",
+        "reason": "boot",
+        "locale": "de",
+        "theme": "dark",
+        "metadata": {
+            "device": {"type": "desktop", "uniqueId": ""},
+            "os": {
+                "name": "linux",
+                "version": "Ubuntu 22.04",
+                "abis": ["x64"],
+                "host": "RENDER",
+            },
+            "app": {"platform": "electron"},
+            "version": {
+                "package": "app.lokke.main",
+                "binary": "1.0.19",
+                "js": "1.0.19",
+            },
+        },
+        "appFocusTime": 173,
+        "playerActive": False,
+        "playDuration": 0,
+        "devMode": True,
+        "hasAddon": True,
+        "castConnected": False,
+        "package": "app.lokke.main",
+        "version": "1.0.19",
+        "process": "app",
+        "firstAppStart": int(time.time() * 1000) - 10000,
+        "lastAppStart": int(time.time() * 1000) - 10000,
+        "ipLocation": 0,
+        "adblockEnabled": True,
+        "proxy": {
+            "supported": ["ss"],
+            "engine": "cu",
+            "enabled": False,
+            "autoServer": True,
+            "id": 0,
+        },
+        "iap": {"supported": False},
+    }
+    try:
+        resp = requests.post(
+            "https://www.lokke.app/api/app/ping",
+            json=data,
+            headers=headers,
+            timeout=15,
+        )
+        result = resp.json()
+        sig = result.get("addonSig")
+        if sig:
+            _watched_sig = sig
+            _watched_sig_time = time.time()
+            log.info("Lokke Imzasi basariyla alindi!")
+            return sig
+    except Exception as e:
+        log.error("Lokke Imza Hatasi: %s", e)
+    return None
+
+
+# ============================================================
+# 3. LINK COZUMLEME (mediahubmx-resolve)
+# ============================================================
+
+
+def resolve_hls_link(link):
+    """MediaHubMX ile HLS linki coz"""
+    sig = get_watchedsig()
+    if not sig:
+        return None
+
+    headers = {
+        "user-agent": "MediaHubMX/2",
+        "accept": "application/json",
+        "content-type": "application/json; charset=utf-8",
+        "mediahubmx-signature": sig,
+    }
+    data = {
+        "language": "de",
+        "region": "AT",
+        "url": link,
+        "clientVersion": "3.0.2",
+    }
+    try:
+        r = requests.post(
+            "https://vavoo.to/mediahubmx-resolve.json",
+            json=data,
+            headers=headers,
+            timeout=15,
+        )
+        result = r.json()
+        if result and len(result) > 0:
+            return result[0].get("url")
+    except Exception as e:
+        log.error("Link cozumleme hatasi: %s", e)
+    return None
+
+
+# ============================================================
+# 4. CHANNEL RESOLVE (3 yontemli - api.py mantigi)
+# ============================================================
+
+
+def resolve_channel(lid):
+    """
+    Kanal ID'sine gore stream URL'ini coz.
+    YONTEM 1: HLS + Lokke Imzasi (en stabil)
+    YONTEM 2: Standart Token (vavoo_auth parametresi)
+    YONTEM 3: Dogrudan URL (son care)
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM channels WHERE lid=?", (lid,))
+    ch = c.fetchone()
+    conn.close()
+
+    if not ch:
+        return None
+
+    name = ch["name"]
+    url = ch["url"]
+    hls = ch["hls"]
+
+    # YONTEM 1: HLS + Lokke Imzasi
+    if hls:
+        log.info("[Y1-HLS] Cozuluyor: %s", name)
+        resolved = resolve_hls_link(hls)
+        if resolved:
+            log.info("[Y1-HLS] Basarili: %s", name)
+            return resolved
+        log.warning("[Y1-HLS] Basarisiz: %s", name)
+
+    # YONTEM 2: Standart Token (vavoo_auth)
+    if url:
+        log.info("[Y2-Auth] Token deneniyor: %s", name)
+        sig = get_auth_signature()
+        if sig:
+            base_url = str(url)
+            separator = "&" if "?" in base_url else "?"
+            final_link = base_url + separator + "n=1&b=5&vavoo_auth=" + sig
+            log.info("[Y2-Auth] Basarili: %s", name)
+            return final_link
+        log.warning("[Y2-Auth] Token alinamadi: %s", name)
+
+    # YONTEM 3: Dogrudan URL (calismayabilir ama son care)
+    if url:
+        log.info("[Y3-Direct] Dogrudan: %s", name)
+        return url
+
+    return None
+
 
 # ============================================================
 # GRUP SIRALAMASI
 # ============================================================
+
 GROUP_ORDER = [
     "TR ULUSAL",
     "TR HABER",
@@ -148,109 +362,11 @@ GROUP_RULES = {
     ],
 }
 
-# ============================================================
-# LOKKE / WATCHED IMZA SISTEMI (vavoo.py'den portlandi)
-# ============================================================
-_watched_sig = None
-_watched_sig_time = 0
-
-
-def get_watchedsig():
-    """Lokke imzasi al (app/ping endpoint)"""
-    global _watched_sig, _watched_sig_time
-
-    # Cache: 30 dakika
-    if _watched_sig and (time.time() - _watched_sig_time) < 1800:
-        return _watched_sig
-
-    log.info("Lokke Imza (app/ping) aliniyor...")
-    headers = {
-        "user-agent": "okhttp/4.11.0",
-        "accept": "application/json",
-        "content-type": "application/json; charset=utf-8",
-    }
-    data = {
-        "token": "",
-        "reason": "boot",
-        "locale": "de",
-        "theme": "dark",
-        "metadata": {
-            "device": {"type": "desktop", "uniqueId": ""},
-            "os": {"name": "linux", "version": "Ubuntu 22.04", "abis": ["x64"], "host": "RENDER"},
-            "app": {"platform": "electron"},
-            "version": {"package": "app.lokke.main", "binary": "1.0.19", "js": "1.0.19"},
-        },
-        "appFocusTime": 173,
-        "playerActive": False,
-        "playDuration": 0,
-        "devMode": True,
-        "hasAddon": True,
-        "castConnected": False,
-        "package": "app.lokke.main",
-        "version": "1.0.19",
-        "process": "app",
-        "firstAppStart": int(time.time() * 1000) - 10000,
-        "lastAppStart": int(time.time() * 1000) - 10000,
-        "ipLocation": 0,
-        "adblockEnabled": True,
-        "proxy": {"supported": ["ss"], "engine": "cu", "enabled": False, "autoServer": True, "id": 0},
-        "iap": {"supported": False},
-    }
-    try:
-        resp = requests.post(
-            "https://www.lokke.app/api/app/ping",
-            json=data,
-            headers=headers,
-            timeout=15,
-        )
-        result = resp.json()
-        sig = result.get("addonSig")
-        if sig:
-            _watched_sig = sig
-            _watched_sig_time = time.time()
-            log.info("Lokke Imzasi basariyla alindi!")
-            return sig
-    except Exception as e:
-        log.error("Lokke Imza Hatasi: %s", e)
-    return None
-
-
-def resolve_link(link):
-    """MediaHubMX ile HLS linki coz"""
-    sig = get_watchedsig()
-    if not sig:
-        return None
-
-    headers = {
-        "user-agent": "MediaHubMX/2",
-        "accept": "application/json",
-        "content-type": "application/json; charset=utf-8",
-        "mediahubmx-signature": sig,
-    }
-    data = {
-        "language": "de",
-        "region": "AT",
-        "url": link,
-        "clientVersion": "3.0.2",
-    }
-    try:
-        r = requests.post(
-            "https://vavoo.to/mediahubmx-resolve.json",
-            json=data,
-            headers=headers,
-            timeout=15,
-        )
-        result = r.json()
-        if result and len(result) > 0:
-            return result[0].get("url")
-    except Exception as e:
-        log.error("Link cozumleme hatasi: %s", e)
-    return None
-
 
 # ============================================================
 # VERITABANI
 # ============================================================
+
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -273,14 +389,12 @@ def init_db():
 
 
 # ============================================================
-# VAVOO'DAN KANAL CEKME (vavoo.py sky_dbfill mantigi)
+# VAVOO'DAN KANAL CEKME
 # ============================================================
 
+
 def fetch_vavoo_channels():
-    """
-    Vavoo live2 API'den kanallari ceker.
-    Kaynak: https://www.vavoo.to/live2/index?output=json
-    """
+    """Vavoo live2 API'den TR/DE kanallarini ceker"""
     log.info("Vavoo live2'den kanallar cekiliyor...")
 
     try:
@@ -297,7 +411,7 @@ def fetch_vavoo_channels():
         return False
 
     if not channel_list or not isinstance(channel_list, list):
-        log.error("Gecersiz kanal listesi formati")
+        log.error("Gecersiz kanal listesi")
         return False
 
     conn = sqlite3.connect(DB_PATH)
@@ -311,15 +425,18 @@ def fetch_vavoo_channels():
         logo = ch.get("logo", "")
 
         # Sadece TR ve DE gruplarini al
-        if not any(x in group_raw for x in [
-            "turkey", "turkish", "tr", "türk", "türkei",
-            "deutschland", "german", "deutsch", "austria", "österreich",
-            "schweiz", "switzerland", "at ", "ch ",
-        ]):
+        if not any(
+            x in group_raw
+            for x in [
+                "turkey", "turkish", "tr", "türk", "türkei",
+                "deutschland", "german", "deutsch", "austria", "österreich",
+                "schweiz", "switzerland", "at ", "ch ",
+            ]
+        ):
             continue
 
         # Turk karakterleri temizle (ASCII)
-        name_clean = re.sub(r'[^\x00-\x7F]+', '', name)
+        name_clean = re.sub(r"[^\x00-\x7F]+", "", name)
         if not name_clean:
             continue
 
@@ -337,15 +454,12 @@ def fetch_vavoo_channels():
 
 
 def fetch_hls_links():
-    """
-    MediaHubMX catalog'dan HLS linklerini ceker.
-    Kaynak: https://www.vavoo.to/mediahubmx-catalog.json
-    """
+    """MediaHubMX catalog'dan HLS linklerini ceker"""
     log.info("MediaHubMX catalog'dan HLS linkleri cekiliyor...")
 
     sig = get_watchedsig()
     if not sig:
-        log.error("Lokke imzasi yok, HLS linkleri alinamadi!")
+        log.warning("Lokke imzasi yok, HLS linkleri atlanacak")
         return False
 
     headers = {
@@ -353,78 +467,43 @@ def fetch_hls_links():
         "accept": "application/json",
         "mediahubmx-signature": sig,
     }
-
     updated = 0
 
-    # Turkey grubu icin HLS linkleri al
-    try:
-        data_turkey = {
-            "language": "de",
-            "region": "AT",
-            "catalogId": "iptv",
-            "id": "iptv",
-            "adult": False,
-            "sort": "name",
-            "clientVersion": "3.0.2",
-            "filter": {"group": "Turkey"},
-        }
-        resp = requests.post(
-            "https://vavoo.to/mediahubmx-catalog.json",
-            json=data_turkey,
-            headers=headers,
-            timeout=20,
-        )
-        items = resp.json().get("items", [])
-        log.info("Turkey HLS: %d kayit bulundu", len(items))
+    for group_name in ["Turkey", "Deutschland"]:
+        try:
+            data = {
+                "language": "de",
+                "region": "AT",
+                "catalogId": "iptv",
+                "id": "iptv",
+                "adult": False,
+                "sort": "name",
+                "clientVersion": "3.0.2",
+                "filter": {"group": group_name},
+            }
+            resp = requests.post(
+                "https://www.vavoo.to/mediahubmx-catalog.json",
+                json=data,
+                headers=headers,
+                timeout=20,
+            )
+            items = resp.json().get("items", [])
+            log.info("%s HLS: %d kayit", group_name, len(items))
 
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        for item in items:
-            hls_url = item.get("url", "")
-            name_clean = re.sub(r'[^\x00-\x7F]+', '', item.get("name", ""))
-            if hls_url and name_clean:
-                c.execute("UPDATE channels SET hls=? WHERE name=?", (hls_url, name_clean))
-                updated += 1
-        conn.commit()
-        conn.close()
-
-    except Exception as e:
-        log.error("Turkey HLS hatasi: %s", e)
-
-    # Deutschland grubu icin de dene
-    try:
-        data_de = {
-            "language": "de",
-            "region": "DE",
-            "catalogId": "iptv",
-            "id": "iptv",
-            "adult": False,
-            "sort": "name",
-            "clientVersion": "3.0.2",
-            "filter": {"group": "Deutschland"},
-        }
-        resp = requests.post(
-            "https://vavoo.to/mediahubmx-catalog.json",
-            json=data_de,
-            headers=headers,
-            timeout=20,
-        )
-        items = resp.json().get("items", [])
-        log.info("Deutschland HLS: %d kayit bulundu", len(items))
-
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        for item in items:
-            hls_url = item.get("url", "")
-            name_clean = re.sub(r'[^\x00-\x7F]+', '', item.get("name", ""))
-            if hls_url and name_clean:
-                c.execute("UPDATE channels SET hls=? WHERE name=?", (hls_url, name_clean))
-                updated += 1
-        conn.commit()
-        conn.close()
-
-    except Exception as e:
-        log.error("Deutschland HLS hatasi: %s", e)
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            for item in items:
+                hls_url = item.get("url", "")
+                name_clean = re.sub(r"[^\x00-\x7F]+", "", item.get("name", ""))
+                if hls_url and name_clean:
+                    c.execute(
+                        "UPDATE channels SET hls=? WHERE name=?", (hls_url, name_clean)
+                    )
+                    updated += 1
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            log.error("%s HLS hatasi: %s", group_name, e)
 
     log.info("Toplam %d HLS linki guncellendi", updated)
     return True
@@ -433,6 +512,7 @@ def fetch_hls_links():
 # ============================================================
 # GRUP REMAPPING
 # ============================================================
+
 
 def remap_groups():
     conn = sqlite3.connect(DB_PATH)
@@ -479,13 +559,15 @@ def remap_groups():
 
 
 # ============================================================
-# M3U URETIMI
+# M3U URETIMI - HER ZAMAN PROXY URL KULLAN!
 # ============================================================
+
 
 def generate_m3u():
     host = BASE_HOST
     if not host:
-        log.warning("BASE_HOST yok, M3U dogrudan URL'lerle olusturuluyor")
+        log.warning("BASE_HOST yok! M3U proxy URL'lerle olusturulamadi")
+        return
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -507,58 +589,25 @@ def generate_m3u():
         group = ch["group_name"]
         lid = ch["lid"]
 
-        # HLS linki varsa proxy URL kullan, yoksa dogrudan URL
-        if ch["hls"] and host:
-            stream_url = f"{host}/channel/{lid}"
-        elif ch["url"]:
-            stream_url = ch["url"]
-        else:
-            continue
+        # HER ZAMAN proxy URL kullan!
+        # /channel/{lid} endpoint'i 3 yontemle resolve eder:
+        # 1. HLS + Lokke, 2. URL + vavoo_auth, 3. Direkt URL
+        stream_url = f"{host}/channel/{lid}"
 
-        lines.append(f'#EXTINF:-1 tvg-logo="{logo}" group-title="{group}",{name}')
+        lines.append(
+            f'#EXTINF:-1 tvg-logo="{logo}" group-title="{group}",{name}'
+        )
         lines.append(stream_url)
 
     with open(M3U_PATH, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
-    log.info("M3U uretildi: %s (%d kanal)", M3U_PATH, len(channels))
-
-
-# ============================================================
-# CHANNEL RESOLVE (API endpoint icin)
-# ============================================================
-
-def resolve_channel(lid):
-    """
-    Kanal ID'sine gore stream URL'ini coz.
-    Oncelik: HLS (Lokke resolve) > Standart URL
-    """
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM channels WHERE lid=?", (lid,))
-    ch = c.fetchone()
-    conn.close()
-
-    if not ch:
-        return None
-
-    # YONTEM 1: HLS + Lokke Imzasi
-    if ch["hls"]:
-        log.info("HLS Cozuluyor: %s", ch["name"])
-        resolved = resolve_link(ch["hls"])
-        if resolved:
-            return resolved
-
-    # YONTEM 2: Standart URL
-    if ch["url"]:
-        return ch["url"]
-
-    return None
+    log.info("M3U uretildi: %s (%d kanal, PROXY URL)", M3U_PATH, len(channels))
 
 
 # ============================================================
 # BASLANGIC SEKANSI
 # ============================================================
+
 
 def startup_sequence():
     global DATA_READY, STARTUP_ERROR
