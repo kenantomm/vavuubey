@@ -7,4 +7,4 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.6"
-'@ | Out-File -Encoding utf8 render.yaml
+        Out-File -Encoding utf8 render.yaml
