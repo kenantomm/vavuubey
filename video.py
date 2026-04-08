@@ -1,16 +1,16 @@
 import os
 import sqlite3
-import httpx
 import logging
 import threading
 
 from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse
 
 DB_PATH = os.environ.get("DB_PATH", "/tmp/vxparser.db")
 M3U_PATH = os.environ.get("M3U_PATH", "/tmp/playlist.m3u")
+BASE_HOST = os.environ.get("BASE_HOST", "")
 
-app = FastAPI(title="VxParser IPTV Proxy", version="2.0.0")
+app = FastAPI(title="VxParser IPTV Proxy", version="3.0.0")
 
 
 def get_db():
@@ -24,7 +24,13 @@ async def root():
     import server
     return {
         "status": "ready" if server.DATA_READY else "loading",
-        "message": "Hazir!" if server.DATA_READY else "Kanallar yukleniyor, 30-60sn bekle...",
+        "error": server.STARTUP_ERROR,
+        "load_time": round(server.LOAD_TIME, 1) if server.DATA_READY else None,
+        "message": (
+            "Hazir!"
+            if server.DATA_READY
+            else "Kanallar yukleniyor, 30-60sn bekle..."
+        ),
     }
 
 
@@ -32,6 +38,10 @@ async def root():
 async def health():
     return {"status": "ok"}
 
+
+# ============================================================
+# M3U PLAYLIST (Xtream Codes uyumlu)
+# ============================================================
 
 @app.get("/get.php")
 async def get_playlist(
@@ -43,7 +53,7 @@ async def get_playlist(
     conn = get_db()
     c = conn.cursor()
     c.execute(
-        "SELECT c.lid, c.name, c.url, c.logo, "
+        "SELECT c.lid, c.name, c.url, c.hls, c.logo, "
         "COALESCE(cat.name, 'Sonstige') as group_name "
         "FROM channels c "
         "LEFT JOIN categories cat ON c.cid = cat.cid "
@@ -52,20 +62,52 @@ async def get_playlist(
     channels = c.fetchall()
     conn.close()
 
+    host = BASE_HOST
     lines = ['#EXTM3U url-tvg="" deinterlace="1"']
     for ch in channels:
         lid = ch["lid"]
         logo = ch["logo"] or ""
         group = ch["group_name"]
         name = ch["name"]
-        url = ch["url"]
+
+        # HLS linki varsa proxy URL, yoksa dogrudan URL
+        if ch["hls"] and host:
+            stream_url = f"{host}/channel/{lid}"
+        elif ch["url"]:
+            stream_url = ch["url"]
+        else:
+            continue
+
         lines.append(
-            f'#EXTINF:-1 tvg-id="{lid}" tvg-logo="{logo}" group-title="{group}",{name}'
+            f'#EXTINF:-1 tvg-id="{lid}" tvg-logo="{logo}" '
+            f'group-title="{group}",{name}'
         )
-        lines.append(url)
+        lines.append(stream_url)
 
-    return PlainTextResponse(content="\n".join(lines), media_type="audio/x-mpegurl")
+    return PlainTextResponse(
+        content="\n".join(lines), media_type="audio/x-mpegurl"
+    )
 
+
+# ============================================================
+# CHANNEL RESOLVE (IPTV oynatici icin stream cozumleme)
+# ============================================================
+
+@app.get("/channel/{sid}")
+async def channel(sid: str):
+    """Kanal ID'sine gore HLS/Stream linkini coz ve yonlendir"""
+    import server
+
+    resolved = server.resolve_channel(sid)
+    if resolved:
+        return RedirectResponse(url=resolved)
+
+    raise HTTPException(status_code=503, detail="Yayin acilamadi.")
+
+
+# ============================================================
+# XTREAM CODES JSON API
+# ============================================================
 
 @app.get("/player_api.php")
 async def player_api(
@@ -118,12 +160,16 @@ async def player_api(
         }
 
 
+# ============================================================
+# M3U DOSYA INDIRME
+# ============================================================
+
 @app.get("/playlist.m3u")
 async def download_playlist():
     conn = get_db()
     c = conn.cursor()
     c.execute(
-        "SELECT c.name, c.url, c.logo, "
+        "SELECT c.name, c.url, c.hls, c.lid, c.logo, "
         "COALESCE(cat.name, 'Sonstige') as group_name "
         "FROM channels c "
         "LEFT JOIN categories cat ON c.cid = cat.cid "
@@ -132,14 +178,23 @@ async def download_playlist():
     channels = c.fetchall()
     conn.close()
 
+    host = BASE_HOST
     lines = ["#EXTM3U"]
     for ch in channels:
         logo = ch["logo"] or ""
         group = ch["group_name"]
         name = ch["name"]
-        url = ch["url"]
+        lid = ch["lid"]
+
+        if ch["hls"] and host:
+            stream_url = f"{host}/channel/{lid}"
+        elif ch["url"]:
+            stream_url = ch["url"]
+        else:
+            continue
+
         lines.append(f'#EXTINF:-1 tvg-logo="{logo}" group-title="{group}",{name}')
-        lines.append(url)
+        lines.append(stream_url)
 
     return PlainTextResponse(
         content="\n".join(lines),
@@ -147,6 +202,10 @@ async def download_playlist():
         headers={"Content-Disposition": "attachment; filename=playlist.m3u"},
     )
 
+
+# ============================================================
+# RELOAD
+# ============================================================
 
 @app.get("/reload")
 async def reload_channels():
@@ -159,7 +218,7 @@ async def reload_channels():
         try:
             server.init_db()
             server.fetch_vavoo_channels()
-            server.filter_tr_de()
+            server.fetch_hls_links()
             server.remap_groups()
             server.generate_m3u()
             server.DATA_READY = True
@@ -169,6 +228,10 @@ async def reload_channels():
     threading.Thread(target=do_reload, daemon=True).start()
     return {"status": "reloading", "message": "Yukleniyor... 30-60sn bekle"}
 
+
+# ============================================================
+# STATS
+# ============================================================
 
 @app.get("/stats")
 async def stats():
@@ -188,10 +251,16 @@ async def stats():
         "ORDER BY MIN(cat.sort_order)"
     )
     groups = [{"group": r[0], "count": r[1]} for r in c.fetchall()]
+
+    # HLS istatistigi
+    c.execute("SELECT COUNT(*) FROM channels WHERE hls != '' AND hls IS NOT NULL")
+    hls_count = c.fetchone()[0]
+
     conn.close()
     return {
         "total_channels": total,
         "total_categories": cats,
+        "hls_channels": hls_count,
         "groups": groups,
         "data_ready": server.DATA_READY,
     }
