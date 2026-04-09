@@ -1078,7 +1078,7 @@ def clean_name(name):
 
 async def startup_sequence():
     global DATA_READY
-    add_log("=== VxParser Basliyor ===")
+    add_log("=== Omer Basliyor ===")
     init_db()
     add_log("Veritabani hazir")
     add_log("Lokke signature aliniyor...")
@@ -1245,4 +1245,4 @@ async def startup_sequence():
             add_log(f"EPG hatasi: {e}")
 
     DATA_READY = True
-    add_log("=== VxParser HAZIR ===")
+    add_log("=== Omer HAZIR ===")

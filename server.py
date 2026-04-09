@@ -62,6 +62,6 @@ async def startup_event():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    print(f"VxParser starting on port {port}...")
+    print(f"Omer starting on port {port}...")
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

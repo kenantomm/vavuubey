@@ -1,5 +1,5 @@
 """
-EPG module for VxParser - Electronic Program Guide
+EPG module for Omer - Electronic Program Guide
 Fetches EPG data from TV Spielfilm (DE) and free TR sources
 Generates XMLTV format XML for IPTV players
 """
@@ -568,8 +568,8 @@ def get_picon_url(name, vavoo_logo="", country=""):
 def generate_xmltv(channels, programmes):
     """Generate XMLTV format XML string"""
     root = Element("tv")
-    root.set("generator-info-name", "VxParser EPG")
-    root.set("generator-info-url", "https://github.com/vxparser")
+    root.set("generator-info-name", "Omer EPG")
+    root.set("generator-info-url", "")
 
     # Channels
     for ch in channels:

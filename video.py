@@ -5,7 +5,7 @@ import state
 import httpx
 import time
 
-app = FastAPI(title="VxParser")
+app = FastAPI(title="Omer")
 
 VAVOO_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -237,31 +237,15 @@ async def test_channel(ch_id: int):
     ch = state.get_channel(ch_id)
     if not ch:
         return JSONResponse({"error": "Not found"}, status_code=404)
-    return JSONResponse(ch)
+    return JSONResponse({"id": ch["id"], "name": ch["name"], "grp": ch["grp"]})
 
 @app.get("/api/test-sig")
 async def test_sig():
-    """Test Lokke signature and MediaHubMX catalog"""
+    """Test signature and resolve"""
     results = {}
     sig = await state.get_watched_sig()
-    results["lokke_sig"] = bool(sig)
-    results["sig_preview"] = sig[:50] + "..." if sig else None
-    results["watched_sig"] = bool(state.WATCHED_SIG)
-
+    results["sig_valid"] = bool(sig)
     if sig:
-        try:
-            catalog = await state.fetch_catalog("Turkey", 0)
-            if isinstance(catalog, dict):
-                results["catalog_turkey"] = {
-                    "items_count": len(catalog.get("items", [])),
-                    "nextCursor": catalog.get("nextCursor"),
-                    "first_item": catalog["items"][0] if catalog.get("items") else None
-                }
-            else:
-                results["catalog_turkey"] = {"error": f"unexpected type: {type(catalog)}", "data": str(catalog)[:300]}
-        except Exception as e:
-            results["catalog_turkey"] = {"error": str(e)}
-
         import sqlite3
         conn = sqlite3.connect(state.DB_PATH)
         c = conn.cursor()
@@ -274,43 +258,28 @@ async def test_sig():
             resolved = await state.resolve_mediahubmx(test_url)
             results["resolve_test"] = {
                 "channel": ch_name,
-                "input_url": test_url,
-                "resolved_url": resolved
+                "resolved": bool(resolved)
             }
-
     return JSONResponse(results)
 
 @app.get("/api/status")
 async def api_status(request: Request):
-    host = detect_host(request)
     import sqlite3
     info = {
         "data_ready": state.DATA_READY,
         "epg_ready": state.EPG_READY,
-        "host": host,
-        "watched_sig": bool(state.WATCHED_SIG),
-        "resolve_cache_size": len(state.RESOLVE_CACHE),
-        "startup_logs": state.STARTUP_LOGS[-30:]
     }
     try:
         conn = sqlite3.connect(state.DB_PATH)
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM channels")
         info["total_channels"] = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM channels WHERE hls != ''")
-        info["hls_channels"] = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM channels WHERE country='TR'")
         info["tr_channels"] = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM channels WHERE country='DE'")
         info["de_channels"] = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM channels WHERE tvg_id != ''")
-        info["epg_mapped"] = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM channels WHERE picon != ''")
-        info["picon_mapped"] = c.fetchone()[0]
         c.execute("SELECT DISTINCT grp FROM channels ORDER BY grp")
         info["groups"] = [r[0] for r in c.fetchall()]
-        c.execute("SELECT id, name, url, hls, tvg_id, picon FROM channels WHERE country='TR' LIMIT 3")
-        info["sample_tr"] = [{"id": r[0], "name": r[1], "url": r[2], "hls": r[3], "tvg_id": r[4], "picon": r[5]} for r in c.fetchall()]
         conn.close()
     except Exception as e:
         info["db_error"] = str(e)
@@ -334,13 +303,7 @@ async def ping():
 async def root(request: Request):
     host = detect_host(request)
     return PlainTextResponse(
-        f"VxParser Online\n\n"
-        f"M3U: {host}/get.php?username=admin&password=admin&type=m3u_plus\n"
-        f"EPG: {host}/epg.xml.gz\n"
-        f"Admin: {host}/admin\n"
-        f"Status: {host}/api/status\n"
-        f"Sig Test: {host}/api/test-sig\n"
-        f"Logs: {host}/api/logs\n"
+        f"Omer Online\n"
     )
 
 # ===== Admin Panel =====
@@ -390,7 +353,7 @@ async def admin_export_overrides():
     import json
     text = json.dumps(overrides, indent=2, ensure_ascii=False)
     return PlainTextResponse(text, media_type="application/json",
-                             headers={"Content-Disposition": "attachment; filename=vxparser-overrides.json"})
+                             headers={"Content-Disposition": "attachment; filename=omer-overrides.json"})
 
 @app.post("/api/admin/overrides/import")
 async def admin_import_overrides(request: Request):
@@ -416,7 +379,7 @@ ADMIN_HTML = r"""<!DOCTYPE html>
 <html lang="tr">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VxParser Admin</title>
+<title>Omer Admin</title>
 <style>
 :root{
   --bg:#0a0e17;--bg2:#111827;--bg3:#1a2236;--bg4:#232d42;
@@ -626,7 +589,7 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans
 <!-- SIDEBAR -->
 <aside class="sidebar" id="sidebar">
   <div class="sb-hdr">
-    <h1><div class="icon">&#9656;</div> VxParser <span style="color:var(--blue)">Admin</span></h1>
+    <h1><div class="icon">&#9656;</div> Omer <span style="color:var(--blue)">Admin</span></h1>
     <p>Kanal Grup Yonetimi &bull; Drag &amp; Drop</p>
   </div>
   <div class="sb-search">
@@ -954,7 +917,7 @@ async function doExport(){
   try{
     const r=await fetch('/api/admin/overrides/export');
     const blob=await r.blob();const a=document.createElement('a');
-    a.href=URL.createObjectURL(blob);a.download='vxparser-overrides.json';a.click();
+    a.href=URL.createObjectURL(blob);a.download='omer-overrides.json';a.click();
     toast('JSON dosyasi indirildi','ok');
   }catch(e){toast('Export hatasi','err')}
 }
