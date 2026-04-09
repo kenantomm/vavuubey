@@ -1,11 +1,30 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse, Response, HTMLResponse
 from fastapi.routing import APIRoute
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import state
 import httpx
 import time
+import os
+import secrets
 
 app = FastAPI(title="Omer")
+
+# Admin protection via HTTP Basic Auth (set via env vars ADMIN_USER + ADMIN_PASS)
+ADMIN_USER = os.environ.get("ADMIN_USER", "")
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "")
+
+security = HTTPBasic()
+
+def verify_admin(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
+    """Verify admin credentials via HTTP Basic Auth. If no ADMIN_USER/ADMIN_PASS set, allow all."""
+    if not ADMIN_USER and not ADMIN_PASS:
+        return True
+    correct_user = secrets.compare_digest(credentials.username or "", ADMIN_USER)
+    correct_pass = secrets.compare_digest(credentials.password or "", ADMIN_PASS)
+    if not (correct_user and correct_pass):
+        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
+    return True
 
 VAVOO_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -232,67 +251,6 @@ async def channel_substream(ch_id: int, url: str):
 def add_log(msg):
     state.add_log(msg)
 
-@app.get("/test/{ch_id}")
-async def test_channel(ch_id: int):
-    ch = state.get_channel(ch_id)
-    if not ch:
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    return JSONResponse({"id": ch["id"], "name": ch["name"], "grp": ch["grp"]})
-
-@app.get("/api/test-sig")
-async def test_sig():
-    """Test signature and resolve"""
-    results = {}
-    sig = await state.get_watched_sig()
-    results["sig_valid"] = bool(sig)
-    if sig:
-        import sqlite3
-        conn = sqlite3.connect(state.DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT id, name, url, hls FROM channels WHERE country='TR' LIMIT 1")
-        row = c.fetchone()
-        conn.close()
-        if row:
-            ch_id, ch_name, ch_url, ch_hls = row
-            test_url = ch_hls if ch_hls else ch_url
-            resolved = await state.resolve_mediahubmx(test_url)
-            results["resolve_test"] = {
-                "channel": ch_name,
-                "resolved": bool(resolved)
-            }
-    return JSONResponse(results)
-
-@app.get("/api/status")
-async def api_status(request: Request):
-    import sqlite3
-    info = {
-        "data_ready": state.DATA_READY,
-        "epg_ready": state.EPG_READY,
-    }
-    try:
-        conn = sqlite3.connect(state.DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM channels")
-        info["total_channels"] = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM channels WHERE country='TR'")
-        info["tr_channels"] = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM channels WHERE country='DE'")
-        info["de_channels"] = c.fetchone()[0]
-        c.execute("SELECT DISTINCT grp FROM channels ORDER BY grp")
-        info["groups"] = [r[0] for r in c.fetchall()]
-        conn.close()
-    except Exception as e:
-        info["db_error"] = str(e)
-    return JSONResponse(info)
-
-@app.get("/api/logs")
-async def api_logs():
-    return JSONResponse({"logs": state.STARTUP_LOGS})
-
-@app.get("/stats")
-async def stats():
-    return JSONResponse({"status": "online" if state.DATA_READY else "loading", "channels": len(state.get_all_channels(ordered=False)) if state.DATA_READY else 0})
-
 @app.get("/ping")
 @app.head("/ping")
 async def ping():
@@ -306,6 +264,12 @@ async def root(request: Request):
         f"Omer Online\n"
     )
 
+# ===== robots.txt =====
+
+@app.get("/robots.txt")
+async def robots_txt():
+    return PlainTextResponse("User-agent: *\nDisallow: /\n", media_type="text/plain")
+
 # ===== Admin Panel =====
 
 ALL_GROUPS = [
@@ -317,11 +281,11 @@ ALL_GROUPS = [
 ]
 
 @app.get("/admin")
-async def admin_page():
+async def admin_page(request: Request, auth: bool = Depends(verify_admin)):
     return HTMLResponse(ADMIN_HTML)
 
 @app.get("/api/admin/channels")
-async def admin_get_channels():
+async def admin_get_channels(request: Request, auth: bool = Depends(verify_admin)):
     channels = state.get_all_channels(ordered=True)
     overrides = state.get_all_overrides()
     return JSONResponse([{
@@ -331,11 +295,11 @@ async def admin_get_channels():
     } for c in channels])
 
 @app.get("/api/admin/overrides")
-async def admin_get_overrides():
+async def admin_get_overrides(request: Request, auth: bool = Depends(verify_admin)):
     return JSONResponse(state.get_all_overrides())
 
 @app.post("/api/admin/overrides")
-async def admin_save_overrides(request: Request):
+async def admin_save_overrides(request: Request, auth: bool = Depends(verify_admin)):
     data = await request.json()
     if not isinstance(data, dict):
         return JSONResponse({"error": "dict expected"}, status_code=400)
@@ -343,12 +307,12 @@ async def admin_save_overrides(request: Request):
     return JSONResponse({"ok": True, "count": count})
 
 @app.delete("/api/admin/overrides")
-async def admin_clear_overrides():
+async def admin_clear_overrides(request: Request, auth: bool = Depends(verify_admin)):
     state.delete_all_overrides()
     return JSONResponse({"ok": True})
 
 @app.get("/api/admin/overrides/export")
-async def admin_export_overrides():
+async def admin_export_overrides(request: Request, auth: bool = Depends(verify_admin)):
     overrides = state.get_all_overrides()
     import json
     text = json.dumps(overrides, indent=2, ensure_ascii=False)
@@ -356,7 +320,7 @@ async def admin_export_overrides():
                              headers={"Content-Disposition": "attachment; filename=omer-overrides.json"})
 
 @app.post("/api/admin/overrides/import")
-async def admin_import_overrides(request: Request):
+async def admin_import_overrides(request: Request, auth: bool = Depends(verify_admin)):
     data = await request.json()
     if not isinstance(data, dict):
         return JSONResponse({"error": "dict expected"}, status_code=400)
@@ -364,7 +328,7 @@ async def admin_import_overrides(request: Request):
     return JSONResponse({"ok": True, "imported": count})
 
 @app.post("/api/admin/reorder")
-async def admin_reorder(request: Request):
+async def admin_reorder(request: Request, auth: bool = Depends(verify_admin)):
     data = await request.json()
     channel_name = data.get("channel", "")
     direction = data.get("direction", "")
@@ -375,10 +339,24 @@ async def admin_reorder(request: Request):
         return JSONResponse({"ok": True, "message": msg})
     return JSONResponse({"ok": False, "message": msg}, status_code=400)
 
+@app.post("/api/admin/reorder-to")
+async def admin_reorder_to(request: Request, auth: bool = Depends(verify_admin)):
+    """Move a channel to a specific position index within its group (for drag-to-reorder)"""
+    data = await request.json()
+    channel_name = data.get("channel", "")
+    target_index = data.get("target_index", -1)
+    if not channel_name or target_index < 0:
+        return JSONResponse({"error": "channel and target_index required"}, status_code=400)
+    success, msg = state.reorder_channel_to_position(channel_name, target_index)
+    if success:
+        return JSONResponse({"ok": True, "message": msg})
+    return JSONResponse({"ok": False, "message": msg}, status_code=400)
+
 ADMIN_HTML = r"""<!DOCTYPE html>
 <html lang="tr">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex, nofollow, noarchive">
 <title>Omer Admin</title>
 <style>
 :root{
@@ -439,6 +417,17 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans
 .ch-dragging{opacity:.4}
 .ch-drag-clone{position:fixed;pointer-events:none;z-index:9999;background:var(--bg3);border:1px solid var(--blue);border-radius:8px;padding:8px 14px;font-size:13px;color:var(--text);box-shadow:0 8px 24px rgba(0,0,0,.5);display:flex;align-items:center;gap:8px;max-width:300px}
 .ch-drag-clone .dc-icon{font-size:16px}
+
+/* ROW DROP INDICATOR - blue line between rows */
+.drop-indicator{height:3px;background:var(--blue);border-radius:2px;margin:-1px 0;box-shadow:0 0 8px var(--blue);pointer-events:none;z-index:5;transition:opacity .1s;animation:dropPulse .8s infinite}
+.drop-indicator::before{content:'';position:absolute;left:0;top:-4px;width:10px;height:10px;background:var(--blue);border-radius:50%}
+.drop-indicator::after{content:'';position:absolute;right:0;top:-4px;width:10px;height:10px;background:var(--blue);border-radius:50%}
+.drop-indicator{position:relative;overflow:visible}
+@keyframes dropPulse{0%,100%{opacity:.6}50%{opacity:1}}
+
+/* ROW hover drop target */
+.tbl tr.row-drop-above td{border-top:2px solid var(--blue)!important}
+.tbl tr.row-drop-below td{border-bottom:2px solid var(--blue)!important}
 
 /* DROP HINT banner */
 .drop-hint{position:fixed;top:0;left:var(--sidebar-w);right:0;height:4px;background:linear-gradient(90deg,var(--blue),var(--green),var(--blue));z-index:100;opacity:0;transition:opacity .2s;pointer-events:none}
@@ -651,7 +640,7 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans
     </div>
     <div class="drag-hint-bar" id="dragHintBar">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 9l7-7 7 7M5 15l7 7 7-7"/></svg>
-      Kanallari gruplara surukleyin
+      Kanallari surukleyerek siralayin veya gruplara tasimayin
     </div>
     <span class="result-count" id="resultCount"></span>
   </div>
@@ -970,10 +959,13 @@ function toast(msg,type){
 }
 
 /* ===== DRAG & DROP ===== */
+let dragDropTarget=null; /* 'table' or 'sidebar' */
+let dropIndicatorEl=null;
+let lastDropRow=null;
 
 function onRowDragStart(e){
   dragChanName=e.currentTarget.dataset.chname;
-  dragStarted=false;
+  dragDropTarget=null;
   e.dataTransfer.effectAllowed='move';
   e.dataTransfer.setData('text/plain',dragChanName);
   /* Custom drag image */
@@ -993,11 +985,120 @@ function onRowDragEnd(e){
   e.currentTarget.classList.remove('ch-dragging');
   document.getElementById('dropHint').classList.remove('active');
   if(dragClone){dragClone.remove();dragClone=null}
-  /* Clean up all drop-target classes */
+  /* Clean up */
   document.querySelectorAll('.grp-item.drop-target,.grp-item.drop-reject').forEach(el=>{
     el.classList.remove('drop-target','drop-reject');
   });
-  dragChanName=null;
+  document.querySelectorAll('.row-drop-above,.row-drop-below').forEach(el=>{
+    el.classList.remove('row-drop-above','row-drop-below');
+  });
+  if(dropIndicatorEl&&dropIndicatorEl.parentNode){dropIndicatorEl.remove()}
+  dropIndicatorEl=null;lastDropRow=null;
+  dragChanName=null;dragDropTarget=null;
+}
+
+/* ===== TABLE ROW DRAG (intra-group reorder) ===== */
+
+function onTableDragOver(e){
+  e.preventDefault();
+  e.dataTransfer.dropEffect='move';
+  dragDropTarget='table';
+  /* Find the row we're hovering over */
+  const tbody=document.getElementById('list');
+  const rows=Array.from(tbody.querySelectorAll('tr[data-chname]'));
+  const mouseY=e.clientY;
+  let closestRow=null;
+  let closestDist=Infinity;
+  let insertBefore=true;
+
+  for(let i=0;i<rows.length;i++){
+    const rect=rows[i].getBoundingClientRect();
+    const midY=rect.top+rect.height/2;
+    const dist=Math.abs(mouseY-midY);
+    if(dist<closestDist){
+      closestDist=dist;
+      closestRow=rows[i];
+      insertBefore=mouseY<midY;
+    }
+  }
+
+  /* Clean previous highlights */
+  if(lastDropRow&&lastDropRow!==closestRow){
+    lastDropRow.classList.remove('row-drop-above','row-drop-below');
+  }
+
+  if(closestRow){
+    closestRow.classList.remove('row-drop-above','row-drop-below');
+    if(insertBefore){
+      closestRow.classList.add('row-drop-above');
+    }else{
+      closestRow.classList.add('row-drop-below');
+    }
+    lastDropRow=closestRow;
+  }
+}
+
+function onTableDragLeave(e){
+  const tbody=document.getElementById('list');
+  if(!tbody.contains(e.relatedTarget)){
+    if(lastDropRow){
+      lastDropRow.classList.remove('row-drop-above','row-drop-below');
+      lastDropRow=null;
+    }
+  }
+}
+
+async function onTableDrop(e){
+  e.preventDefault();
+  e.stopPropagation();
+  const tbody=document.getElementById('list');
+  if(lastDropRow){lastDropRow.classList.remove('row-drop-above','row-drop-below');lastDropRow=null}
+  if(dropIndicatorEl&&dropIndicatorEl.parentNode){dropIndicatorEl.remove()}
+  dropIndicatorEl=null;
+  document.getElementById('dropHint').classList.remove('active');
+  if(!dragChanName)return;
+
+  /* Find target row and insert position from mouse Y */
+  const rows=Array.from(tbody.querySelectorAll('tr[data-chname]'));
+  let targetChName=null,placeBefore=true;
+  for(let i=0;i<rows.length;i++){
+    const rect=rows[i].getBoundingClientRect();
+    const midY=rect.top+rect.height/2;
+    if(e.clientY<midY){targetChName=rows[i].dataset.chname;placeBefore=true;break}
+    if(i===rows.length-1){targetChName=rows[i].dataset.chname;placeBefore=false}
+  }
+  if(!targetChName||targetChName===dragChanName)return;
+
+  /* Find the group and calculate correct target index within the group */
+  const dragCh=channels.find(c=>c.name===dragChanName);
+  if(!dragCh)return;
+  const grp=dragCh.grp;
+  const groupList=channels.filter(c=>c.grp===grp);
+  const targetIdx=groupList.findIndex(c=>c.name===targetChName);
+  const dragIdx=groupList.findIndex(c=>c.name===dragChanName);
+  if(targetIdx<0||dragIdx<0)return;
+
+  /* Calculate final position: API removes dragged item first, then inserts at target_index */
+  let finalIdx;
+  if(placeBefore){
+    finalIdx=dragIdx<targetIdx?targetIdx-1:targetIdx;
+  }else{
+    finalIdx=dragIdx<targetIdx?targetIdx:targetIdx+1;
+  }
+  finalIdx=Math.max(0,Math.min(finalIdx,groupList.length-1));
+
+  try{
+    const r=await fetch('/api/admin/reorder-to',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({channel:dragChanName,target_index:finalIdx})
+    });
+    const j=await r.json();
+    if(j.ok){
+      toast(j.message,'ok');
+      const r2=await fetch('/api/admin/channels');channels=await r2.json();
+      buildSidebar();render();
+    }else{toast(j.message||'Hata','err')}
+  }catch(ex){toast('Hata: '+ex,'err')}
 }
 
 function onGrpDragOver(e){
@@ -1095,6 +1196,13 @@ document.addEventListener('keydown',e=>{
 });
 
 load();
+
+/* Attach table-level drag events (delegation, only once) */
+const listTbody=document.getElementById('list');
+listTbody.addEventListener('dragover',onTableDragOver);
+listTbody.addEventListener('dragleave',onTableDragLeave);
+listTbody.addEventListener('drop',onTableDrop);
 </script>
 </body>
-</html>"""
+</html>
+"""

@@ -480,6 +480,75 @@ def reorder_channel(channel_name, direction):
     save_overrides_to_json()
     return True, f"{channel_name} {'asagi' if direction == 'down' else 'yukari'} tasindi"
 
+def reorder_channel_to_position(channel_name, target_index):
+    """Move a channel to a specific position index within its group. Used for drag-to-reorder.
+    target_index: 0-based index in the group's sorted channel list where the channel should end up."""
+    key = channel_name.upper().strip()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    # Get all channels in the same group, ordered by effective sort_order
+    c.execute("""SELECT c.name, c.grp,
+        CASE WHEN o.custom_sort_order > 0 THEN o.custom_sort_order ELSE c.sort_order END as eff_sort
+        FROM channels c
+        LEFT JOIN channel_overrides o ON UPPER(c.name) = o.channel_name
+        WHERE UPPER(c.name) = ?""", (key,))
+    target = c.fetchone()
+    if not target:
+        conn.close()
+        return False, "Kanal bulunamadi"
+
+    target_grp = target["grp"]
+    target_name = target["name"]
+
+    # Get all channels in the group
+    c.execute("""SELECT c.name,
+        CASE WHEN o.custom_sort_order > 0 THEN o.custom_sort_order ELSE c.sort_order END as eff_sort
+        FROM channels c
+        LEFT JOIN channel_overrides o ON UPPER(c.name) = o.channel_name
+        WHERE c.grp = ?
+        ORDER BY eff_sort, c.name""", (target_grp,))
+    group_channels = [dict(r) for r in c.fetchall()]
+
+    if len(group_channels) <= 1:
+        conn.close()
+        return False, "Grupta sadece 1 kanal"
+
+    # Find current index of target
+    current_idx = None
+    for i, ch in enumerate(group_channels):
+        if ch["name"].upper().strip() == key:
+            current_idx = i
+            break
+
+    if current_idx is None:
+        conn.close()
+        return False, "Kanal grupta bulunamadi"
+
+    # Clamp target index
+    target_index = max(0, min(target_index, len(group_channels) - 1))
+    if current_idx == target_index:
+        conn.close()
+        return False, "Zaten bu sirada"
+
+    # Remove target from list, insert at new position
+    removed = group_channels.pop(current_idx)
+    group_channels.insert(target_index, removed)
+
+    # Reassign sort_order to all channels in the group based on new positions
+    for idx, ch in enumerate(group_channels):
+        new_sort = idx + 1  # Start from 1
+        ch_key = ch["name"].upper().strip()
+        c.execute("INSERT OR REPLACE INTO channel_overrides (channel_name, target_group, custom_sort_order) VALUES (?, ?, ?)",
+            (ch_key, target_grp, new_sort))
+        c.execute("UPDATE channels SET sort_order = ? WHERE UPPER(name) = ?", (new_sort, ch_key))
+
+    conn.commit()
+    conn.close()
+    save_overrides_to_json()
+    return True, f"{channel_name} -> pozisyon {target_index + 1}"
+
 def import_overrides(overrides_dict):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
