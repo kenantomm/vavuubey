@@ -200,6 +200,11 @@ def init_db():
         picon TEXT DEFAULT '',
         sort_order INTEGER DEFAULT 9999
     )""")
+    # Override table for manual group assignments
+    c.execute("""CREATE TABLE IF NOT EXISTS channel_overrides (
+        channel_name TEXT PRIMARY KEY,
+        target_group TEXT NOT NULL
+    )""")
     # Migration: ensure columns exist (for old databases)
     try:
         cols = [row[1] for row in c.execute("PRAGMA table_info(channels)").fetchall()]
@@ -213,6 +218,8 @@ def init_db():
         pass
     conn.commit()
     conn.close()
+    # Load override cache into memory
+    load_overrides_cache()
 
 def get_channel(ch_id):
     conn = sqlite3.connect(DB_PATH)
@@ -282,6 +289,74 @@ def compute_sort_order(name, grp):
             return idx + 1
     # Unknown channel in group -> sort alphabetically at end
     return 9999 + sum(ord(c) for c in n[:5])
+
+# ===== OVERRIDE CACHE (in-memory for fast lookup) =====
+OVERRIDE_CACHE = {}
+
+def load_overrides_cache():
+    global OVERRIDE_CACHE
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT channel_name, target_group FROM channel_overrides")
+        OVERRIDE_CACHE = {row[0]: row[1] for row in c.fetchall()}
+        conn.close()
+        if OVERRIDE_CACHE:
+            add_log(f"Override cache: {len(OVERRIDE_CACHE)} kanal yuklendi")
+    except Exception:
+        OVERRIDE_CACHE = {}
+
+def get_override(channel_name):
+    return OVERRIDE_CACHE.get(channel_name.upper().strip())
+
+def set_override(channel_name, target_group):
+    key = channel_name.upper().strip()
+    OVERRIDE_CACHE[key] = target_group
+    sort_ord = compute_sort_order(channel_name, target_group)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO channel_overrides (channel_name, target_group) VALUES (?, ?)", (key, target_group))
+    c.execute("UPDATE channels SET grp = ?, sort_order = ? WHERE UPPER(name) = ?", (target_group, sort_ord, key))
+    conn.commit()
+    conn.close()
+
+def delete_override(channel_name):
+    key = channel_name.upper().strip()
+    OVERRIDE_CACHE.pop(key, None)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM channel_overrides WHERE channel_name = ?", (key,))
+    conn.commit()
+    conn.close()
+
+def delete_all_overrides():
+    global OVERRIDE_CACHE
+    OVERRIDE_CACHE = {}
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM channel_overrides")
+    conn.commit()
+    conn.close()
+
+def get_all_overrides():
+    return dict(OVERRIDE_CACHE)
+
+def import_overrides(overrides_dict):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    count = 0
+    for name, group in overrides_dict.items():
+        if not name or not group:
+            continue
+        key = name.upper().strip()
+        OVERRIDE_CACHE[key] = group
+        sort_ord = compute_sort_order(name, group)
+        c.execute("INSERT OR REPLACE INTO channel_overrides (channel_name, target_group) VALUES (?, ?)", (key, group))
+        c.execute("UPDATE channels SET grp = ?, sort_order = ? WHERE UPPER(name) = ?", (group, sort_ord, key))
+        count += 1
+    conn.commit()
+    conn.close()
+    return count
 
 def update_channel_hls(ch_id, hls_url):
     conn = sqlite3.connect(DB_PATH)
@@ -559,6 +634,11 @@ def remap_group(name, original_group="", country=""):
     # INFO tamamen sil
     if n in ("INFO", "INFO TV", "INFO HD"):
         return "__REMOVE__"
+
+    # ===== MANUAL OVERRIDE CHECK (first priority) =====
+    override = get_override(name)
+    if override:
+        return override
 
     ulusal_haber = ["HALK TV", "SOZCU", "SÖZCÜ", "SZC TV", "TELE1", "TELE 1"]
 
@@ -1002,6 +1082,18 @@ async def startup_sequence():
             add_log(f"HLS eslesme: {total_hls} kanal")
         except Exception as e:
             add_log(f"Catalog hatasi: {e}")
+
+    # Load overrides from environment variable (persists across HF Spaces restarts)
+    import os, base64, json as _json
+    env_overrides = os.environ.get("VXPARSER_OVERRIDES", "")
+    if env_overrides:
+        try:
+            env_data = _json.loads(base64.b64decode(env_overrides).decode("utf-8"))
+            if isinstance(env_data, dict):
+                cnt = import_overrides(env_data)
+                add_log(f"Env override: {cnt} kanal yuklendi")
+        except Exception as e:
+            add_log(f"Env override hatasi: {e}")
 
     # EPG Build (background, non-blocking)
     if epg:

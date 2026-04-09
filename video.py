@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse, Response
+from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse, Response, HTMLResponse
 from fastapi.routing import APIRoute
 import state
 import httpx
@@ -345,7 +345,258 @@ async def root(request: Request):
         f"VxParser Online\n\n"
         f"M3U: {host}/get.php?username=admin&password=admin&type=m3u_plus\n"
         f"EPG: {host}/epg.xml.gz\n"
+        f"Admin: {host}/admin\n"
         f"Status: {host}/api/status\n"
         f"Sig Test: {host}/api/test-sig\n"
         f"Logs: {host}/api/logs\n"
     )
+
+# ===== Admin Panel =====
+
+ALL_GROUPS = [
+    "TR ULUSAL", "TR SPOR", "TR SINEMA", "TR SINEMA VOD", "TR DIZI", "TR 7/24 DIZI",
+    "TR BELGESEL", "TR COCUK", "TR MUZIK", "TR HABER", "TR DINI", "TR YEREL",
+    "TR RADYO", "TR 4K", "TR 8K", "TR RAW",
+    "DE VOLLPROGRAMM", "DE NACHRICHTEN", "DE DOKU", "DE KINDER", "DE FILM",
+    "DE MUSIK", "DE SPORT", "DE SONSTIGE",
+]
+
+@app.get("/admin")
+async def admin_page():
+    return HTMLResponse(ADMIN_HTML)
+
+@app.get("/api/admin/channels")
+async def admin_get_channels():
+    channels = state.get_all_channels(ordered=True)
+    overrides = state.get_all_overrides()
+    return JSONResponse([{
+        "name": c["name"], "grp": c["grp"], "country": c["country"],
+        "id": c["id"], "has_override": c["name"].upper().strip() in overrides
+    } for c in channels])
+
+@app.get("/api/admin/overrides")
+async def admin_get_overrides():
+    return JSONResponse(state.get_all_overrides())
+
+@app.post("/api/admin/overrides")
+async def admin_save_overrides(request: Request):
+    data = await request.json()
+    if not isinstance(data, dict):
+        return JSONResponse({"error": "dict expected"}, status_code=400)
+    for name, group in data.items():
+        state.set_override(name, group)
+    return JSONResponse({"ok": True, "count": len(data)})
+
+@app.delete("/api/admin/overrides")
+async def admin_clear_overrides():
+    state.delete_all_overrides()
+    return JSONResponse({"ok": True})
+
+@app.get("/api/admin/overrides/export")
+async def admin_export_overrides():
+    overrides = state.get_all_overrides()
+    import json
+    text = json.dumps(overrides, indent=2, ensure_ascii=False)
+    return PlainTextResponse(text, media_type="application/json",
+                             headers={"Content-Disposition": "attachment; filename=vxparser-overrides.json"})
+
+@app.post("/api/admin/overrides/import")
+async def admin_import_overrides(request: Request):
+    data = await request.json()
+    if not isinstance(data, dict):
+        return JSONResponse({"error": "dict expected"}, status_code=400)
+    count = state.import_overrides(data)
+    return JSONResponse({"ok": True, "imported": count})
+
+ADMIN_HTML = """<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VxParser Admin</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d1117;color:#e6edf3;min-height:100vh}
+.wrap{max-width:1100px;margin:0 auto;padding:20px}
+h1{font-size:22px;margin-bottom:4px}h1 span{color:#58a6ff}
+.sub{color:#8b949e;font-size:13px;margin-bottom:16px}
+.stats{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap}
+.st{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 14px;flex:1;min-width:100px}
+.st b{font-size:20px;display:block}.st small{color:#8b949e;font-size:11px}
+.toolbar{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;align-items:center}
+input[type=text],select{background:#161b22;border:1px solid #30363d;color:#e6edf3;padding:8px 12px;border-radius:6px;font-size:14px;outline:none}
+input[type=text]:focus,select:focus{border-color:#58a6ff}
+input[type=text]{flex:1;min-width:180px}
+.btn{background:#21262d;border:1px solid #30363d;color:#e6edf3;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;transition:.15s}
+.btn:hover{background:#30363d}.btn-g{background:#238636;border-color:#2ea043}.btn-g:hover{background:#2ea043}
+.btn-r{background:#da3633;border-color:#f85149}.btn-r:hover{background:#f85149}
+.btn-b{background:#1f6feb;border-color:#388bfd}.btn-b:hover{background:#388bfd}
+.tbl{background:#161b22;border:1px solid #30363d;border-radius:8px;overflow:hidden}
+.tbl table{width:100%;border-collapse:collapse}
+.tbl th{background:#21262d;padding:10px 12px;text-align:left;font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;position:sticky;top:0;z-index:2}
+.tbl td{padding:6px 10px;border-top:1px solid #21262d;font-size:13px}
+.tbl .scr{max-height:65vh;overflow-y:auto}
+tr.changed{background:#1c2d1c}tr.changed td{border-top-color:#238636}
+.gsel{background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:4px 6px;border-radius:4px;font-size:12px;width:170px}
+.acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700}
+.b-tr{background:#1a2332;color:#58a6ff}.b-de{background:#2a1a1a;color:#f85149}
+.ov{color:#d29922;font-size:11px}
+.toast{position:fixed;bottom:20px;right:20px;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 20px;transform:translateY(80px);opacity:0;transition:.3s;z-index:99;font-size:14px}
+.toast.show{transform:translateY(0);opacity:1}.toast.ok{border-color:#3fb950}.toast.err{border-color:#f85149}
+#fileIn{display:none}
+.empty{text-align:center;padding:40px;color:#8b949e}
+.hdr{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="hdr">
+<div><h1>&#x1f4fa; VxParser <span>Admin</span></h1>
+<p class="sub">Kanallar\u0131 gruplar\u0131na ay\u0131r, de\u011fi\u015fiklikleri kaydet ve yedekle</p></div>
+</div>
+<div class="stats">
+<div class="st"><b id="sTotal">-</b><small>Toplam Kanal</small></div>
+<div class="st"><b id="sGroups">-</b><small>Grup</small></div>
+<div class="st"><b id="sOverride">-</b><small>Override</small></div>
+<div class="st"><b id="sChanged">0</b><small>Kaydedilmemi\u015f</small></div>
+</div>
+<div class="toolbar">
+<input type="text" id="search" placeholder="&#x1f50d; Kanal ara..." oninput="render()">
+<select id="gFilter" onchange="render()"><option value="">T\u00fcm Gruplar</option></select>
+<button class="btn btn-g" onclick="save()">&#x1f4be; Kaydet</button>
+</div>
+<div class="tbl"><div class="scr">
+<table>
+<thead><tr><th>Kanal Ad\u0131</th><th>\u00dclke</th><th>Mevcut Grup</th><th>Yeni Grup</th><th></th></tr></thead>
+<tbody id="list"></tbody>
+</table>
+</div></div>
+<div class="acts">
+<button class="btn btn-b" onclick="doExport()">&#x1f4e4; D\u0131\u015fa Aktar JSON</button>
+<button class="btn" onclick="document.getElementById('fileIn').click()">&#x1f4e5; \u0130\u00e7e Aktar JSON</button>
+<button class="btn" onclick="copyJson()">&#x1f4cb; Kopyala</button>
+<button class="btn btn-r" onclick="doReset()">&#x1f504; S\u0131f\u0131rla</button>
+</div>
+<input type="file" id="fileIn" accept=".json" onchange="doImport(event)">
+</div>
+<div class="toast" id="toast"></div>
+<script>
+const GRPS=["TR ULUSAL","TR SPOR","TR SINEMA","TR SINEMA VOD","TR DIZI","TR 7/24 DIZI","TR BELGESEL","TR COCUK","TR MUZIK","TR HABER","TR DINI","TR YEREL","TR RADYO","TR 4K","TR 8K","TR RAW","DE VOLLPROGRAMM","DE NACHRICHTEN","DE DOKU","DE KINDER","DE FILM","DE MUSIK","DE SPORT","DE SONSTIGE"];
+let channels=[],overrides={},changes={};
+
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function escA(s){return String(s).replace(/'/g,"\\\\'").replace(/"/g,'&quot;')}
+
+async function load(){
+  try{
+    const r=await fetch('/api/admin/channels');channels=await r.json();
+    const r2=await fetch('/api/admin/overrides');overrides=await r2.json();
+    changes={};
+    fillGroupFilter();render();
+  }catch(e){toast('Veri yuklenemedi: '+e,'err')}
+}
+
+function fillGroupFilter(){
+  const sel=document.getElementById('gFilter');
+  const seen=new Set();channels.forEach(c=>seen.add(c.grp));
+  sel.innerHTML='<option value="">Tüm Gruplar</option>';
+  [...seen].sort().forEach(g=>{sel.innerHTML+=`<option value="${g}">${g}</option>`});
+}
+
+function render(){
+  const q=document.getElementById('search').value.toUpperCase();
+  const gf=document.getElementById('gFilter').value;
+  let fl=channels.filter(c=>{
+    if(gf&&c.grp!==gf)return false;
+    if(q&&!c.name.toUpperCase().includes(q))return false;
+    return true;
+  });
+  const tb=document.getElementById('list');
+  if(!fl.length){tb.innerHTML='<tr><td colspan="5" class="empty">Kanal bulunamadı</td></tr>';updStats();return}
+  let h='';
+  fl.forEach(c=>{
+    const k=c.name,orig=c.grp;
+    const isOvr=overrides.hasOwnProperty(k.toUpperCase());
+    const isChg=changes.hasOwnProperty(k);
+    const cur=isChg?changes[k]:orig;
+    const rowCls=isChg?'changed':'';
+    const ovMark=isOvr&&!isChg?'<span class="ov">&#x270e; override</span>':'';
+    const chgMark=isChg?'<span class="ov" style="color:#3fb950">&#x270e; değişti</span>':'';
+    h+=`<tr class="${rowCls}"><td>${esc(c.name)} ${ovMark}${chgMark}</td><td><span class="badge ${c.country==='TR'?'b-tr':'b-de'}">${c.country}</span></td><td>${esc(orig)}</td><td><select class="gsel" onchange="chg('${escA(c.name)}',this.value)">${GRPS.map(g=>`<option value="${g}"${cur===g?' selected':''}>${g}</option>`).join('')}</select></td><td>${isChg?'<button class="btn" style="padding:3px 8px;font-size:11px" onclick="revert(\\''+escA(c.name)+'\\')">Geri Al</button>':''}</td></tr>`;
+  });
+  tb.innerHTML=h;
+  updStats();
+}
+
+function chg(name,val){
+  const c=channels.find(x=>x.name===name);if(!c)return;
+  if(val===c.grp&&!overrides[name.toUpperCase()])delete changes[name];
+  else changes[name]=val;
+  render();
+}
+
+function revert(name){delete changes[name];render()}
+
+async function save(){
+  const n=Object.keys(changes).length;
+  if(!n){toast('Kaydedilecek değişiklik yok');return}
+  try{
+    const r=await fetch('/api/admin/overrides',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)});
+    if(r.ok){overrides={...overrides};Object.entries(changes).forEach(([k,v])=>{overrides[k.toUpperCase()]=v});const c=channels.find(x=>x.name===Object.keys(changes)[0]);changes={};render();toast(n+' kanal kaydedildi!','ok')}
+    else toast('Hata!','err');
+  }catch(e){toast('Hata: '+e,'err')}
+}
+
+async function doExport(){
+  try{
+    const r=await fetch('/api/admin/overrides/export');
+    const blob=await r.blob();const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);a.download='vxparser-overrides.json';a.click();
+    toast('Dosya indirildi','ok');
+  }catch(e){toast('Export hatası','err')}
+}
+
+function doImport(ev){
+  const f=ev.target.files[0];if(!f)return;
+  const rd=new FileReader();
+  rd.onload=async(e)=>{
+    try{
+      const d=JSON.parse(e.target.result);
+      const r=await fetch('/api/admin/overrides/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
+      if(r.ok){const j=await r.json();toast(j.imported+' override yuklendi','ok');load()}
+      else toast('Import hatası','err');
+    }catch(ex){toast('JSON parse hatası','err')}
+  };rd.readAsText(f);ev.target.value='';
+}
+
+function copyJson(){
+  const t=JSON.stringify(overrides,null,2);navigator.clipboard.writeText(t).then(()=>toast('Kopyalandı!','ok')).catch(()=>toast('Kopyalama hatası','err'));
+}
+
+async function doReset(){
+  if(!confirm('Tüm override\'ları silmek istediğinize emin misiniz?'))return;
+  try{
+    await fetch('/api/admin/overrides',{method:'DELETE'});
+    overrides={};changes={};render();toast('Tüm override\'lar silindi','ok');
+  }catch(e){toast('Hata','err')}
+}
+
+function updStats(){
+  document.getElementById('sTotal').textContent=channels.length;
+  const g=new Set(channels.map(c=>c.grp));
+  document.getElementById('sGroups').textContent=g.size;
+  document.getElementById('sOverride').textContent=Object.keys(overrides).length;
+  const nc=Object.keys(changes).length;
+  const el=document.getElementById('sChanged');el.textContent=nc;
+  el.style.color=nc?'#d29922':'';
+}
+
+function toast(msg,type){
+  const t=document.getElementById('toast');t.textContent=msg;t.className='toast show '+(type||'');
+  setTimeout(()=>t.className='toast',2500);
+}
+
+load();
+</script>
+</body>
+</html>"""
