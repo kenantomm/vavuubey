@@ -14,7 +14,13 @@ STARTUP_LOGS = []
 VAVOO_TOKEN = ""
 WATCHED_SIG = ""
 WATCHED_SIG_TIME = 0
+# Use persistent storage on HuggingFace Spaces (/data/ is persistent)
+# Fallback to /tmp/ if /data/ is not writable
+import os
+_PERSISTENT_DIR = "/data"
+_DB_PATH_SET = False
 DB_PATH = "/tmp/vxparser.db"
+OVERRIDE_JSON_PATH = "/tmp/vxparser-overrides.json"
 RESOLVE_CACHE = {}
 SIG_REFRESH_INTERVAL = 1800
 SELF_PING_INTERVAL = 240
@@ -186,6 +192,19 @@ CHANNEL_ORDER = {
 
 
 def init_db():
+    global DB_PATH, OVERRIDE_JSON_PATH, _DB_PATH_SET
+    if not _DB_PATH_SET:
+        if os.path.isdir(_PERSISTENT_DIR) and os.access(_PERSISTENT_DIR, os.W_OK):
+            DB_PATH = os.path.join(_PERSISTENT_DIR, "vxparser.db")
+            OVERRIDE_JSON_PATH = os.path.join(_PERSISTENT_DIR, "vxparser-overrides.json")
+            add_log(f"Kalici depolama: /data/ (override'lar korunacak)")
+        else:
+            DB_PATH = "/tmp/vxparser.db"
+            OVERRIDE_JSON_PATH = "/tmp/vxparser-overrides.json"
+            add_log(f"UYARI: /data/ yazilabilir degil, gecici depolama kullaniliyor")
+            add_log(f"  -> Override'lar restartta silinebilir! JSON export/import kullanin.")
+        _DB_PATH_SET = True
+    
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS channels (
@@ -218,8 +237,10 @@ def init_db():
         pass
     conn.commit()
     conn.close()
-    # Load override cache into memory
+    # Load override cache into memory (from DB first, then merge with JSON backup)
     load_overrides_cache()
+    # Also load from JSON backup for persistence across restarts
+    load_overrides_from_json()
 
 def get_channel(ch_id):
     conn = sqlite3.connect(DB_PATH)
@@ -309,6 +330,27 @@ def load_overrides_cache():
 def get_override(channel_name):
     return OVERRIDE_CACHE.get(channel_name.upper().strip())
 
+def save_overrides_to_json():
+    """Backup overrides to JSON file for persistence across restarts"""
+    try:
+        with open(OVERRIDE_JSON_PATH, 'w', encoding='utf-8') as f:
+            json.dump(OVERRIDE_CACHE, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        add_log(f"Override JSON kayit hatasi: {e}")
+
+def load_overrides_from_json():
+    """Load overrides from JSON backup file"""
+    global OVERRIDE_CACHE
+    try:
+        if os.path.exists(OVERRIDE_JSON_PATH):
+            with open(OVERRIDE_JSON_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    OVERRIDE_CACHE.update(data)
+                    add_log(f"Override JSON'dan {len(data)} kayit yuklendi")
+    except Exception as e:
+        add_log(f"Override JSON yukleme hatasi: {e}")
+
 def set_override(channel_name, target_group):
     key = channel_name.upper().strip()
     OVERRIDE_CACHE[key] = target_group
@@ -319,6 +361,8 @@ def set_override(channel_name, target_group):
     c.execute("UPDATE channels SET grp = ?, sort_order = ? WHERE UPPER(name) = ?", (target_group, sort_ord, key))
     conn.commit()
     conn.close()
+    # Also save to JSON for persistence
+    save_overrides_to_json()
 
 def delete_override(channel_name):
     key = channel_name.upper().strip()
@@ -328,6 +372,7 @@ def delete_override(channel_name):
     c.execute("DELETE FROM channel_overrides WHERE channel_name = ?", (key,))
     conn.commit()
     conn.close()
+    save_overrides_to_json()
 
 def delete_all_overrides():
     global OVERRIDE_CACHE
@@ -337,6 +382,7 @@ def delete_all_overrides():
     c.execute("DELETE FROM channel_overrides")
     conn.commit()
     conn.close()
+    save_overrides_to_json()
 
 def get_all_overrides():
     return dict(OVERRIDE_CACHE)
@@ -356,6 +402,7 @@ def import_overrides(overrides_dict):
         count += 1
     conn.commit()
     conn.close()
+    save_overrides_to_json()
     return count
 
 def update_channel_hls(ch_id, hls_url):

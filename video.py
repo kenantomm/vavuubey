@@ -1000,21 +1000,44 @@ function onGrpDrop(e){
   gi.classList.remove('drop-target','drop-reject');
   document.getElementById('dropHint').classList.remove('active');
 
-  if(!dragChanName||!targetGroup)return;
+  if(!targetGroup)return;
 
-  const c=channels.find(x=>x.name===dragChanName);
-  if(!c)return;
-
-  /* Apply the change */
-  const curGrp=c.grp;
-  if(targetGroup===curGrp&&!overrides[dragChanName.toUpperCase()]){
-    toast(c.name+' zaten '+targetGroup+' grubunda','ok');
-    return;
+  /* Collect all channels to move: dragged + all selected (if multi-select) */
+  let namesToMove=[];
+  if(dragChanName)namesToMove.push(dragChanName);
+  /* If there are other selected channels (checkbox), include them too */
+  if(selected.size>0){
+    selected.forEach(name=>{if(!namesToMove.includes(name))namesToMove.push(name)});
   }
-  changes[dragChanName]=targetGroup;
+
+  if(!namesToMove.length)return;
+
+  let movedCount=0,skippedCount=0;
+  namesToMove.forEach(name=>{
+    const c=channels.find(x=>x.name===name);
+    if(!c)return;
+    const curGrp=c.grp;
+    if(targetGroup===curGrp&&!overrides[name.toUpperCase()]){
+      skippedCount++;
+      return;
+    }
+    changes[name]=targetGroup;
+    movedCount++;
+  });
+
+  /* Clear selection after drop */
+  selected=new Set();
+
   buildSidebar();
   render();
-  toast(c.name+' → '+targetGroup+' (kaydetmek icin Kaydet basin)','ok');
+
+  if(movedCount===1){
+    toast(namesToMove[0]+' → '+targetGroup+' (Kaydet basin)','ok');
+  }else if(movedCount>1){
+    toast(movedCount+' kanal '+targetGroup+' grubuna tasindi (Kaydet basin)','ok');
+  }else if(skippedCount>0){
+    toast(skippedCount+' kanal zaten '+targetGroup+' grubunda','ok');
+  }
 }
 
 /* ===== KEYBOARD SHORTCUTS ===== */
