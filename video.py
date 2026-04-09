@@ -3,6 +3,7 @@ from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse
 import state
 import httpx
 import time
+import asyncio
 
 app = FastAPI(title="VxParser")
 
@@ -75,7 +76,6 @@ async def proxy_stream(url, ch_id):
             r = await client.get(url, headers=VAVOO_HEADERS)
             if r.status_code != 200:
                 return JSONResponse({"error": f"upstream {r.status_code}", "url": url[:100]}, status_code=502)
-            content_type = r.headers.get("content-type", "")
             base = url.rsplit("/", 1)[0] + "/"
             def rewrite(line):
                 line = line.strip()
@@ -124,6 +124,31 @@ async def channel_substream(ch_id: int, url: str):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
+# === KEEPALIVE / HEALTH ===
+
+@app.get("/ping")
+async def ping():
+    """Ultra-lightweight health check. UptimeRobot uses this.
+    Also triggers sig refresh if older than 25 minutes."""
+    sig_age = time.time() - state.WATCHED_SIG_TIME if state.WATCHED_SIG_TIME else 9999
+    if sig_age > 1500:  # 25 minutes
+        asyncio.create_task(state.refresh_watched_sig(force=True))
+    return PlainTextResponse("pong", status_code=200)
+
+@app.get("/wake")
+async def wake():
+    """Full health check + recovery. Use this for manual wake-up."""
+    result = {"awake": True, "data_ready": state.DATA_READY, "sig": bool(state.WATCHED_SIG)}
+    if not state.DATA_READY:
+        asyncio.create_task(state.startup_sequence())
+        result["restarting"] = True
+    if not state.WATCHED_SIG:
+        await state.refresh_watched_sig(force=True)
+        result["sig_refreshed"] = bool(state.WATCHED_SIG)
+    return JSONResponse(result)
+
+# === DEBUG ===
+
 @app.get("/test/{ch_id}")
 async def test_channel(ch_id: int):
     ch = state.get_channel(ch_id)
@@ -131,37 +156,11 @@ async def test_channel(ch_id: int):
         return JSONResponse({"error": "Not found"}, status_code=404)
     return JSONResponse(ch)
 
-@app.get("/api/test-sig")
-async def test_sig():
-    results = {}
-    sig = await state.get_watched_sig()
-    results["lokke_sig"] = bool(sig)
-    results["sig_preview"] = sig[:50] + "..." if sig else None
-    if sig:
-        try:
-            catalog = await state.fetch_catalog("Turkey", 0)
-            if isinstance(catalog, dict):
-                items = catalog.get("items", [])
-                results["catalog_turkey"] = {"count": len(items), "first": items[0] if items else None}
-        except Exception as e:
-            results["catalog_turkey"] = {"error": str(e)}
-        import sqlite3
-        conn = sqlite3.connect(state.DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT id, name, url, hls FROM channels WHERE country='TR' LIMIT 1")
-        row = c.fetchone()
-        conn.close()
-        if row:
-            test_url = row[3] if row[3] else row[2]
-            resolved = await state.resolve_mediahubmx(test_url)
-            results["resolve"] = {"channel": row[1], "input": test_url[:80], "resolved": resolved}
-    return JSONResponse(results)
-
 @app.get("/api/status")
 async def api_status(request: Request):
     host = detect_host(request)
     import sqlite3
-    info = {"data_ready": state.DATA_READY, "host": host, "watched_sig": bool(state.WATCHED_SIG), "startup_logs": state.STARTUP_LOGS[-30:]}
+    info = {"data_ready": state.DATA_READY, "host": host, "sig": bool(state.WATCHED_SIG), "sig_age_sec": int(time.time() - state.WATCHED_SIG_TIME) if state.WATCHED_SIG_TIME else -1, "cache_size": len(state.RESOLVE_CACHE), "startup_logs": state.STARTUP_LOGS[-20:]}
     try:
         conn = sqlite3.connect(state.DB_PATH)
         c = conn.cursor()
@@ -173,8 +172,6 @@ async def api_status(request: Request):
         info["tr"] = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM channels WHERE country='DE'")
         info["de"] = c.fetchone()[0]
-        c.execute("SELECT id, name, url, hls FROM channels WHERE country='TR' LIMIT 2")
-        info["samples"] = [{"id": r[0], "name": r[1], "url": r[2], "hls": r[3]} for r in c.fetchall()]
         conn.close()
     except Exception as e:
         info["db_error"] = str(e)
@@ -191,4 +188,4 @@ async def stats():
 @app.get("/")
 async def root(request: Request):
     host = detect_host(request)
-    return PlainTextResponse(f"VxParser Online\n\nM3U: {host}/get.php?username=admin&password=admin&type=m3u_plus\nSig: {host}/api/test-sig\nLogs: {host}/api/logs\n")
+    return PlainTextResponse(f"VxParser Online\n\nM3U: {host}/get.php?username=admin&password=admin&type=m3u_plus\nPing: {host}/ping\nLogs: {host}/api/logs\n")
