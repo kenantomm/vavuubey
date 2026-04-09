@@ -10,4 +10,4 @@ pinned: false
 
 # Omer
 
-Personal streaming project.
+Personal project.
