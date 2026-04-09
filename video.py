@@ -1,8 +1,9 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse, Response
 from fastapi.routing import APIRoute
 import state
 import httpx
+import time
 
 app = FastAPI(title="VxParser")
 
@@ -19,15 +20,26 @@ def detect_host(request: Request) -> str:
     return f"{forwarded}://{host}"
 
 def build_m3u(host: str) -> str:
+    """Build M3U playlist with tvg-id, tvg-logo, tvg-name"""
     lines = ['#EXTM3U url-tvg="" deinterlace="1"']
     channels = state.get_all_channels(ordered=True)
     for ch in channels:
         ch_id = ch["id"]
         ch_name = ch["name"]
         ch_grp = ch["grp"]
-        ch_logo = ch.get("logo", "")
-        logo_param = f' tvg-logo="{ch_logo}"' if ch_logo else ""
-        lines.append(f'#EXTINF:-1 group-title="{ch_grp}"{logo_param},{ch_name}')
+        ch_logo = ch.get("picon", "") or ch.get("logo", "")
+        ch_tvg_id = ch.get("tvg_id", "")
+        
+        # Build EXTINF line
+        attrs = []
+        if ch_tvg_id:
+            attrs.append(f'tvg-id="{ch_tvg_id}"')
+        if ch_logo:
+            attrs.append(f'tvg-logo="{ch_logo}"')
+        attrs.append(f'group-title="{ch_grp}"')
+        
+        attr_str = " ".join(attrs)
+        lines.append(f'#EXTINF:-1 {attr_str},{ch_name}')
         lines.append(f'{host}/channel/{ch_id}')
     return "\n".join(lines)
 
@@ -45,8 +57,85 @@ async def player_api(request: Request, username: str = "", password: str = "", a
             groups[ch["grp"]] = groups.get(ch["grp"], 0) + 1
         return JSONResponse([{"category_id": str(i+1), "category_name": g, "parent_id": 0} for i, g in enumerate(groups.keys())])
     elif action == "get_live_streams":
-        return JSONResponse([{"num": i+1, "name": ch["name"], "stream_type": "live", "stream_id": ch["id"], "stream_icon": ch.get("logo", ""), "epg_channel_id": "", "added": "", "category_id": "", "custom_sid": "", "tv_archive": 0, "direct_source": "", "tv_archive_duration": 0} for i, ch in enumerate(state.get_all_channels(ordered=True))])
+        return JSONResponse([{
+            "num": i+1,
+            "name": ch["name"],
+            "stream_type": "live",
+            "stream_id": ch["id"],
+            "stream_icon": ch.get("picon", "") or ch.get("logo", ""),
+            "epg_channel_id": ch.get("tvg_id", ""),
+            "added": "",
+            "category_id": "",
+            "custom_sid": "",
+            "tv_archive": 0,
+            "direct_source": "",
+            "tv_archive_duration": 0
+        } for i, ch in enumerate(state.get_all_channels(ordered=True))])
     return PlainTextResponse(build_m3u(host), media_type="audio/x-mpegurl")
+
+# ===== EPG Endpoints =====
+
+@app.get("/epg.xml")
+async def get_epg_xml():
+    """Serve EPG XML file"""
+    try:
+        import epg
+        xml_str = epg.get_cached_epg_xml()
+        if xml_str:
+            return PlainTextResponse(xml_str, media_type="application/xml; charset=utf-8")
+    except Exception as e:
+        state.add_log(f"EPG XML serve error: {e}")
+    return PlainTextResponse('<?xml version="1.0" encoding="utf-8"?><tv></tv>', media_type="application/xml; charset=utf-8")
+
+@app.get("/epg.xml.gz")
+async def get_epg_gz():
+    """Serve gzipped EPG XML"""
+    try:
+        import epg
+        gz_data = epg.get_cached_epg_gz()
+        if gz_data:
+            return Response(content=gz_data, media_type="application/x-gzip",
+                          headers={"Content-Disposition": "attachment; filename=epg.xml.gz"})
+    except Exception as e:
+        state.add_log(f"EPG GZ serve error: {e}")
+    # Return empty gz
+    import gzip
+    empty = gzip.compress(b'<?xml version="1.0" encoding="utf-8"?><tv></tv>')
+    return Response(content=empty, media_type="application/x-gzip")
+
+@app.get("/xmltv.xml")
+async def get_xmltv():
+    """Serve XMLTV format EPG (alias for epg.xml)"""
+    return await get_epg_xml()
+
+# ===== Picon Proxy Endpoint =====
+
+@app.get("/picon/{ch_name:path}")
+async def get_picon(ch_name: str):
+    """Proxy picon images to avoid CORS and mixed content issues"""
+    try:
+        # Try to find channel by name and get its picon URL
+        channels = state.get_all_channels(ordered=False)
+        for ch in channels:
+            ch_norm = ch["name"].upper().strip()
+            req_norm = ch_name.upper().strip().replace("_", " ").replace("-", " ")
+            if ch_norm == req_norm or ch_norm in req_norm or req_norm in ch_norm:
+                picon_url = ch.get("picon", "") or ch.get("logo", "")
+                if picon_url:
+                    async with httpx.AsyncClient(timeout=10, verify=False) as client:
+                        r = await client.get(picon_url, follow_redirects=True)
+                        if r.status_code == 200:
+                            ct = r.headers.get("content-type", "image/png")
+                            return Response(content=r.content, media_type=ct)
+                break
+    except Exception:
+        pass
+    # Fallback: return 1x1 transparent PNG
+    import base64
+    tiny_png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPj/HwADBwIAMCbHYQAAAABJRU5ErkJggg==")
+    return Response(content=tiny_png, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+
+# ===== Channel Stream Endpoints =====
 
 @app.get("/channel/{ch_id}")
 async def channel_stream(ch_id: int):
@@ -65,7 +154,7 @@ async def channel_stream(ch_id: int):
     # Try HLS URL from catalog first
     hls = ch.get("hls", "")
     if hls:
-        add_log(f"[{ch_id}] Catalog HLS resolve: {hls[:80]}")
+        state.add_log(f"[{ch_id}] Catalog HLS resolve: {hls[:80]}")
         resolved = await state.resolve_mediahubmx(hls)
         if resolved:
             state.RESOLVE_CACHE[cache_key] = {"url": resolved, "expires": time.time() + 300}
@@ -146,10 +235,10 @@ async def channel_substream(ch_id: int, url: str):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
+# ===== Utility Endpoints =====
+
 def add_log(msg):
     state.add_log(msg)
-
-import time
 
 @app.get("/test/{ch_id}")
 async def test_channel(ch_id: int):
@@ -162,13 +251,11 @@ async def test_channel(ch_id: int):
 async def test_sig():
     """Test Lokke signature and MediaHubMX catalog"""
     results = {}
-    # Test 1: Lokke signature
     sig = await state.get_watched_sig()
     results["lokke_sig"] = bool(sig)
     results["sig_preview"] = sig[:50] + "..." if sig else None
     results["watched_sig"] = bool(state.WATCHED_SIG)
 
-    # Test 2: Catalog fetch
     if sig:
         try:
             catalog = await state.fetch_catalog("Turkey", 0)
@@ -183,7 +270,6 @@ async def test_sig():
         except Exception as e:
             results["catalog_turkey"] = {"error": str(e)}
 
-        # Test 3: Resolve
         import sqlite3
         conn = sqlite3.connect(state.DB_PATH)
         c = conn.cursor()
@@ -206,7 +292,14 @@ async def test_sig():
 async def api_status(request: Request):
     host = detect_host(request)
     import sqlite3
-    info = {"data_ready": state.DATA_READY, "host": host, "watched_sig": bool(state.WATCHED_SIG), "resolve_cache_size": len(state.RESOLVE_CACHE), "startup_logs": state.STARTUP_LOGS[-30:]}
+    info = {
+        "data_ready": state.DATA_READY,
+        "epg_ready": state.EPG_READY,
+        "host": host,
+        "watched_sig": bool(state.WATCHED_SIG),
+        "resolve_cache_size": len(state.RESOLVE_CACHE),
+        "startup_logs": state.STARTUP_LOGS[-30:]
+    }
     try:
         conn = sqlite3.connect(state.DB_PATH)
         c = conn.cursor()
@@ -218,10 +311,14 @@ async def api_status(request: Request):
         info["tr_channels"] = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM channels WHERE country='DE'")
         info["de_channels"] = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM channels WHERE tvg_id != ''")
+        info["epg_mapped"] = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM channels WHERE picon != ''")
+        info["picon_mapped"] = c.fetchone()[0]
         c.execute("SELECT DISTINCT grp FROM channels ORDER BY grp")
         info["groups"] = [r[0] for r in c.fetchall()]
-        c.execute("SELECT id, name, url, hls FROM channels WHERE country='TR' LIMIT 3")
-        info["sample_tr"] = [{"id": r[0], "name": r[1], "url": r[2], "hls": r[3]} for r in c.fetchall()]
+        c.execute("SELECT id, name, url, hls, tvg_id, picon FROM channels WHERE country='TR' LIMIT 3")
+        info["sample_tr"] = [{"id": r[0], "name": r[1], "url": r[2], "hls": r[3], "tvg_id": r[4], "picon": r[5]} for r in c.fetchall()]
         conn.close()
     except Exception as e:
         info["db_error"] = str(e)
@@ -247,6 +344,7 @@ async def root(request: Request):
     return PlainTextResponse(
         f"VxParser Online\n\n"
         f"M3U: {host}/get.php?username=admin&password=admin&type=m3u_plus\n"
+        f"EPG: {host}/epg.xml.gz\n"
         f"Status: {host}/api/status\n"
         f"Sig Test: {host}/api/test-sig\n"
         f"Logs: {host}/api/logs\n"

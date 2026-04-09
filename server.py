@@ -40,11 +40,25 @@ async def run_sig_refresh():
         await asyncio.sleep(10)
         asyncio.create_task(run_sig_refresh())
 
+async def run_epg_refresh():
+    """Background task: EPG refresh every 6 hours"""
+    await asyncio.sleep(60)  # Wait for initial startup to complete
+    try:
+        import epg
+        state.add_log("EPG refresh loop basladi")
+        await epg.epg_refresh_loop()
+    except ImportError:
+        state.add_log("EPG modulu bulunamadi, refresh atlanacak")
+    except Exception as e:
+        state.add_log(f"EPG refresh CRITICAL: {e}")
+        import traceback
+        state.add_log(traceback.format_exc())
+
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(run_startup())
-    # Sig refresh loop hemen baslat (startup bittikten sonra da calisir)
     asyncio.create_task(run_sig_refresh())
+    asyncio.create_task(run_epg_refresh())
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
