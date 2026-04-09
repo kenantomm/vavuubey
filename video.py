@@ -30,7 +30,6 @@ def build_m3u(host: str) -> str:
         ch_logo = ch.get("picon", "") or ch.get("logo", "")
         ch_tvg_id = ch.get("tvg_id", "")
         
-        # Build EXTINF line
         attrs = []
         if ch_tvg_id:
             attrs.append(f'tvg-id="{ch_tvg_id}"')
@@ -98,7 +97,6 @@ async def get_epg_gz():
                           headers={"Content-Disposition": "attachment; filename=epg.xml.gz"})
     except Exception as e:
         state.add_log(f"EPG GZ serve error: {e}")
-    # Return empty gz
     import gzip
     empty = gzip.compress(b'<?xml version="1.0" encoding="utf-8"?><tv></tv>')
     return Response(content=empty, media_type="application/x-gzip")
@@ -114,7 +112,6 @@ async def get_xmltv():
 async def get_picon(ch_name: str):
     """Proxy picon images to avoid CORS and mixed content issues"""
     try:
-        # Try to find channel by name and get its picon URL
         channels = state.get_all_channels(ordered=False)
         for ch in channels:
             ch_norm = ch["name"].upper().strip()
@@ -130,7 +127,6 @@ async def get_picon(ch_name: str):
                 break
     except Exception:
         pass
-    # Fallback: return 1x1 transparent PNG
     import base64
     tiny_png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPj/HwADBwIAMCbHYQAAAABJRU5ErkJggg==")
     return Response(content=tiny_png, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
@@ -144,14 +140,12 @@ async def channel_stream(ch_id: int):
     if not ch:
         return JSONResponse({"error": "Not found"}, status_code=404)
 
-    # Check resolve cache first
     cache_key = str(ch_id)
     if cache_key in state.RESOLVE_CACHE:
         cached = state.RESOLVE_CACHE[cache_key]
         if cached.get("expires", 0) > time.time():
             return await proxy_stream(cached["url"], ch_id)
 
-    # Try HLS URL from catalog first
     hls = ch.get("hls", "")
     if hls:
         state.add_log(f"[{ch_id}] Catalog HLS resolve: {hls[:80]}")
@@ -160,7 +154,6 @@ async def channel_stream(ch_id: int):
             state.RESOLVE_CACHE[cache_key] = {"url": resolved, "expires": time.time() + 300}
             return await proxy_stream(resolved, ch_id)
 
-    # Try resolving the original URL
     url = ch.get("url", "")
     if url:
         resolved = await state.resolve_mediahubmx(url)
@@ -168,7 +161,6 @@ async def channel_stream(ch_id: int):
             state.RESOLVE_CACHE[cache_key] = {"url": resolved, "expires": time.time() + 300}
             return await proxy_stream(resolved, ch_id)
 
-    # Fallback: try direct proxy of original URL
     if url:
         return await proxy_stream(url, ch_id)
 
@@ -371,7 +363,8 @@ async def admin_get_channels():
     overrides = state.get_all_overrides()
     return JSONResponse([{
         "name": c["name"], "grp": c["grp"], "country": c["country"],
-        "id": c["id"], "has_override": c["name"].upper().strip() in overrides
+        "id": c["id"], "logo": c.get("picon", "") or c.get("logo", ""),
+        "has_override": c["name"].upper().strip() in overrides
     } for c in channels])
 
 @app.get("/api/admin/overrides")
@@ -408,111 +401,344 @@ async def admin_import_overrides(request: Request):
     count = state.import_overrides(data)
     return JSONResponse({"ok": True, "imported": count})
 
-ADMIN_HTML = """<!DOCTYPE html>
+ADMIN_HTML = r"""<!DOCTYPE html>
 <html lang="tr">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VxParser Admin</title>
 <style>
+:root{
+  --bg:#0a0e17;--bg2:#111827;--bg3:#1a2236;--bg4:#232d42;
+  --border:#2a3550;--border2:#3a4a6b;
+  --text:#e2e8f0;--text2:#94a3b8;--text3:#64748b;
+  --blue:#3b82f6;--blue2:#2563eb;--blue-bg:rgba(59,130,246,.1);
+  --green:#22c55e;--green-bg:rgba(34,197,94,.1);
+  --red:#ef4444;--red-bg:rgba(239,68,68,.1);
+  --yellow:#f59e0b;--yellow-bg:rgba(245,158,11,.1);
+  --purple:#a855f7;--purple-bg:rgba(168,85,247,.1);
+  --sidebar-w:280px;
+}
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d1117;color:#e6edf3;min-height:100vh}
-.wrap{max-width:1100px;margin:0 auto;padding:20px}
-h1{font-size:22px;margin-bottom:4px}h1 span{color:#58a6ff}
-.sub{color:#8b949e;font-size:13px;margin-bottom:16px}
-.stats{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap}
-.st{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 14px;flex:1;min-width:100px}
-.st b{font-size:20px;display:block}.st small{color:#8b949e;font-size:11px}
-.toolbar{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;align-items:center}
-input[type=text],select{background:#161b22;border:1px solid #30363d;color:#e6edf3;padding:8px 12px;border-radius:6px;font-size:14px;outline:none}
-input[type=text]:focus,select:focus{border-color:#58a6ff}
-input[type=text]{flex:1;min-width:180px}
-.btn{background:#21262d;border:1px solid #30363d;color:#e6edf3;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;transition:.15s}
-.btn:hover{background:#30363d}.btn-g{background:#238636;border-color:#2ea043}.btn-g:hover{background:#2ea043}
-.btn-r{background:#da3633;border-color:#f85149}.btn-r:hover{background:#f85149}
-.btn-b{background:#1f6feb;border-color:#388bfd}.btn-b:hover{background:#388bfd}
-.tbl{background:#161b22;border:1px solid #30363d;border-radius:8px;overflow:hidden}
+body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow:hidden}
+.app{display:flex;height:100vh}
+.sidebar{width:var(--sidebar-w);min-width:var(--sidebar-w);background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;height:100vh;overflow:hidden;transition:transform .3s}
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+
+/* SIDEBAR */
+.sb-hdr{padding:20px;border-bottom:1px solid var(--border);background:linear-gradient(135deg,var(--bg2),var(--bg3))}
+.sb-hdr h1{font-size:18px;font-weight:700;display:flex;align-items:center;gap:10px}
+.sb-hdr h1 .icon{width:32px;height:32px;background:linear-gradient(135deg,var(--blue),var(--purple));border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;color:#fff}
+.sb-hdr p{font-size:11px;color:var(--text3);margin-top:4px;letter-spacing:.3px}
+
+.sb-search{padding:12px}
+.sb-search .search-box{position:relative}
+.sb-search input{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:9px 12px 9px 36px;border-radius:8px;font-size:13px;outline:none;transition:.2s}
+.sb-search input:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(59,130,246,.15)}
+.sb-search .s-icon{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--text3);font-size:14px;pointer-events:none}
+.sb-search .s-clear{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text3);cursor:pointer;font-size:16px;display:none;padding:2px 4px;border-radius:4px}
+.sb-search .s-clear:hover{color:var(--text);background:var(--bg3)}
+.sb-search input:not(:placeholder-shown)~.s-clear{display:block}
+
+.sb-groups{flex:1;overflow-y:auto;padding:4px 8px 16px}
+.sb-groups::-webkit-scrollbar{width:4px}
+.sb-groups::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+.sb-section{margin-top:8px}
+.sb-section-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;color:var(--text3);padding:8px 10px 4px;display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none}
+.sb-section-title:hover{color:var(--text2)}
+.sb-section-title .arrow{font-size:8px;transition:transform .2s}
+.sb-section-title.collapsed .arrow{transform:rotate(-90deg)}
+.sb-section-body.collapsed{display:none}
+.grp-item{display:flex;align-items:center;padding:7px 10px;border-radius:6px;cursor:pointer;transition:.15s;gap:8px;font-size:13px;margin:1px 0}
+.grp-item:hover{background:var(--bg3)}
+.grp-item.active{background:var(--blue-bg);color:var(--blue);font-weight:600}
+.grp-item .g-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.grp-item .g-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.grp-item .g-cnt{font-size:11px;color:var(--text3);background:var(--bg);padding:1px 7px;border-radius:10px;font-weight:600}
+.grp-item.active .g-cnt{background:rgba(59,130,246,.2);color:var(--blue)}
+
+.sb-footer{padding:12px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:4px}
+.sb-footer .sbtn{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:6px;border:none;background:none;color:var(--text2);font-size:12px;cursor:pointer;transition:.15s;width:100%;text-align:left}
+.sb-footer .sbtn:hover{background:var(--bg3);color:var(--text)}
+.sb-footer .sbtn svg{width:16px;height:16px;flex-shrink:0}
+
+/* TOP BAR */
+.topbar{padding:16px 24px;border-bottom:1px solid var(--border);background:var(--bg2);display:flex;align-items:center;gap:16px;flex-shrink:0}
+.topbar .mob-toggle{display:none;background:none;border:none;color:var(--text);font-size:20px;cursor:pointer;padding:4px}
+.stats-row{display:flex;gap:12px;flex:1;flex-wrap:wrap}
+.stat-card{display:flex;align-items:center;gap:10px;padding:8px 16px;background:var(--bg);border:1px solid var(--border);border-radius:10px;min-width:120px}
+.stat-card .sc-icon{width:36px;height:36px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
+.stat-card .sc-icon.blue{background:var(--blue-bg);color:var(--blue)}
+.stat-card .sc-icon.green{background:var(--green-bg);color:var(--green)}
+.stat-card .sc-icon.yellow{background:var(--yellow-bg);color:var(--yellow)}
+.stat-card .sc-icon.purple{background:var(--purple-bg);color:var(--purple)}
+.stat-card .sc-info b{display:block;font-size:18px;font-weight:700;line-height:1.2}
+.stat-card .sc-info small{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px}
+.topbar-actions{display:flex;gap:8px;flex-shrink:0}
+
+/* TOOLBAR */
+.toolbar{padding:12px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;background:var(--bg2);flex-shrink:0;flex-wrap:wrap}
+.toolbar .bulk-sel{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2)}
+.toolbar .bulk-sel label{cursor:pointer;display:flex;align-items:center;gap:4px}
+.toolbar .search-main{position:relative;flex:1;max-width:400px}
+.toolbar .search-main input{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px 36px 8px 36px;border-radius:8px;font-size:13px;outline:none;transition:.2s}
+.toolbar .search-main input:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(59,130,246,.15)}
+.toolbar .search-main .si{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--text3);font-size:13px;pointer-events:none}
+.toolbar .search-main .sc{position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text3);cursor:pointer;font-size:14px;padding:2px;display:none;border-radius:4px}
+.toolbar .search-main input:not(:placeholder-shown)~.sc{display:block}
+.toolbar .search-main .sc:hover{color:var(--text)}
+.toolbar .result-count{font-size:12px;color:var(--text3);white-space:nowrap}
+
+/* BUTTONS */
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 14px;border-radius:8px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-size:12px;font-weight:500;cursor:pointer;transition:.15s;white-space:nowrap}
+.btn:hover{background:var(--bg4);border-color:var(--border2)}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn svg{width:14px;height:14px}
+.btn-blue{background:var(--blue);border-color:var(--blue2);color:#fff}
+.btn-blue:hover{background:var(--blue2)}
+.btn-green{background:var(--green);border-color:#16a34a;color:#fff}
+.btn-green:hover{background:#16a34a}
+.btn-red{background:var(--red);border-color:#dc2626;color:#fff}
+.btn-red:hover{background:#dc2626}
+.btn-ghost{background:transparent;border-color:transparent}
+.btn-ghost:hover{background:var(--bg3)}
+
+/* TABLE */
+.table-wrap{flex:1;overflow-y:auto;padding:0 24px 24px}
+.table-wrap::-webkit-scrollbar{width:6px}
+.table-wrap::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+.tbl{background:var(--bg2);border:1px solid var(--border);border-radius:12px;overflow:hidden}
 .tbl table{width:100%;border-collapse:collapse}
-.tbl th{background:#21262d;padding:10px 12px;text-align:left;font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;position:sticky;top:0;z-index:2}
-.tbl td{padding:6px 10px;border-top:1px solid #21262d;font-size:13px}
-.tbl .scr{max-height:65vh;overflow-y:auto}
-tr.changed{background:#1c2d1c}tr.changed td{border-top-color:#238636}
-.gsel{background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:4px 6px;border-radius:4px;font-size:12px;width:170px}
-.acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
-.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700}
-.b-tr{background:#1a2332;color:#58a6ff}.b-de{background:#2a1a1a;color:#f85149}
-.ov{color:#d29922;font-size:11px}
-.toast{position:fixed;bottom:20px;right:20px;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 20px;transform:translateY(80px);opacity:0;transition:.3s;z-index:99;font-size:14px}
-.toast.show{transform:translateY(0);opacity:1}.toast.ok{border-color:#3fb950}.toast.err{border-color:#f85149}
+.tbl thead{position:sticky;top:0;z-index:3}
+.tbl th{background:var(--bg3);padding:10px 14px;text-align:left;font-size:11px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--border)}
+.tbl td{padding:8px 14px;border-bottom:1px solid var(--border);font-size:13px;vertical-align:middle}
+.tbl tr:last-child td{border-bottom:none}
+.tbl tr:hover td{background:rgba(59,130,246,.03)}
+.tbl tr.changed td{background:var(--green-bg);border-bottom-color:rgba(34,197,94,.2)}
+.tbl tr.changed:hover td{background:rgba(34,197,94,.15)}
+
+.ch-row{display:flex;align-items:center;gap:10px}
+.ch-logo{width:32px;height:32px;border-radius:6px;background:var(--bg);flex-shrink:0;display:flex;align-items:center;justify-content:center;overflow:hidden;border:1px solid var(--border)}
+.ch-logo img{width:100%;height:100%;object-fit:contain}
+.ch-logo .placeholder{font-size:14px;color:var(--text3)}
+.ch-info .ch-name{font-weight:500;font-size:13px}
+.ch-info .ch-meta{font-size:10px;color:var(--text3);margin-top:1px}
+.badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:6px;font-size:10px;font-weight:700;letter-spacing:.3px}
+.b-tr{background:var(--blue-bg);color:var(--blue)}
+.b-de{background:var(--red-bg);color:var(--red)}
+.gsel{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:6px;font-size:12px;width:200px;outline:none;cursor:pointer;transition:.2s}
+.gsel:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(59,130,246,.15)}
+.tag{display:inline-flex;align-items:center;gap:3px;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600}
+.tag-ovr{background:var(--yellow-bg);color:var(--yellow)}
+.tag-chg{background:var(--green-bg);color:var(--green)}
+.tag-cur{background:var(--bg3);color:var(--text2)}
+.cb{width:16px;height:16px;accent-color:var(--blue);cursor:pointer}
+
+/* TOAST */
+.toast{position:fixed;bottom:24px;right:24px;background:var(--bg3);border:1px solid var(--border);border-radius:10px;padding:12px 20px;transform:translateY(100px);opacity:0;transition:.3s cubic-bezier(.4,0,.2,1);z-index:999;font-size:13px;display:flex;align-items:center;gap:8px;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+.toast.show{transform:translateY(0);opacity:1}
+.toast.ok{border-color:var(--green)}.toast.ok .t-dot{background:var(--green)}
+.toast.err{border-color:var(--red)}.toast.err .t-dot{background:var(--red)}
+.toast .t-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+
 #fileIn{display:none}
-.empty{text-align:center;padding:40px;color:#8b949e}
-.hdr{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px}
+.empty{text-align:center;padding:60px 20px;color:var(--text3)}
+.empty .em-icon{font-size:40px;margin-bottom:12px;opacity:.5}
+.empty p{font-size:14px}
+
+.overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:90}
+@media(max-width:768px){
+  .sidebar{position:fixed;left:0;top:0;z-index:95;transform:translateX(-100%)}
+  .sidebar.open{transform:translateX(0)}
+  .overlay.show{display:block}
+  .topbar .mob-toggle{display:block}
+  .stats-row{gap:8px}
+  .stat-card{min-width:80px;padding:6px 10px}
+  .stat-card .sc-info b{font-size:15px}
+  .gsel{width:140px;font-size:11px}
+  .table-wrap{padding:0 12px 12px}
+  .toolbar{padding:10px 12px}
+  .tbl td,.tbl th{padding:6px 8px;font-size:11px}
+  .ch-logo{width:28px;height:28px}
+}
+
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:var(--border2)}
+
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+.tbl tr{animation:fadeIn .15s ease-out}
 </style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
 <body>
-<div class="wrap">
-<div class="hdr">
-<div><h1>&#x1f4fa; VxParser <span>Admin</span></h1>
-<p class="sub">Kanallar\u0131 gruplar\u0131na ay\u0131r, de\u011fi\u015fiklikleri kaydet ve yedekle</p></div>
+<div class="overlay" id="overlay" onclick="toggleSidebar()"></div>
+<div class="app">
+
+<!-- SIDEBAR -->
+<aside class="sidebar" id="sidebar">
+  <div class="sb-hdr">
+    <h1><div class="icon">&#9656;</div> VxParser <span style="color:var(--blue)">Admin</span></h1>
+    <p>Kanal Grup Yonetimi</p>
+  </div>
+  <div class="sb-search">
+    <div class="search-box">
+      <span class="s-icon">&#128269;</span>
+      <input type="text" id="sideSearch" placeholder="Kanal ara..." oninput="onSideSearch(this.value)">
+      <button class="s-clear" onclick="clearSideSearch()">&#10005;</button>
+    </div>
+  </div>
+  <div class="sb-groups" id="sbGroups"></div>
+  <div class="sb-footer">
+    <button class="sbtn" onclick="doExport()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+      Disa Aktar JSON
+    </button>
+    <button class="sbtn" onclick="document.getElementById('fileIn').click()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/></svg>
+      Ice Aktar JSON
+    </button>
+    <button class="sbtn" onclick="copyJson()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+      Kopyala
+    </button>
+    <button class="sbtn" style="color:var(--red)" onclick="doReset()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+      Sifirla
+    </button>
+  </div>
+</aside>
+
+<!-- MAIN -->
+<div class="main">
+  <div class="topbar">
+    <button class="mob-toggle" onclick="toggleSidebar()">&#9776;</button>
+    <div class="stats-row">
+      <div class="stat-card"><div class="sc-icon blue">&#128250;</div><div class="sc-info"><b id="sTotal">-</b><small>Toplam</small></div></div>
+      <div class="stat-card"><div class="sc-icon green">&#128193;</div><div class="sc-info"><b id="sGroups">-</b><small>Grup</small></div></div>
+      <div class="stat-card"><div class="sc-icon yellow">&#9998;</div><div class="sc-info"><b id="sOverride">0</b><small>Override</small></div></div>
+      <div class="stat-card"><div class="sc-icon purple">&#9999;</div><div class="sc-info"><b id="sChanged">0</b><small>Bekleyen</small></div></div>
+    </div>
+    <div class="topbar-actions">
+      <button class="btn btn-green" onclick="save()" id="saveBtn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+        Kaydet
+      </button>
+    </div>
+  </div>
+
+  <div class="toolbar">
+    <div class="bulk-sel">
+      <label><input type="checkbox" class="cb" id="selectAll" onchange="toggleSelectAll()"> Tumunu Sec</label>
+      <select class="gsel" id="bulkGroup" style="width:180px"><option value="">Toplu Tasi...</option></select>
+      <button class="btn btn-blue" onclick="bulkMove()" id="bulkBtn" disabled>Uygula</button>
+    </div>
+    <div class="search-main">
+      <span class="si">&#128269;</span>
+      <input type="text" id="mainSearch" placeholder="Kanal adi ile ara..." oninput="onMainSearch(this.value)">
+      <button class="sc" onclick="clearMainSearch()">&#10005;</button>
+    </div>
+    <span class="result-count" id="resultCount"></span>
+  </div>
+
+  <div class="table-wrap">
+    <div class="tbl">
+      <table>
+        <thead>
+          <tr>
+            <th style="width:36px"><input type="checkbox" class="cb" id="selectAll2" onchange="toggleSelectAll()"></th>
+            <th style="width:44px"></th>
+            <th>Kanal</th>
+            <th style="width:70px">Ulke</th>
+            <th style="width:160px">Grup</th>
+            <th style="width:200px">Yeni Grup</th>
+            <th style="width:80px">Durum</th>
+          </tr>
+        </thead>
+        <tbody id="list"></tbody>
+      </table>
+    </div>
+  </div>
 </div>
-<div class="stats">
-<div class="st"><b id="sTotal">-</b><small>Toplam Kanal</small></div>
-<div class="st"><b id="sGroups">-</b><small>Grup</small></div>
-<div class="st"><b id="sOverride">-</b><small>Override</small></div>
-<div class="st"><b id="sChanged">0</b><small>Kaydedilmemi\u015f</small></div>
-</div>
-<div class="toolbar">
-<input type="text" id="search" placeholder="&#x1f50d; Kanal ara..." oninput="render()">
-<select id="gFilter" onchange="render()"><option value="">T\u00fcm Gruplar</option></select>
-<button class="btn btn-g" onclick="save()">&#x1f4be; Kaydet</button>
-</div>
-<div class="tbl"><div class="scr">
-<table>
-<thead><tr><th>Kanal Ad\u0131</th><th>\u00dclke</th><th>Mevcut Grup</th><th>Yeni Grup</th><th></th></tr></thead>
-<tbody id="list"></tbody>
-</table>
-</div></div>
-<div class="acts">
-<button class="btn btn-b" onclick="doExport()">&#x1f4e4; D\u0131\u015fa Aktar JSON</button>
-<button class="btn" onclick="document.getElementById('fileIn').click()">&#x1f4e5; \u0130\u00e7e Aktar JSON</button>
-<button class="btn" onclick="copyJson()">&#x1f4cb; Kopyala</button>
-<button class="btn btn-r" onclick="doReset()">&#x1f504; S\u0131f\u0131rla</button>
-</div>
+
 <input type="file" id="fileIn" accept=".json" onchange="doImport(event)">
 </div>
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast"><span class="t-dot"></span><span id="toastMsg"></span></div>
+
 <script>
-const GRPS=["TR ULUSAL","TR SPOR","TR SINEMA","TR SINEMA VOD","TR DIZI","TR 7/24 DIZI","TR BELGESEL","TR COCUK","TR MUZIK","TR HABER","TR DINI","TR YEREL","TR RADYO","TR 4K","TR 8K","TR RAW","DE VOLLPROGRAMM","DE NACHRICHTEN","DE DOKU","DE KINDER","DE FILM","DE MUSIK","DE SPORT","DE SONSTIGE"];
-let channels=[],overrides={},changes={};
+const TR_GRPS=["TR ULUSAL","TR SPOR","TR SINEMA","TR SINEMA VOD","TR DIZI","TR 7/24 DIZI","TR BELGESEL","TR COCUK","TR MUZIK","TR HABER","TR DINI","TR YEREL","TR RADYO","TR 4K","TR 8K","TR RAW"];
+const DE_GRPS=["DE VOLLPROGRAMM","DE NACHRICHTEN","DE DOKU","DE KINDER","DE FILM","DE MUSIK","DE SPORT","DE SONSTIGE"];
+const GRPS=[...TR_GRPS,...DE_GRPS];
+const GRP_COLORS={"TR ULUSAL":"#3b82f6","TR SPOR":"#ef4444","TR SINEMA":"#a855f7","TR SINEMA VOD":"#8b5cf6","TR DIZI":"#ec4899","TR 7/24 DIZI":"#f472b6","TR BELGESEL":"#f59e0b","TR COCUK":"#22c55e","TR MUZIK":"#06b6d4","TR HABER":"#eab308","TR DINI":"#10b981","TR YEREL":"#6b7280","TR RADYO":"#14b8a6","TR 4K":"#f97316","TR 8K":"#fb923c","TR RAW":"#ef4444","DE VOLLPROGRAMM":"#3b82f6","DE NACHRICHTEN":"#ef4444","DE DOKU":"#f59e0b","DE KINDER":"#22c55e","DE FILM":"#a855f7","DE MUSIK":"#06b6d4","DE SPORT":"#ef4444","DE SONSTIGE":"#6b7280"};
+
+let channels=[],overrides={},changes={},selected=new Set(),activeGroup='',searchQ='';
 
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
-function escA(s){return String(s).replace(/'/g,"\\\\'").replace(/"/g,'&quot;')}
+function escJ(s){return JSON.stringify(s)}
 
 async function load(){
   try{
     const r=await fetch('/api/admin/channels');channels=await r.json();
     const r2=await fetch('/api/admin/overrides');overrides=await r2.json();
-    changes={};
-    fillGroupFilter();render();
+    changes={};selected=new Set();
+    buildSidebar();fillBulkGroup();render();
   }catch(e){toast('Veri yuklenemedi: '+e,'err')}
 }
 
-function fillGroupFilter(){
-  const sel=document.getElementById('gFilter');
-  const seen=new Set();channels.forEach(c=>seen.add(c.grp));
-  sel.innerHTML='<option value="">Tüm Gruplar</option>';
-  [...seen].sort().forEach(g=>{sel.innerHTML+=`<option value="${g}">${g}</option>`});
+function buildSidebar(){
+  const el=document.getElementById('sbGroups');
+  const grpCounts={};channels.forEach(c=>{grpCounts[c.grp]=(grpCounts[c.grp]||0)+1});
+  let h='';
+  h+='<div class="grp-item '+(activeGroup===''?'active':'')+'" onclick="selectGroup(\'\')"><div class="g-dot" style="background:var(--text2)"></div><div class="g-name">Tumunu Goster</div><div class="g-cnt">'+channels.length+'</div></div>';
+
+  h+='<div class="sb-section"><div class="sb-section-title" onclick="toggleSection(this)"><span class="arrow">&#9660;</span> Turk Kanallari ('+TR_GRPS.filter(g=>grpCounts[g]).length+')</div><div class="sb-section-body">';
+  TR_GRPS.forEach(g=>{
+    const cnt=grpCounts[g]||0;if(!cnt)return;
+    const ovr=Object.keys(overrides).filter(k=>overrides[k]===g).length;
+    h+='<div class="grp-item '+(activeGroup===g?'active':'')+'" onclick="selectGroup(\''+esc(g)+'\')"><div class="g-dot" style="background:'+(GRP_COLORS[g]||'var(--text3)')+'"></div><div class="g-name" title="'+esc(g)+'">'+esc(g.replace('TR ',''))+'</div><div class="g-cnt">'+cnt+(ovr?'<span style="color:var(--yellow);margin-left:3px">+'+ovr+'</span>':'')+'</div></div>';
+  });
+  h+='</div></div>';
+
+  h+='<div class="sb-section"><div class="sb-section-title" onclick="toggleSection(this)"><span class="arrow">&#9660;</span> Alman Kanallari ('+DE_GRPS.filter(g=>grpCounts[g]).length+')</div><div class="sb-section-body">';
+  DE_GRPS.forEach(g=>{
+    const cnt=grpCounts[g]||0;if(!cnt)return;
+    const ovr=Object.keys(overrides).filter(k=>overrides[k]===g).length;
+    h+='<div class="grp-item '+(activeGroup===g?'active':'')+'" onclick="selectGroup(\''+esc(g)+'\')"><div class="g-dot" style="background:'+(GRP_COLORS[g]||'var(--text3)')+'"></div><div class="g-name" title="'+esc(g)+'">'+esc(g.replace('DE ',''))+'</div><div class="g-cnt">'+cnt+(ovr?'<span style="color:var(--yellow);margin-left:3px">+'+ovr+'</span>':'')+'</div></div>';
+  });
+  h+='</div></div>';
+  el.innerHTML=h;
+}
+
+function toggleSection(el){el.classList.toggle('collapsed');el.nextElementSibling.classList.toggle('collapsed')}
+function selectGroup(g){activeGroup=g;searchQ='';document.getElementById('sideSearch').value='';document.getElementById('mainSearch').value='';selected=new Set();buildSidebar();render()}
+function onSideSearch(v){searchQ=v.toUpperCase();activeGroup='';document.getElementById('mainSearch').value='';selected=new Set();buildSidebar();render()}
+function onMainSearch(v){searchQ=v.toUpperCase();activeGroup='';selected=new Set();document.getElementById('sideSearch').value='';buildSidebar();render()}
+function clearSideSearch(){document.getElementById('sideSearch').value='';searchQ='';buildSidebar();render()}
+function clearMainSearch(){document.getElementById('mainSearch').value='';searchQ='';buildSidebar();render()}
+function toggleSidebar(){document.getElementById('sidebar').classList.toggle('open');document.getElementById('overlay').classList.toggle('show')}
+
+function fillBulkGroup(){
+  const sel=document.getElementById('bulkGroup');
+  sel.innerHTML='<option value="">Toplu Tasi...</option>';
+  GRPS.forEach(g=>{sel.innerHTML+='<option value="'+g+'">'+g+'</option>'});
+}
+
+function getFiltered(){
+  return channels.filter(c=>{
+    if(activeGroup&&c.grp!==activeGroup)return false;
+    if(searchQ&&!c.name.toUpperCase().includes(searchQ))return false;
+    return true;
+  });
 }
 
 function render(){
-  const q=document.getElementById('search').value.toUpperCase();
-  const gf=document.getElementById('gFilter').value;
-  let fl=channels.filter(c=>{
-    if(gf&&c.grp!==gf)return false;
-    if(q&&!c.name.toUpperCase().includes(q))return false;
-    return true;
-  });
+  const fl=getFiltered();
   const tb=document.getElementById('list');
-  if(!fl.length){tb.innerHTML='<tr><td colspan="5" class="empty">Kanal bulunamadı</td></tr>';updStats();return}
+  document.getElementById('resultCount').textContent=fl.length+' / '+channels.length+' kanal';
+
+  if(!fl.length){tb.innerHTML='<tr><td colspan="7"><div class="empty"><div class="em-icon">&#128250;</div><p>Kanal bulunamadi</p></div></td></tr>';updStats();return}
+
   let h='';
   fl.forEach(c=>{
     const k=c.name,orig=c.grp;
@@ -520,13 +746,53 @@ function render(){
     const isChg=changes.hasOwnProperty(k);
     const cur=isChg?changes[k]:orig;
     const rowCls=isChg?'changed':'';
-    const ovMark=isOvr&&!isChg?'<span class="ov">&#x270e; override</span>':'';
-    const chgMark=isChg?'<span class="ov" style="color:#3fb950">&#x270e; değişti</span>':'';
-    h+=`<tr class="${rowCls}"><td>${esc(c.name)} ${ovMark}${chgMark}</td><td><span class="badge ${c.country==='TR'?'b-tr':'b-de'}">${c.country}</span></td><td>${esc(orig)}</td><td><select class="gsel" onchange="chg('${escA(c.name)}',this.value)">${GRPS.map(g=>`<option value="${g}"${cur===g?' selected':''}>${g}</option>`).join('')}</select></td><td>${isChg?'<button class="btn" style="padding:3px 8px;font-size:11px" onclick="revert(\\''+escA(c.name)+'\\')">Geri Al</button>':''}</td></tr>`;
+    const isSel=selected.has(k);
+    const logo=c.logo||'';
+    const logoHtml=logo?'<img src="'+esc(logo)+'" onerror="this.parentElement.innerHTML=\'<span class=placeholder>&#9656;</span>\'" loading="lazy">':'<span class="placeholder">&#9656;</span>';
+
+    let statusTag='';
+    if(isOvr&&!isChg)statusTag='<span class="tag tag-ovr">&#9998; OVR</span>';
+    else if(isChg)statusTag='<span class="tag tag-chg">&#10003; DEGISTI</span>';
+    else statusTag='<span class="tag tag-cur">OTO</span>';
+
+    h+='<tr class="'+rowCls+'">';
+    h+='<td><input type="checkbox" class="cb ch-cb" data-name="'+esc(k)+'" '+(isSel?'checked':'')+' onchange="toggleSel(this)"></td>';
+    h+='<td><div class="ch-logo">'+logoHtml+'</div></td>';
+    h+='<td><div class="ch-info"><div class="ch-name">'+esc(k)+'</div><div class="ch-meta">ID: '+c.id+'</div></div></td>';
+    h+='<td><span class="badge '+(c.country==='TR'?'b-tr':'b-de')+'">'+c.country+'</span></td>';
+    h+='<td style="color:var(--text2);font-size:12px">'+esc(orig)+'</td>';
+    h+='<td><select class="gsel" onchange="chg('+escJ(k)+',this.value)">';
+    GRPS.forEach(g=>{h+='<option value="'+g+'"'+(cur===g?' selected':'')+'>'+g+'</option>'});
+    h+='</select></td>';
+    h+='<td>'+statusTag+'</td>';
+    h+='</tr>';
   });
   tb.innerHTML=h;
   updStats();
 }
+
+function toggleSel(cb){
+  const name=cb.dataset.name;
+  if(cb.checked)selected.add(name);else selected.delete(name);
+  syncSelectAll();
+}
+function toggleSelectAll(){
+  const fl=getFiltered();
+  const checked=document.getElementById('selectAll').checked;
+  selected.clear();
+  if(checked)fl.forEach(c=>selected.add(c.name));
+  document.getElementById('selectAll2').checked=checked;
+  document.querySelectorAll('.ch-cb').forEach(cb=>{cb.checked=checked});
+  updBulkBtn();
+}
+function syncSelectAll(){
+  const fl=getFiltered();
+  const allSel=fl.length>0&&fl.every(c=>selected.has(c.name));
+  document.getElementById('selectAll').checked=allSel;
+  document.getElementById('selectAll2').checked=allSel;
+  updBulkBtn();
+}
+function updBulkBtn(){document.getElementById('bulkBtn').disabled=selected.size===0}
 
 function chg(name,val){
   const c=channels.find(x=>x.name===name);if(!c)return;
@@ -535,15 +801,35 @@ function chg(name,val){
   render();
 }
 
+function bulkMove(){
+  const grp=document.getElementById('bulkGroup').value;
+  if(!grp||selected.size===0)return;
+  selected.forEach(name=>{
+    const c=channels.find(x=>x.name===name);
+    if(c){
+      if(grp===c.grp&&!overrides[name.toUpperCase()])delete changes[name];
+      else changes[name]=grp;
+    }
+  });
+  selected=new Set();
+  document.getElementById('bulkGroup').value='';
+  buildSidebar();render();
+  toast(Object.keys(changes).length+' bekleyen degisiklik','ok');
+}
+
 function revert(name){delete changes[name];render()}
 
 async function save(){
   const n=Object.keys(changes).length;
-  if(!n){toast('Kaydedilecek değişiklik yok');return}
+  if(!n){toast('Kaydedilecek degisiklik yok');return}
   try{
     const r=await fetch('/api/admin/overrides',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)});
-    if(r.ok){overrides={...overrides};Object.entries(changes).forEach(([k,v])=>{overrides[k.toUpperCase()]=v});const c=channels.find(x=>x.name===Object.keys(changes)[0]);changes={};render();toast(n+' kanal kaydedildi!','ok')}
-    else toast('Hata!','err');
+    if(r.ok){
+      Object.entries(changes).forEach(([k,v])=>{overrides[k.toUpperCase()]=v});
+      changes={};selected=new Set();
+      buildSidebar();render();
+      toast(n+' kanal basariyla kaydedildi!','ok');
+    }else toast('Sunucu hatasi!','err');
   }catch(e){toast('Hata: '+e,'err')}
 }
 
@@ -552,8 +838,8 @@ async function doExport(){
     const r=await fetch('/api/admin/overrides/export');
     const blob=await r.blob();const a=document.createElement('a');
     a.href=URL.createObjectURL(blob);a.download='vxparser-overrides.json';a.click();
-    toast('Dosya indirildi','ok');
-  }catch(e){toast('Export hatası','err')}
+    toast('JSON dosyasi indirildi','ok');
+  }catch(e){toast('Export hatasi','err')}
 }
 
 function doImport(ev){
@@ -564,20 +850,23 @@ function doImport(ev){
       const d=JSON.parse(e.target.result);
       const r=await fetch('/api/admin/overrides/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
       if(r.ok){const j=await r.json();toast(j.imported+' override yuklendi','ok');load()}
-      else toast('Import hatası','err');
-    }catch(ex){toast('JSON parse hatası','err')}
+      else toast('Import hatasi','err');
+    }catch(ex){toast('JSON parse hatasi','err')}
   };rd.readAsText(f);ev.target.value='';
 }
 
 function copyJson(){
-  const t=JSON.stringify(overrides,null,2);navigator.clipboard.writeText(t).then(()=>toast('Kopyalandı!','ok')).catch(()=>toast('Kopyalama hatası','err'));
+  const t=JSON.stringify(overrides,null,2);
+  navigator.clipboard.writeText(t).then(()=>toast('Panoya kopyalandi!','ok')).catch(()=>toast('Kopyalama hatasi','err'));
 }
 
 async function doReset(){
-  if(!confirm('Tüm override\'ları silmek istediğinize emin misiniz?'))return;
+  if(!confirm('Tum Manuel Atamalari Silmek Istediğinize Emin Misiniz?'))return;
   try{
     await fetch('/api/admin/overrides',{method:'DELETE'});
-    overrides={};changes={};render();toast('Tüm override\'lar silindi','ok');
+    overrides={};changes={};selected=new Set();
+    buildSidebar();render();
+    toast('Tum atamalar sifirlandi','ok');
   }catch(e){toast('Hata','err')}
 }
 
@@ -587,14 +876,22 @@ function updStats(){
   document.getElementById('sGroups').textContent=g.size;
   document.getElementById('sOverride').textContent=Object.keys(overrides).length;
   const nc=Object.keys(changes).length;
-  const el=document.getElementById('sChanged');el.textContent=nc;
-  el.style.color=nc?'#d29922':'';
+  document.getElementById('sChanged').textContent=nc;
+  document.getElementById('saveBtn').disabled=nc===0;
 }
 
 function toast(msg,type){
-  const t=document.getElementById('toast');t.textContent=msg;t.className='toast show '+(type||'');
-  setTimeout(()=>t.className='toast',2500);
+  document.getElementById('toastMsg').textContent=msg;
+  const t=document.getElementById('toast');
+  t.className='toast show '+(type||'');
+  setTimeout(()=>t.className='toast',3000);
 }
+
+document.addEventListener('keydown',e=>{
+  if((e.ctrlKey||e.metaKey)&&e.key==='s'){e.preventDefault();save()}
+  if(e.key==='Escape'){clearSideSearch();clearMainSearch();selected=new Set();syncSelectAll();render()}
+  if(e.key==='/'){const ae=document.activeElement;if(ae.tagName!=='INPUT'&&ae.tagName!=='SELECT'&&ae.tagName!=='TEXTAREA'){e.preventDefault();document.getElementById('mainSearch').focus()}}
+});
 
 load();
 </script>
