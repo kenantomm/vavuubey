@@ -217,7 +217,8 @@ def init_db():
         logo TEXT DEFAULT '',
         tvg_id TEXT DEFAULT '',
         picon TEXT DEFAULT '',
-        sort_order INTEGER DEFAULT 9999
+        sort_order INTEGER DEFAULT 9999,
+        grp_order INTEGER DEFAULT 99
     )""")
     # Override table for manual group assignments
     c.execute("""CREATE TABLE IF NOT EXISTS channel_overrides (
@@ -233,6 +234,8 @@ def init_db():
             c.execute("ALTER TABLE channels ADD COLUMN picon TEXT DEFAULT ''")
         if "sort_order" not in cols:
             c.execute("ALTER TABLE channels ADD COLUMN sort_order INTEGER DEFAULT 9999")
+        if "grp_order" not in cols:
+            c.execute("ALTER TABLE channels ADD COLUMN grp_order INTEGER DEFAULT 99")
     except Exception:
         pass
     conn.commit()
@@ -256,32 +259,7 @@ def get_all_channels(ordered=True):
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     if ordered:
-        c.execute("""SELECT * FROM channels ORDER BY CASE grp
-            WHEN 'TR ULUSAL' THEN 1
-            WHEN 'TR SPOR' THEN 2
-            WHEN 'TR SINEMA' THEN 3
-            WHEN 'TR SINEMA VOD' THEN 4
-            WHEN 'TR DIZI' THEN 5
-            WHEN 'TR 7/24 DIZI' THEN 6
-            WHEN 'TR BELGESEL' THEN 7
-            WHEN 'TR COCUK' THEN 8
-            WHEN 'TR MUZIK' THEN 9
-            WHEN 'TR HABER' THEN 10
-            WHEN 'TR DINI' THEN 11
-            WHEN 'TR YEREL' THEN 12
-            WHEN 'TR RADYO' THEN 13
-            WHEN 'TR 4K' THEN 14
-            WHEN 'TR 8K' THEN 15
-            WHEN 'TR RAW' THEN 16
-            WHEN 'DE VOLLPROGRAMM' THEN 17
-            WHEN 'DE NACHRICHTEN' THEN 18
-            WHEN 'DE DOKU' THEN 19
-            WHEN 'DE KINDER' THEN 20
-            WHEN 'DE FILM' THEN 21
-            WHEN 'DE MUSIK' THEN 22
-            WHEN 'DE SPORT' THEN 23
-            WHEN 'DE SONSTIGE' THEN 24
-            ELSE 99 END, sort_order, name""")
+        c.execute("SELECT * FROM channels ORDER BY grp_order, sort_order, name")
     else:
         c.execute("SELECT * FROM channels")
     rows = [dict(r) for r in c.fetchall()]
@@ -352,17 +330,39 @@ def load_overrides_from_json():
         add_log(f"Override JSON yukleme hatasi: {e}")
 
 def set_override(channel_name, target_group):
+    """Set a single override (with DB write + JSON backup). For bulk, use batch_set_overrides()."""
     key = channel_name.upper().strip()
     OVERRIDE_CACHE[key] = target_group
     sort_ord = compute_sort_order(channel_name, target_group)
+    grp_ord = GROUP_ORDER.get(target_group, 99)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO channel_overrides (channel_name, target_group) VALUES (?, ?)", (key, target_group))
-    c.execute("UPDATE channels SET grp = ?, sort_order = ? WHERE UPPER(name) = ?", (target_group, sort_ord, key))
+    c.execute("UPDATE channels SET grp = ?, sort_order = ?, grp_order = ? WHERE UPPER(name) = ?", (target_group, sort_ord, grp_ord, key))
     conn.commit()
     conn.close()
-    # Also save to JSON for persistence
     save_overrides_to_json()
+
+def batch_set_overrides(overrides_dict):
+    """Bulk set multiple overrides in a single DB transaction + single JSON write. FAST."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    count = 0
+    for name, group in overrides_dict.items():
+        if not name or not group:
+            continue
+        key = name.upper().strip()
+        OVERRIDE_CACHE[key] = group
+        sort_ord = compute_sort_order(name, group)
+        grp_ord = GROUP_ORDER.get(group, 99)
+        c.execute("INSERT OR REPLACE INTO channel_overrides (channel_name, target_group) VALUES (?, ?)", (key, group))
+        c.execute("UPDATE channels SET grp = ?, sort_order = ?, grp_order = ? WHERE UPPER(name) = ?", (group, sort_ord, grp_ord, key))
+        count += 1
+    conn.commit()
+    conn.close()
+    # Single JSON write at the end
+    save_overrides_to_json()
+    return count
 
 def delete_override(channel_name):
     key = channel_name.upper().strip()
@@ -1080,8 +1080,9 @@ async def startup_sequence():
     c.execute("DELETE FROM channels")
     for ch in filtered:
         sort_ord = compute_sort_order(ch["name"], ch["grp"])
-        c.execute("INSERT OR REPLACE INTO channels (id,name,url,hls,grp,country,logo,tvg_id,picon,sort_order) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (ch["id"], ch["name"], ch["url"], ch["hls"], ch["grp"], ch["country"], ch["logo"], ch["tvg_id"], ch["picon"], sort_ord))
+        grp_ord = GROUP_ORDER.get(ch["grp"], 99)
+        c.execute("INSERT OR REPLACE INTO channels (id,name,url,hls,grp,country,logo,tvg_id,picon,sort_order,grp_order) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (ch["id"], ch["name"], ch["url"], ch["hls"], ch["grp"], ch["country"], ch["logo"], ch["tvg_id"], ch["picon"], sort_ord, grp_ord))
     conn.commit()
     conn.close()
     add_log(f"DB kaydedildi: {len(filtered)} kanal")

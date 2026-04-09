@@ -376,9 +376,8 @@ async def admin_save_overrides(request: Request):
     data = await request.json()
     if not isinstance(data, dict):
         return JSONResponse({"error": "dict expected"}, status_code=400)
-    for name, group in data.items():
-        state.set_override(name, group)
-    return JSONResponse({"ok": True, "count": len(data)})
+    count = state.batch_set_overrides(data)
+    return JSONResponse({"ok": True, "count": count})
 
 @app.delete("/api/admin/overrides")
 async def admin_clear_overrides():
@@ -588,6 +587,15 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans
 
 @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
 .tbl tr{animation:fadeIn .15s ease-out}
+
+/* PAGINATION */
+.pager{display:flex;align-items:center;justify-content:center;gap:4px;padding:12px 0;flex-wrap:wrap}
+.pbtn{background:var(--bg3);border:1px solid var(--border);color:var(--text2);padding:5px 10px;border-radius:6px;font-size:12px;cursor:pointer;transition:.15s;min-width:32px;text-align:center}
+.pbtn:hover{background:var(--bg4);color:var(--text);border-color:var(--border2)}
+.pbtn.active{background:var(--blue);border-color:var(--blue2);color:#fff;font-weight:600}
+.pdots{color:var(--text3);padding:0 4px;font-size:14px}
+.psel{background:var(--bg);border:1px solid var(--border);color:var(--text2);padding:5px 8px;border-radius:6px;font-size:11px;outline:none;cursor:pointer;margin-left:8px}
+.psel:focus{border-color:var(--blue)}
 </style>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -684,6 +692,7 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans
         <tbody id="list"></tbody>
       </table>
     </div>
+    <div id="pager"></div>
   </div>
 </div>
 
@@ -699,6 +708,7 @@ const GRP_COLORS={"TR ULUSAL":"#3b82f6","TR SPOR":"#ef4444","TR SINEMA":"#a855f7
 
 let channels=[],overrides={},changes={},selected=new Set(),activeGroup='',searchQ='';
 let dragChanName=null,dragClone=null,dragStarted=false;
+let curPage=1,pageSize=100;
 
 /* Safe HTML escaping for text content */
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
@@ -747,11 +757,11 @@ function buildSidebar(){
 }
 
 function toggleSection(el){el.classList.toggle('collapsed');el.nextElementSibling.classList.toggle('collapsed')}
-function selectGroup(g){activeGroup=g;searchQ='';document.getElementById('sideSearch').value='';document.getElementById('mainSearch').value='';selected=new Set();buildSidebar();render()}
-function onSideSearch(v){searchQ=v.toUpperCase();activeGroup='';document.getElementById('mainSearch').value='';selected=new Set();buildSidebar();render()}
-function onMainSearch(v){searchQ=v.toUpperCase();activeGroup='';selected=new Set();document.getElementById('sideSearch').value='';buildSidebar();render()}
-function clearSideSearch(){document.getElementById('sideSearch').value='';searchQ='';buildSidebar();render()}
-function clearMainSearch(){document.getElementById('mainSearch').value='';searchQ='';buildSidebar();render()}
+function selectGroup(g){activeGroup=g;searchQ='';curPage=1;document.getElementById('sideSearch').value='';document.getElementById('mainSearch').value='';selected=new Set();buildSidebar();render()}
+function onSideSearch(v){searchQ=v.toUpperCase();activeGroup='';curPage=1;document.getElementById('mainSearch').value='';selected=new Set();buildSidebar();render()}
+function onMainSearch(v){searchQ=v.toUpperCase();activeGroup='';curPage=1;selected=new Set();document.getElementById('sideSearch').value='';buildSidebar();render()}
+function clearSideSearch(){document.getElementById('sideSearch').value='';searchQ='';curPage=1;buildSidebar();render()}
+function clearMainSearch(){document.getElementById('mainSearch').value='';searchQ='';curPage=1;buildSidebar();render()}
 function toggleSidebar(){document.getElementById('sidebar').classList.toggle('open');document.getElementById('overlay').classList.toggle('show')}
 
 function fillBulkGroup(){
@@ -771,12 +781,20 @@ function getFiltered(){
 function render(){
   const fl=getFiltered();
   const tb=document.getElementById('list');
-  document.getElementById('resultCount').textContent=fl.length+' / '+channels.length+' kanal';
+  const totalPages=Math.max(1,Math.ceil(fl.length/pageSize));
+  if(curPage>totalPages)curPage=totalPages;
+  const start=(curPage-1)*pageSize;
+  const pageItems=fl.slice(start,start+pageSize);
 
-  if(!fl.length){tb.innerHTML='<tr><td colspan="7"><div class="empty"><div class="em-icon">&#128250;</div><p>Kanal bulunamadi</p></div></td></tr>';updStats();return}
+  document.getElementById('resultCount').textContent=fl.length+' kanal (Sayfa '+curPage+'/'+totalPages+')';
 
+  if(!fl.length){tb.innerHTML='<tr><td colspan="7"><div class="empty"><div class="em-icon">&#128250;</div><p>Kanal bulunamadi</p></div></td></tr>';updStats();renderPagination(0);return}
+
+  /* Build rows using DocumentFragment for speed */
+  const frag=document.createDocumentFragment();
+  const tmp=document.createElement('tbody');
   let h='';
-  fl.forEach(c=>{
+  pageItems.forEach(c=>{
     const k=c.name,orig=c.grp;
     const isOvr=overrides.hasOwnProperty(k.toUpperCase());
     const isChg=changes.hasOwnProperty(k);
@@ -803,10 +821,14 @@ function render(){
     h+='<td>'+statusTag+'</td>';
     h+='</tr>';
   });
-  tb.innerHTML=h;
+  tmp.innerHTML=h;
+  while(tmp.firstChild)frag.appendChild(tmp.firstChild);
+  tb.innerHTML='';
+  tb.appendChild(frag);
   updStats();
+  renderPagination(totalPages);
 
-  /* Attach event listeners via delegation for select changes and drag */
+  /* Attach event listeners via delegation */
   tb.querySelectorAll('.gsel').forEach(sel=>{
     sel.addEventListener('change',function(){chgGrp(this.dataset.chname,this.value)});
   });
@@ -815,6 +837,30 @@ function render(){
     tr.addEventListener('dragend',onRowDragEnd);
   });
 }
+
+function renderPagination(totalPages){
+  let el=document.getElementById('pager');
+  if(!el)return;
+  if(totalPages<=1){el.innerHTML='';return}
+  let h='<div class="pager">';
+  if(curPage>1)h+='<button class="pbtn" onclick="goPage('+(curPage-1)+')">&#9664;</button>';
+  /* Show max 7 page buttons around current */
+  let startP=Math.max(1,curPage-3),endP=Math.min(totalPages,curPage+3);
+  if(startP>1)h+='<button class="pbtn" onclick="goPage(1)">1</button>';
+  if(startP>2)h+='<span class="pdots">...</span>';
+  for(let i=startP;i<=endP;i++){
+    h+='<button class="pbtn '+(i===curPage?'active':'')+'" onclick="goPage('+i+')">'+i+'</button>';
+  }
+  if(endP<totalPages-1)h+='<span class="pdots">...</span>';
+  if(endP<totalPages)h+='<button class="pbtn" onclick="goPage('+totalPages+')">'+totalPages+'</button>';
+  if(curPage<totalPages)h+='<button class="pbtn" onclick="goPage('+(curPage+1)+')">&#9654;</button>';
+  h+='<select class="psel" onchange="pageSize=parseInt(this.value);curPage=1;render()">';
+  [100,200,500,1000].forEach(n=>{h+='<option value="'+n+'"'+(pageSize===n?' selected':'')+'">'+n+' / sayfa</option>'});
+  h+='</select></div>';
+  el.innerHTML=h;
+}
+
+function goPage(p){curPage=p;render();document.querySelector('.table-wrap').scrollTop=0}
 
 function toggleSel(cb){
   const name=cb.dataset.name;
