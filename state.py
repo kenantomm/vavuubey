@@ -46,15 +46,27 @@ def get_all_channels(ordered=True):
     c = conn.cursor()
     if ordered:
         c.execute("""SELECT * FROM channels ORDER BY CASE grp
-            WHEN 'TR ULUSAL' THEN 1 WHEN 'TR HABER' THEN 2
-            WHEN 'TR BELGESEL' THEN 3 WHEN 'TR COCUK' THEN 4
-            WHEN 'TR FILM' THEN 5 WHEN 'TR MUZIK' THEN 6
-            WHEN 'TR SPOR' THEN 7 WHEN 'TR DINI' THEN 8
-            WHEN 'TR YEREL' THEN 9 WHEN 'TR RADYO' THEN 10
-            WHEN 'DE VOLLPROGRAMM' THEN 11 WHEN 'DE NACHRICHTEN' THEN 12
-            WHEN 'DE DOKU' THEN 13 WHEN 'DE KINDER' THEN 14
-            WHEN 'DE FILM' THEN 15 WHEN 'DE MUSIK' THEN 16
-            WHEN 'DE SPORT' THEN 17 WHEN 'DE SONSTIGE' THEN 18
+            WHEN 'TR ULUSAL' THEN 1
+            WHEN 'TR SPOR' THEN 2
+            WHEN 'TR SINEMA' THEN 3
+            WHEN 'TR SINEMA VOD' THEN 4
+            WHEN 'TR DIZI' THEN 5
+            WHEN 'TR 7/24 DIZI' THEN 6
+            WHEN 'TR BELGESEL' THEN 7
+            WHEN 'TR COCUK' THEN 8
+            WHEN 'TR MUZIK' THEN 9
+            WHEN 'TR HABER' THEN 10
+            WHEN 'TR DINI' THEN 11
+            WHEN 'TR YEREL' THEN 12
+            WHEN 'TR RADYO' THEN 13
+            WHEN 'DE VOLLPROGRAMM' THEN 14
+            WHEN 'DE NACHRICHTEN' THEN 15
+            WHEN 'DE DOKU' THEN 16
+            WHEN 'DE KINDER' THEN 17
+            WHEN 'DE FILM' THEN 18
+            WHEN 'DE MUSIK' THEN 19
+            WHEN 'DE SPORT' THEN 20
+            WHEN 'DE SONSTIGE' THEN 21
             ELSE 99 END, name""")
     else:
         c.execute("SELECT * FROM channels")
@@ -279,47 +291,266 @@ def detect_country(ch):
     if any(k in g for k in ["GERMANY", "DEUTSCH"]): is_de = True
     if t.endswith(".de"): is_de = True
     if t.endswith(".tr"): is_tr = True
+    # TR-ozel kanallar (prefix yok ama TR'ye ozgu)
+    if any(k in n for k in ["TRT ", "SHOW TV", "STAR TV", "KANAL D", "ATV ", "FOX TV",
+        "TV8", "TEVE2", "BEYAZ TV", "KANAL 7", "A2 HD", "A SPOR",
+        "TGRT ", "TJK ", "TIVIBU", "SPOR SMART", "EXXEN",
+        "DIZI SMART", "SINEMA TV", "FILMBOX", "MOVIE SMART",
+        "TARIM TURK", "CIFTCI TV", "KEMAL SUNAL",
+        "SEMERKAND", "LALEGUL", "DOST TV", "REHBER TV",
+        "MASAL TV", "MINIKA", "PEPEE", "BARBIE",
+        "NET MUZIK", "KRAL POP", "KRAL TV",
+        "POWER TV", "POWER TURK", "DREAM TURK", "TATLISES",
+        "TURKLIVE", "YESILCAM BOX", "VIZYONTV",
+        "UNI BOX OFFICE", "FIBERBOX", "PRIMEBOX",
+        "7/24 ", "GULDUR GULDUR", "KUKULI", "CICIKI",
+        "RAFADAN TAYFA", "KOSTEBEKGILLER"]):
+        is_tr = True
+    # DE-ozel kanallar (prefix yok ama Alman'ya ozgu)
+    if any(k in n for k in ["ARD ", "ARD HD", "ZDF", "DAS ERSTE", "WDR ", "WDR HD",
+        "NDR ", "MDR ", "SWR ", "RBB ", "PHOENIX", "3SAT",
+        "KIKA", "ZDFNEO", "ZDFINFO",
+        "PROSIEBEN", "SAT.1", "SAT 1", "RTL2",
+        "SUPER RTL", "SIXX", "TELE 5", "ARTE ",
+        "ORF ", "PULS 4", "SERVUS ", "SRF ", "SRF HD",
+        "N-TV", "N24 ", "WELT ", "SPIEGEL TV",
+        "SKY CINEMA", "SKY SPORT", "SKY HITS", "SKY ACTION",
+        "13TH STREET", "TNT SERIE", "TNT FILM",
+        "DAZN", "SPORT1 ", "MOTORVISION",
+        "VIVA ", "DELUXE ", "TOGGO"]):
+        is_de = True
+    # Ortak kanallar: TR veya DE prefix'i varsa ona gore, yoksa group'a gore
+    if any(k in n for k in ["EUROSPORT", "DISCOVERY ", "NICKELODEON",
+        "CARTOON NETWORK", "CARTOONITO", "BABY TV", "BOOMERANG",
+        "CBEEBIES", "JUNIOR ", "NAT GEO", "NATIONAL GEO",
+        "DISNEY ", "HISTORY ", "AXN ", "FOX CRIME", "FX HD"]):
+        if not is_tr and not is_de:
+            # Prefix yoksa group'a bak
+            if any(k in g for k in ["TURKEY", "TURKIYE"]):
+                is_tr = True
+            elif any(k in g for k in ["GERMANY", "DEUTSCH"]):
+                is_de = True
+            else:
+                # Group da yoksa TR varsay (Vavoo TR agirlikli)
+                is_tr = True
     if is_tr and is_de: return "BOTH"
     if is_tr: return "TR"
     if is_de: return "DE"
     return ""
 
+# ===== Tamamen kaldirilacak kanallar =====
+REMOVED_CHANNELS = {"INFO", "INFO TV", "INFO HD"}
+
+# ===== ULUSAL'a girmemesi gereken kanallar =====
+ULUSAL_EXCLUDE = ["HALK TV", "SÖZCÜ", "SZC TV", "TELE1", "TELE 1"]
+
 def remap_group(name, original_group=""):
-    n = name.upper()
+    n = name.upper().strip()
     g = original_group.upper()
     combined = n + " " + g
-    if any(k in combined for k in ["ULUSAL","SHOW TV","STAR TV","KANAL D","ATV","FOX TV","TV8","TRT 1","A2 TV","A2 HD","TEVE2","TV100","BLOOMBERG HT","TV A","TLC","BEYAZ TV","FLASH TV","KANAL 7","HALK TV","TELE1","ULKE TV"]):
-        return "TR ULUSAL"
-    if any(k in combined for k in ["HABER","NEWS","CNBC","NTV","BLOOMBERG","AHABER","CNN TURK","HABER TURK","TGRT HABER"]):
-        return "TR HABER"
-    if any(k in combined for k in ["BELGESEL","DOC","DISCOVERY","NAT GEO","HISTORY","ANIMAL","DA VINCI","YABAN","TRT BELGESEL","VIASAT EXPLORE","VIASAT HISTORY"]):
-        return "TR BELGESEL"
-    if any(k in combined for k in ["COCUK","CARTOON","MINIKA","TRT COCUK","BABY","DISNEY","NICKELODEON","KIDS","BOOMERANG"]):
-        return "TR COCUK"
-    if any(k in combined for k in ["FILM","MOVIE","SINEMA","CINE","YESILCAM","DIZI","SERIES","FILMBOX"]):
-        return "TR FILM"
-    if any(k in combined for k in ["MUZIK","MUSIC","KRAL","POWER","NUMBER ONE","DREAM","NR1","TMB"]):
-        return "TR MUZIK"
-    if any(k in combined for k in ["SPOR","SPORT","BEIN","TIVIBU","DSMART","TRT SPOR","A SPOR","EUROSPORT"]):
+
+    # --- Tamamen kaldirilacak kanallar ---
+    if n in REMOVED_CHANNELS:
+        return "__REMOVE__"
+
+    # --- TR SPOR (once kontrol et - beIN, S Sport, Exxen vb.) ---
+    if any(k in n for k in ["BEIN SPORTS", "BEIN SPORT", "S SPORT",
+        "EXXEN SPORT", "EXXEN TV",
+        "TIVIBU SPOR", "SPOR SMART", "EUROSPORT",
+        "A SPOR", "TRT SPOR", "SPORTS TV",
+        "NBA TV", "FIGHT BOX", "EDGE SPORT", "TRACE SPORT",
+        "FB TV", "GS TV", "TJK TV", "TAY TV"]):
         return "TR SPOR"
-    if any(k in combined for k in ["DINI","DIN","LALE","SEMERKAND","HILAL","MEKKE","KURAN"]):
+
+    # --- TR SINEMA ---
+    if any(k in n for k in ["BEIN MOVIES", "BEIN MOVIE",
+        "MOVIE SMART", "SINEMA TV", "FILMBOX",
+        "BLU TV PLAY", "EPIC DRAMA"]):
+        return "TR SINEMA"
+
+    # --- TR SINEMA VOD ---
+    if any(k in n for k in ["ENO ", "ENOFLIX", "ENOAKSIYON",
+        "FIBERBOX", "MARVEL STUDIOS", "PRIMEBOX", "SINEMAX",
+        "GOOGLE TV", "GOOGLE TV", "TURKLIVE",
+        "UNI BOX OFFICE", "VIZYONTV", "YESILCAM BOX",
+        "KEMAL SUNAL", "KADIR INANIR", "KADİR İNANIR",
+        "METIN AKPINAR", "ZEKI METIN", "ZEKİ METİN",
+        "SENER SEN", "ŞENER ŞEN",
+        "CUNEYT ARKIN", "CÜNEYT ARKIN",
+        "TARIK AKAN", "ILYAS SALMAN", "YILMAZ GUNEY",
+        "HALIT AKCATEPE", "HALİT AKÇATEPE", "MUNIR ÖZKUL",
+        "MUNİR ÖZKUL", "SADRI ALISIK", "SADRİ ALİSİK",
+        "GULDUR GULDUR", "GÜLDÜR GÜLDÜR"]):
+        return "TR SINEMA VOD"
+
+    # --- TR DIZI ---
+    if any(k in n for k in ["FX HD", "FOX CRIME", "BEIN SERIES", "DIZI SMART"]):
+        return "TR DIZI"
+
+    # --- TR 7/24 DIZI ---
+    if n.startswith("7/24") or "7/24 " in n:
+        return "TR 7/24 DIZI"
+
+    # --- TR HABER (ULUSAL'dan once!) ---
+    if any(k in n for k in ["24 HD", "A HABER", "A NEWS", "A PARA",
+        "AKIT TV", "BBN TURK", "BENGUTURK", "BLOOMBERG HT",
+        "CADDE TV", "CNN TURK", "EKOTURK", "FLASH HABER",
+        "HABER GLOBAL", "HABERTURK", "HALK TV",
+        "IBB TV", "KRT TV", "LIDER HABER",
+        "NTV", "SZC TV", "TELE 1", "TELE1",
+        "TGRT HABER", "TRT HABER", "TURKHABER",
+        "TV100", "TVNET", "ULKE TV", "ULUSAL KANAL",
+        "TBMM"]):
+        return "TR HABER"
+
+    # --- TR ULUSAL ---
+    if any(k in combined for k in ["TRT 1", "TRT 2", "TRT TURK", "TRT AVAZ", "TRT 4K",
+        "ATV HD", "ATV HD+", "ATV AVRUPA",
+        "SHOW TV", "SHOW TURK", "SHOW MAX",
+        "STAR TV", "KANAL D", "FOX TV",
+        "TV8", "TV 8", "TV 8,5", "TV 8.5",
+        "TEVE 2", "BEYAZ TV", "A2 HD", "A2 HD+",
+        "KANAL 7", "360 HD", "360 HD+",
+        "TGRT EU", "EURO STAR", "EURO D",
+        "TV 8 INT", "TV8 INT", "KANAL 7 AVRUPA"]):
+        # ULUSAL'dan cikarilacak kanallar
+        if any(k in n for k in ULUSAL_EXCLUDE):
+            return "TR HABER"
+        return "TR ULUSAL"
+
+    # --- TR BELGESEL ---
+    if any(k in n for k in ["BELGESEL", "DISCOVERY", "NAT GEO", "NATIONAL GEOGRAPHIC",
+        "HISTORY", "ANIMAL", "DA VINCI", "VIASAT EXPLORE", "VIASAT HISTORY",
+        "BBC EARTH", "HABITAT TV", "TARIH TV", "CHASSE", "ANIMAUX",
+        "DOCUBOX", "LOVE NATURE", "TRT BELGESEL",
+        "BEIN IZ", "BEIN GURME", "BEIN HOME",
+        "FASHION HD", "FAST FUN", "TARIM TURK",
+        "STINGRAY", "CIFTCI TV", "YABAN TV", "TGRT BELGESEL"]):
+        return "TR BELGESEL"
+    if "DMAX" in n or "TLC" in n:
+        return "TR BELGESEL"
+
+    # --- TR COCUK ---
+    if any(k in n for k in ["COCUK", "CARTOON", "NICKELODEON", "NICK JR",
+        "MINIKA", "MOONBUG", "MOOUNBUG", "DISNEY JUNIOR", "CBEEBIES",
+        "CARTOONITO", "BABY TV", "KIDS",
+        "MASAL TV", "SEVIMLI DOSTLAR", "HEIDI", "ARI MAYA",
+        "REDKIT", "DIGITAL TAYFA", "KONUŞAN TOM", "KONUSAN TOM",
+        "ELIF", "AKILLI TAVŞAN", "ASLAN", "BIZ IKIMIZ", "BİZ İKİMİZ",
+        "BULMACA", "ŞIRINLER", "SIRINLER", "İTFAIYECİ SAM",
+        "DINOTRUX", "JOHNNY TEST", "OSCAR",
+        "KÜÇÜK TREN", "PJ MASKELILER", "ROBOCAR POLI",
+        "KUKULI", "CANIM KARDESIM", "CANIM KARDEŞİM",
+        "DORU", "CILLE", "EGE ILE GAGA", "EGE İLE GAGA",
+        "ELIF VE ARKADAS", "ELIF VE ARKADAŞ",
+        "GÖKKUŞAĞI", "GOKKUSAGI", "İBI", "KARE", "KELOĞLAN",
+        "KOYUN SHAUN", "PAW PATROL", "ANGRY BIRDS",
+        "HAPŞUU", "KÖSTEBEKGİLLER", "KOSTEBEKGİLLER",
+        "KÜÇÜK HEZARFEN", "KUKLALI", "KUZUCUK",
+        "MAYSA", "MIGHTY EXPRESS", "OLSAYDIM",
+        "PINKY MALINKY", "PİRIL", "PIRIL",
+        "RAFADAN TAYFA", "SU ELÇILERİ", "SU ELCILERI",
+        "SÜNGER BOB", "SUNGER BOB",
+        "PATRON BEBEK", "NILOYA", "OZI",
+        "PEPEE", "KÜÇÜK OTOBÜS", "LEYLEK KARDEŞ",
+        "CICIKI", "SONIC BOOM", "MY LITTLE PONY", "LARVA",
+        "BARBIE", "POLLY POCKET", "ALVIN", "LOLI ROCK",
+        "PAC-MAN", "KARDESIM OZI", "KARDEŞİM OZİ"]):
+        return "TR COCUK"
+    if "TRT DIYANET COCUK" in n or "TRT COCUK" in n:
+        return "TR COCUK"
+
+    # --- TR MUZIK ---
+    if any(k in n for k in ["MUZIK", "MÜZİK", "MUSIC",
+        "KRAL POP", "KRAL TV", "POWER TV", "POWER TURK",
+        "NUMBER 1", "NUMBER1", "DREAM TURK",
+        "MILYON TV", "TRT MUZIK", "TRACE URBAN", "TATLISES", "NET MUZIK"]):
+        return "TR MUZIK"
+
+    # --- TR DINI ---
+    if any(k in n for k in ["DINI", "DİNİ", "DIYANET", "DİYANET",
+        "DOST TV", "KABE TV", "LALEGUL", "LALEGÜL",
+        "REHBER TV", "SEMERKAND", "MELTEM TV",
+        "MEDINE TV", "MESAJ TV", "DIYAR TV", "BERAT TV",
+        "HZ YUSUF"]):
         return "TR DINI"
-    if any(k in combined for k in ["RADYO","RADIO"]):
+
+    # --- TR RADYO ---
+    if any(k in n for k in ["RADYO", "RADIO", " FM"]):
         return "TR RADYO"
-    if any(k in combined for k in ["ARD","ZDF","ARTE","WDR","NDR","MDR","SWR","RBB","PHOENIX","TAGESSCHAU","3SAT","KIKA","ONE","ZDFNEO","PROSIEBEN","SAT.1","RTL","VOX","KABEL1"]):
+
+    # --- TR YEREL (şehir bazli) ---
+    if any(k in n for k in ["MALATYA", "KAHRAMANMARAS", "BURSA", "ISPARTA",
+        "ZONGULDAK", "RIZE", "DENIZLI", "DENİZLİ",
+        "SANLIURFA", "ŞANLIURFA", "ELAZIG", "ELAZIĞ",
+        "KONYA", "MERSIN", "KUTAHYA", "KÜTAHYA",
+        "KIBRIS", "KIBRİS", "ADANA", "ADIYAMAN",
+        "ORDU", "ANTALYA", "CANAKKALE", "ÇANAKKALE",
+        "KAYSERI", "KAYSERİ", "KOCAELI", "KOCAELİ",
+        "SIVAS", "KARADENIZ", "KARADENİZ", "VIYANA"]):
+        return "TR YEREL"
+    if any(k in combined for k in ["YEREL", "AKILLI TV", "ANADOLU DERNEK",
+        "BEYKENT TV", "CAN TV", "CEM TV", "EGE TV",
+        "KADIRGA TV", "KANAL AVRUPA", "KANAL B",
+        "TEMPO TV", "TV 4 HD", "TV 5 HABER",
+        "UCANKUS TV", "VATAN TV", "YOL TV", "ON4 TV",
+        "MAVI KARADENIZ", "MAVİ KARADENİZ"]):
+        return "TR YEREL"
+
+    # --- DE VOLLPROGRAMM ---
+    if any(k in combined for k in ["ARD", "ZDF", "DAS ERSTE", "WDR", "NDR",
+        "BR ", "SWR", "HR ", "MDR", "RBB", "PHOENIX", "3SAT",
+        "KIKA", "ONE", "ARTE", "TAGESSCHAU", "ZDFNEO", "ZDFINFO",
+        "PROSIEBEN", "SAT.1", "SAT1", "RTL", "VOX",
+        "KABEL1", "KABEL EINS", "RTL2", "SUPER RTL",
+        "SIXX", "TELE 5"]):
         return "DE VOLLPROGRAMM"
-    if any(k in combined for k in ["NACHRICHTEN","WELT","SPIEGEL"]):
+
+    # --- DE NACHRICHTEN ---
+    if any(k in combined for k in ["NACHRICHTEN", "N-TV", "N24", "WELT", "SPIEGEL"]):
         return "DE NACHRICHTEN"
-    if any(k in combined for k in ["DOKU","DOKUMENTATION"]):
+
+    # --- DE DOKU ---
+    if any(k in combined for k in ["DOKU", "DOKUMENTATION", "D-MAX", "DMAX",
+        "N24 DOKU", "SPIEGEL TV"]):
         return "DE DOKU"
-    if any(k in combined for k in ["KINDER","CHILDREN"]):
+
+    # --- DE KINDER ---
+    if any(k in combined for k in ["KINDER", "KIDS", "TOGGO"]):
         return "DE KINDER"
-    if any(k in combined for k in ["DE: FILM","DE: MOVIE","DE: SKY","DE: AXN"]):
+
+    # --- DE FILM (genis eslesme!) ---
+    if any(k in n for k in ["SKY CINEMA", "13TH STREET", "AXN",
+        "TNT SERIE", "TNT FILM", "SKY HITS", "SKY ACTION",
+        "KINO", "CINEMA", "SERIE"]):
         return "DE FILM"
-    if any(k in combined for k in ["DE: SPORT","DE: EUROSPORT","DE: SKY SPORT","DE: BEIN"]):
+    # Alman film kanallari - DE prefix + film kelimeleri
+    if any(k in combined for k in ["DE: FILM", "DE: MOVIE", "DE: SKY", "DE: AXN"]):
+        return "DE FILM"
+
+    # --- DE SPORT (genis eslesme!) ---
+    if any(k in n for k in ["SPORT", "EUROSPORT", "SKY SPORT",
+        "DAZN", "SPORT1", "MOTORVISION"]):
         return "DE SPORT"
-    if any(k in combined for k in ["DE:","DE ","GERMAN","4K DE","FHD DE","HD DE"]):
+    if any(k in combined for k in ["DE: SPORT", "DE: EUROSPORT", "DE: SKY SPORT"]):
+        return "DE SPORT"
+
+    # --- DE MUSIK ---
+    if any(k in n for k in ["MUSIK", "VIVA", "DELUXE"]):
+        return "DE MUSIK"
+
+    # --- DE SONSTIGE (Avusturya, İsvicre, diger) ---
+    if any(k in n for k in ["ORF", "PULS 4", "SERVUS", "SRF", "SWISS"]):
         return "DE SONSTIGE"
+
+    # --- DE catch-all ---
+    if any(k in combined for k in ["DE:", "DE ", "GERMAN", "4K DE", "FHD DE", "HD DE"]):
+        return "DE SONSTIGE"
+
+    # --- TR catch-all ---
+    if any(k in combined for k in ["TURKEY", "TURKIYE", "TÜRKİYE", "TR:", "TR "]):
+        return "TR YEREL"
+
     return "TR YEREL"
 
 def clean_name(name):
@@ -352,6 +583,7 @@ async def startup_sequence():
         return
     add_log(f"Toplam {len(channels)} kanal")
     filtered = []
+    removed = 0
     for ch in channels:
         country = detect_country(ch)
         if country in ("TR", "DE", "BOTH"):
@@ -360,6 +592,9 @@ async def startup_sequence():
             logo = ch.get("logo", "")
             group = ch.get("group", "")
             grp = remap_group(name, group)
+            if grp == "__REMOVE__":
+                removed += 1
+                continue
             ch_id = 0
             m = re.search(r'/play\d+/(\d+)\.m3u8', url)
             if m:
@@ -369,7 +604,14 @@ async def startup_sequence():
             filtered.append({"id": ch_id, "name": name, "url": url, "hls": "", "grp": grp, "country": country if country != "BOTH" else "TR", "logo": logo, "clean_name": clean_name(name)})
     tr_count = sum(1 for c in filtered if c["country"] == "TR")
     de_count = sum(1 for c in filtered if c["country"] == "DE")
-    add_log(f"Filtrelenmis: {len(filtered)} (TR={tr_count}, DE={de_count})")
+    # Grup bazli sayilar
+    grp_counts = {}
+    for c in filtered:
+        g = c["grp"]
+        grp_counts[g] = grp_counts.get(g, 0) + 1
+    grp_str = ", ".join(f"{g}={v}" for g, v in sorted(grp_counts.items()))
+    add_log(f"Filtrelenmis: {len(filtered)} (TR={tr_count}, DE={de_count}),Removed={removed}")
+    add_log(f"Gruplar: {grp_str}")
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM channels")
