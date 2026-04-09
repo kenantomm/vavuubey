@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse
+from fastapi.routing import APIRoute
 import state
 import httpx
 
@@ -235,6 +236,7 @@ async def stats():
     return JSONResponse({"status": "online" if state.DATA_READY else "loading", "channels": len(state.get_all_channels(ordered=False)) if state.DATA_READY else 0})
 
 @app.get("/ping")
+@app.head("/ping")
 async def ping():
     """Lightweight health check for UptimeRobot/cron-job - returns 200 OK"""
     return PlainTextResponse("pong", status_code=200, media_type="text/plain")
