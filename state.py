@@ -220,10 +220,11 @@ def init_db():
         sort_order INTEGER DEFAULT 9999,
         grp_order INTEGER DEFAULT 99
     )""")
-    # Override table for manual group assignments
+    # Override table for manual group assignments + custom sort order
     c.execute("""CREATE TABLE IF NOT EXISTS channel_overrides (
         channel_name TEXT PRIMARY KEY,
-        target_group TEXT NOT NULL
+        target_group TEXT NOT NULL,
+        custom_sort_order INTEGER DEFAULT 0
     )""")
     # Migration: ensure columns exist (for old databases)
     try:
@@ -236,6 +237,14 @@ def init_db():
             c.execute("ALTER TABLE channels ADD COLUMN sort_order INTEGER DEFAULT 9999")
         if "grp_order" not in cols:
             c.execute("ALTER TABLE channels ADD COLUMN grp_order INTEGER DEFAULT 99")
+    except Exception:
+        pass
+    # Migration: add custom_sort_order to channel_overrides if missing
+    try:
+        ovr_cols = [row[1] for row in c.execute("PRAGMA table_info(channel_overrides)").fetchall()]
+        if "custom_sort_order" not in ovr_cols:
+            c.execute("ALTER TABLE channel_overrides ADD COLUMN custom_sort_order INTEGER DEFAULT 0")
+            add_log("Migration: custom_sort_order eklendi")
     except Exception:
         pass
     conn.commit()
@@ -259,7 +268,12 @@ def get_all_channels(ordered=True):
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     if ordered:
-        c.execute("SELECT * FROM channels ORDER BY grp_order, sort_order, name")
+        # Use effective sort_order: prefer custom_sort_order from overrides, fall back to computed
+        c.execute("""SELECT c.*, 
+            CASE WHEN o.custom_sort_order > 0 THEN o.custom_sort_order ELSE c.sort_order END as effective_sort_order
+            FROM channels c
+            LEFT JOIN channel_overrides o ON UPPER(c.name) = o.channel_name
+            ORDER BY c.grp_order, effective_sort_order, c.name""")
     else:
         c.execute("SELECT * FROM channels")
     rows = [dict(r) for r in c.fetchall()]
@@ -329,16 +343,18 @@ def load_overrides_from_json():
     except Exception as e:
         add_log(f"Override JSON yukleme hatasi: {e}")
 
-def set_override(channel_name, target_group):
+def set_override(channel_name, target_group, custom_sort_order=0):
     """Set a single override (with DB write + JSON backup). For bulk, use batch_set_overrides()."""
     key = channel_name.upper().strip()
     OVERRIDE_CACHE[key] = target_group
     sort_ord = compute_sort_order(channel_name, target_group)
     grp_ord = GROUP_ORDER.get(target_group, 99)
+    # Use custom sort_order if provided, otherwise use computed
+    effective_sort = custom_sort_order if custom_sort_order > 0 else sort_ord
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO channel_overrides (channel_name, target_group) VALUES (?, ?)", (key, target_group))
-    c.execute("UPDATE channels SET grp = ?, sort_order = ?, grp_order = ? WHERE UPPER(name) = ?", (target_group, sort_ord, grp_ord, key))
+    c.execute("INSERT OR REPLACE INTO channel_overrides (channel_name, target_group, custom_sort_order) VALUES (?, ?, ?)", (key, target_group, custom_sort_order))
+    c.execute("UPDATE channels SET grp = ?, sort_order = ?, grp_order = ? WHERE UPPER(name) = ?", (target_group, effective_sort, grp_ord, key))
     conn.commit()
     conn.close()
     save_overrides_to_json()
@@ -355,7 +371,8 @@ def batch_set_overrides(overrides_dict):
         OVERRIDE_CACHE[key] = group
         sort_ord = compute_sort_order(name, group)
         grp_ord = GROUP_ORDER.get(group, 99)
-        c.execute("INSERT OR REPLACE INTO channel_overrides (channel_name, target_group) VALUES (?, ?)", (key, group))
+        # Reset custom_sort_order to 0 when group changes (use auto-computed sort)
+        c.execute("INSERT OR REPLACE INTO channel_overrides (channel_name, target_group, custom_sort_order) VALUES (?, ?, 0)", (key, group))
         c.execute("UPDATE channels SET grp = ?, sort_order = ?, grp_order = ? WHERE UPPER(name) = ?", (group, sort_ord, grp_ord, key))
         count += 1
     conn.commit()
@@ -387,6 +404,82 @@ def delete_all_overrides():
 def get_all_overrides():
     return dict(OVERRIDE_CACHE)
 
+def reorder_channel(channel_name, direction):
+    """Move a channel up (-1) or down (+1) within its group. Swaps sort_order with neighbor."""
+    key = channel_name.upper().strip()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    # Get the target channel's current group and effective sort_order
+    c.execute("""SELECT c.name, c.grp, c.sort_order, c.grp_order,
+        CASE WHEN o.custom_sort_order > 0 THEN o.custom_sort_order ELSE c.sort_order END as eff_sort
+        FROM channels c
+        LEFT JOIN channel_overrides o ON UPPER(c.name) = o.channel_name
+        WHERE UPPER(c.name) = ?""", (key,))
+    target = c.fetchone()
+    if not target:
+        conn.close()
+        return False, "Kanal bulunamadi"
+    
+    target_grp = target["grp"]
+    target_sort = target["eff_sort"]
+    
+    # Get all channels in the same group, ordered by effective sort_order, then name
+    c.execute("""SELECT c.name, c.sort_order,
+        CASE WHEN o.custom_sort_order > 0 THEN o.custom_sort_order ELSE c.sort_order END as eff_sort
+        FROM channels c
+        LEFT JOIN channel_overrides o ON UPPER(c.name) = o.channel_name
+        WHERE c.grp = ?
+        ORDER BY eff_sort, c.name""", (target_grp,))
+    group_channels = [dict(r) for r in c.fetchall()]
+    
+    # Find target index
+    target_idx = None
+    for i, ch in enumerate(group_channels):
+        if ch["name"].upper().strip() == key:
+            target_idx = i
+            break
+    
+    if target_idx is None:
+        conn.close()
+        return False, "Kanal grupta bulunamadi"
+    
+    # Find neighbor
+    neighbor_idx = target_idx + (1 if direction == "down" else -1)
+    if neighbor_idx < 0 or neighbor_idx >= len(group_channels):
+        conn.close()
+        return False, "Zaten en ustte/altta"
+    
+    neighbor = group_channels[neighbor_idx]
+    neighbor_key = neighbor["name"].upper().strip()
+    target_new_sort = neighbor["eff_sort"]
+    neighbor_new_sort = target_sort
+    
+    # Swap sort_orders - save custom_sort_order for both
+    # Target channel
+    c.execute("INSERT OR REPLACE INTO channel_overrides (channel_name, target_group, custom_sort_order) VALUES (?, ?, ?)",
+        (key, target_grp, target_new_sort))
+    c.execute("UPDATE channels SET sort_order = ? WHERE UPPER(name) = ?", (target_new_sort, key))
+    
+    # Neighbor channel
+    current_neighbor_grp = None
+    c.execute("SELECT target_group FROM channel_overrides WHERE channel_name = ?", (neighbor_key,))
+    nr = c.fetchone()
+    if nr:
+        current_neighbor_grp = nr[0]
+    
+    # If neighbor has no override, create one to preserve its position
+    target_grp_for_neighbor = current_neighbor_grp or target_grp
+    c.execute("INSERT OR REPLACE INTO channel_overrides (channel_name, target_group, custom_sort_order) VALUES (?, ?, ?)",
+        (neighbor_key, target_grp_for_neighbor, neighbor_new_sort))
+    c.execute("UPDATE channels SET sort_order = ? WHERE UPPER(name) = ?", (neighbor_new_sort, neighbor_key))
+    
+    conn.commit()
+    conn.close()
+    save_overrides_to_json()
+    return True, f"{channel_name} {'asagi' if direction == 'down' else 'yukari'} tasindi"
+
 def import_overrides(overrides_dict):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -397,7 +490,7 @@ def import_overrides(overrides_dict):
         key = name.upper().strip()
         OVERRIDE_CACHE[key] = group
         sort_ord = compute_sort_order(name, group)
-        c.execute("INSERT OR REPLACE INTO channel_overrides (channel_name, target_group) VALUES (?, ?)", (key, group))
+        c.execute("INSERT OR REPLACE INTO channel_overrides (channel_name, target_group, custom_sort_order) VALUES (?, ?, 0)", (key, group))
         c.execute("UPDATE channels SET grp = ?, sort_order = ? WHERE UPPER(name) = ?", (group, sort_ord, key))
         count += 1
     conn.commit()

@@ -400,6 +400,18 @@ async def admin_import_overrides(request: Request):
     count = state.import_overrides(data)
     return JSONResponse({"ok": True, "imported": count})
 
+@app.post("/api/admin/reorder")
+async def admin_reorder(request: Request):
+    data = await request.json()
+    channel_name = data.get("channel", "")
+    direction = data.get("direction", "")
+    if not channel_name or direction not in ("up", "down"):
+        return JSONResponse({"error": "channel and direction required"}, status_code=400)
+    success, msg = state.reorder_channel(channel_name, direction)
+    if success:
+        return JSONResponse({"ok": True, "message": msg})
+    return JSONResponse({"ok": False, "message": msg}, status_code=400)
+
 ADMIN_HTML = r"""<!DOCTYPE html>
 <html lang="tr">
 <head>
@@ -518,6 +530,12 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans
 .btn-red:hover{background:#dc2626}
 .btn-ghost{background:transparent;border-color:transparent}
 .btn-ghost:hover{background:var(--bg3)}
+.btn-ghost:active{background:var(--blue-bg);color:var(--blue)}
+
+/* REORDER buttons */
+.reorder-btn{width:26px;height:26px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--text2);font-size:11px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:.15s;padding:0}
+.reorder-btn:hover{background:var(--blue-bg);color:var(--blue);border-color:var(--blue)}
+.reorder-btn:active{transform:scale(.92)}
 
 /* TABLE */
 .table-wrap{flex:1;overflow-y:auto;padding:0 24px 24px}
@@ -686,6 +704,7 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans
             <th style="width:70px">Ulke</th>
             <th style="width:160px">Grup</th>
             <th style="width:200px">Yeni Grup</th>
+            <th style="width:90px">Sira</th>
             <th style="width:80px">Durum</th>
           </tr>
         </thead>
@@ -788,7 +807,7 @@ function render(){
 
   document.getElementById('resultCount').textContent=fl.length+' kanal (Sayfa '+curPage+'/'+totalPages+')';
 
-  if(!fl.length){tb.innerHTML='<tr><td colspan="7"><div class="empty"><div class="em-icon">&#128250;</div><p>Kanal bulunamadi</p></div></td></tr>';updStats();renderPagination(0);return}
+  if(!fl.length){tb.innerHTML='<tr><td colspan="8"><div class="empty"><div class="em-icon">&#128250;</div><p>Kanal bulunamadi</p></div></td></tr>';updStats();renderPagination(0);return}
 
   /* Build rows using DocumentFragment for speed */
   const frag=document.createDocumentFragment();
@@ -818,6 +837,7 @@ function render(){
     h+='<td><select class="gsel" data-chname="'+esc(k)+'">';
     GRPS.forEach(g=>{h+='<option value="'+g+'"'+(cur===g?' selected':'')+'>'+g+'</option>'});
     h+='</select></td>';
+    h+='<td><div style="display:flex;gap:3px"><button class="reorder-btn" onclick="moveChannel(\''+escJS(k)+'\',\'up\')" title="Yukari tas">&#9650;</button><button class="reorder-btn" onclick="moveChannel(\''+escJS(k)+'\',\'down\')" title="Asagi tas">&#9660;</button></div></td>';
     h+='<td>'+statusTag+'</td>';
     h+='</tr>';
   });
@@ -1084,6 +1104,23 @@ function onGrpDrop(e){
   }else if(skippedCount>0){
     toast(skippedCount+' kanal zaten '+targetGroup+' grubunda','ok');
   }
+}
+
+/* ===== CHANNEL REORDER (up/down within group) ===== */
+
+async function moveChannel(name,dir){
+  try{
+    const r=await fetch('/api/admin/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:name,direction:dir})});
+    const j=await r.json();
+    if(j.ok){
+      toast(j.message,'ok');
+      /* Reload channel data to reflect new order */
+      const r2=await fetch('/api/admin/channels');channels=await r2.json();
+      buildSidebar();render();
+    }else{
+      toast(j.message||'Hata','err');
+    }
+  }catch(e){toast('Hata: '+e,'err')}
 }
 
 /* ===== KEYBOARD SHORTCUTS ===== */
