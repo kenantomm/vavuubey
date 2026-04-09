@@ -510,7 +510,7 @@ def detect_country(ch):
             "ATV HD", "FOX TV", "TV8", "TEVE2", "BEYAZ TV",
             "KANAL 7", "A2 HD", "A SPOR", "TGRT ", "TJK ",
             "TIVIBU", "SPOR SMART", "EXXEN", "DIZI SMART",
-            "SINEMA TV", "FILMBOX", "MOVIE SMART",
+            "SINEMA TV", "SINEMA ", "FILMBOX", "MOVIE SMART",
             "CIFTCI TV", "KEMAL SUNAL", "SEMERKAND", "LALEGUL",
             "DOST TV", "REHBER TV", "MASAL TV", "MINIKA",
             "PEPEE", "NET MUZIK", "KRAL POP", "KRAL TV",
@@ -518,7 +518,9 @@ def detect_country(ch):
             "TURKLIVE", "YESILCAM BOX", "VIZYONTV",
             "UNI BOX OFFICE", "FIBERBOX", "PRIMEBOX",
             "7/24 ", "GULDUR GULDUR", "KUKULI", "CICIKI",
-            "RAFADAN TAYFA", "KOSTEBEKGILLER"]):
+            "RAFADAN TAYFA", "KOSTEBEKGILLER",
+            "ULKE TV", "CINESTAR", "NOW HD",
+            "EUROSPORT", "BEIN 1", "BEIN 2", "BEIN 3"]):
             is_tr = True
 
     # 5. DE-ozgu isimler
@@ -595,8 +597,12 @@ def remap_group(name, original_group="", country=""):
             return "TR ULUSAL"
 
         # --- TR SPOR ---
-        if any(k in n for k in ["BEIN SPORTS", "BEIN SPORT",
-            "S SPORT", "EXXEN SPORT",
+        # BEIN: catch all BEIN sport channels, but NOT BEIN MOVIES/SERIES/IZ/GURME/HOME
+        is_bein_sport = ("BEIN" in n and not any(k in n for k in [
+            "BEIN MOVIES", "BEIN MOVIE", "BEIN SERIES",
+            "BEIN IZ", "BEIN GURME", "BEIN HOME"]))
+        if is_bein_sport or any(k in n for k in [
+            "S SPORT", "EXXEN", "EUROSPORT",
             "TIVIBU SPOR", "SPOR SMART",
             "A SPOR", "TRT SPOR", "SPORTS TV",
             "NBA TV", "FIGHT BOX", "EDGE SPORT", "TRACE SPORT",
@@ -609,8 +615,9 @@ def remap_group(name, original_group="", country=""):
 
         # --- TR SINEMA ---
         if any(k in n for k in ["BEIN MOVIES", "BEIN MOVIE",
-            "MOVIE SMART", "SINEMA TV", "FILMBOX",
-            "BLU TV PLAY", "EPIC DRAMA"]):
+            "MOVIE SMART", "SINEMA", "FILMBOX",
+            "BLU TV PLAY", "EPIC DRAMA",
+            "CINESTAR", "NOW HD", "NOW TV"]):
             if is_4k:
                 return "TR 4K"
             if is_raw:
@@ -736,8 +743,10 @@ def remap_group(name, original_group="", country=""):
             return "TR YEREL"
 
         # --- TR ULUSAL fallback (broad TR keywords) ---
+        # NOTE: EUROSPORT caught above in TR SPOR, so 'EURO' here only matches EURO STAR/D
         if any(k in n for k in ["TRT ", "ATV ", "SHOW ", "STAR ",
-            "KANAL ", "FOX ", "TV8", "TEVE", "BEYAZ", "EURO"]):
+            "KANAL ", "FOX ", "TV8", "TEVE", "BEYAZ",
+            "EURO ", "EUROSTAR", "EUROD"]):
             return "TR ULUSAL"
 
         # --- TR-only: default to TR YEREL ---
