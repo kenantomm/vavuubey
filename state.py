@@ -15,7 +15,8 @@ WATCHED_SIG = ""
 WATCHED_SIG_TIME = 0
 DB_PATH = "/tmp/vxparser.db"
 RESOLVE_CACHE = {}
-SIG_REFRESH_INTERVAL = 1800
+SIG_REFRESH_INTERVAL = 1800  # 30 dakikada bir signature yenile
+SELF_PING_INTERVAL = 240    # 4 dakikada bir kendine ping at
 
 def add_log(msg):
     log.info(msg)
@@ -68,12 +69,34 @@ def update_channel_hls(ch_id, hls_url):
     conn.commit()
     conn.close()
 
+# ===== LOKKE / MediaHubMX =====
+
 async def refresh_watched_sig(force=False):
+    """Get FRESH mediahubmx-signature from Lokke (always calls API, ignores cache)"""
     global WATCHED_SIG, WATCHED_SIG_TIME
     try:
         now_ms = int(time.time()) * 1000
-        headers = {"user-agent": "okhttp/4.11.0", "accept": "application/json", "content-type": "application/json; charset=utf-8"}
-        data = {"token": "", "reason": "boot", "locale": "de", "theme": "dark", "metadata": {"device": {"type": "desktop", "uniqueId": ""}, "os": {"name": "win32", "version": "Windows 10", "abis": ["x64"], "host": "DESKTOP-VX"}, "app": {"platform": "electron"}, "version": {"package": "app.lokke.main", "binary": "1.0.19", "js": "1.0.19"}}, "appFocusTime": 173, "playerActive": False, "playDuration": 0, "devMode": True, "hasAddon": True, "castConnected": False, "package": "app.lokke.main", "version": "1.0.19", "process": "app", "firstAppStart": now_ms, "lastAppStart": now_ms, "ipLocation": 0, "adblockEnabled": True, "proxy": {"supported": ["ss"], "engine": "cu", "enabled": False, "autoServer": True, "id": 0}, "iap": {"supported": False}}
+        headers = {
+            "user-agent": "okhttp/4.11.0",
+            "accept": "application/json",
+            "content-type": "application/json; charset=utf-8",
+        }
+        data = {
+            "token": "", "reason": "boot", "locale": "de", "theme": "dark",
+            "metadata": {
+                "device": {"type": "desktop", "uniqueId": ""},
+                "os": {"name": "win32", "version": "Windows 10", "abis": ["x64"], "host": "DESKTOP-VX"},
+                "app": {"platform": "electron"},
+                "version": {"package": "app.lokke.main", "binary": "1.0.19", "js": "1.0.19"}
+            },
+            "appFocusTime": 173, "playerActive": False, "playDuration": 0,
+            "devMode": True, "hasAddon": True, "castConnected": False,
+            "package": "app.lokke.main", "version": "1.0.19", "process": "app",
+            "firstAppStart": now_ms, "lastAppStart": now_ms,
+            "ipLocation": 0, "adblockEnabled": True,
+            "proxy": {"supported": ["ss"], "engine": "cu", "enabled": False, "autoServer": True, "id": 0},
+            "iap": {"supported": False}
+        }
         async with httpx.AsyncClient(timeout=15, verify=False) as client:
             r = await client.post("https://www.lokke.app/api/app/ping", json=data, headers=headers)
             result = r.json()
@@ -84,26 +107,37 @@ async def refresh_watched_sig(force=False):
                 add_log(f"Signature yenilendi ({len(sig)} char)")
                 return sig
             else:
-                add_log(f"Sig basarisiz: {json.dumps(result)[:200]}")
+                add_log(f"Signature yenileme basarisiz: {json.dumps(result)[:200]}")
     except Exception as e:
-        add_log(f"Sig hata: {e}")
+        add_log(f"Signature yenileme hata: {e}")
     return ""
 
 async def get_watched_sig():
+    """Get signature - use cache if fresh, otherwise refresh"""
     global WATCHED_SIG, WATCHED_SIG_TIME
+    # If we have a sig and it's less than 30 min old, use it
     if WATCHED_SIG and (time.time() - WATCHED_SIG_TIME) < SIG_REFRESH_INTERVAL:
         return WATCHED_SIG
+    # Otherwise refresh
     return await refresh_watched_sig()
 
 async def resolve_mediahubmx(url):
+    """Resolve a stream URL via MediaHubMX - auto-refreshes sig on 403"""
+    global RESOLVE_CACHE
     sig = await get_watched_sig()
     if not sig:
+        # Force refresh
         sig = await refresh_watched_sig(force=True)
     if not sig:
-        add_log("Resolve: sig alinamadi!")
+        add_log("Resolve: signature alinamadi!")
         return None
+    
     try:
-        headers = {"user-agent": "MediaHubMX/2", "accept": "application/json", "content-type": "application/json; charset=utf-8", "mediahubmx-signature": sig}
+        headers = {
+            "user-agent": "MediaHubMX/2", "accept": "application/json",
+            "content-type": "application/json; charset=utf-8",
+            "mediahubmx-signature": sig,
+        }
         data = {"language": "de", "region": "AT", "url": url, "clientVersion": "3.0.2"}
         async with httpx.AsyncClient(timeout=15, verify=False) as client:
             r = await client.post("https://vavoo.to/mediahubmx-resolve.json", json=data, headers=headers)
@@ -113,9 +147,10 @@ async def resolve_mediahubmx(url):
                     resolved_url = result[0].get("url", "")
                     if resolved_url:
                         return resolved_url
-                add_log("Resolve bos response")
+                add_log(f"Resolve bos response")
             elif r.status_code == 403:
-                add_log("Resolve 403 -> sig yenileniyor...")
+                # Signature expired! Force refresh and retry ONCE
+                add_log("Resolve 403 -> signature yenileniyor...")
                 new_sig = await refresh_watched_sig(force=True)
                 if new_sig:
                     headers["mediahubmx-signature"] = new_sig
@@ -127,9 +162,9 @@ async def resolve_mediahubmx(url):
                             if resolved_url:
                                 add_log("Resolve 2. deneme BASARILI!")
                                 return resolved_url
-                    add_log(f"Resolve 2. deneme basarisiz: HTTP {r2.status_code}")
+                    add_log(f"Resolve 2. deneme de basarisiz: HTTP {r2.status_code}")
                 else:
-                    add_log("Resolve: sig yenilenemedi!")
+                    add_log("Resolve: signature yenilenemedi!")
             else:
                 add_log(f"Resolve HTTP {r.status_code}")
     except Exception as e:
@@ -137,14 +172,23 @@ async def resolve_mediahubmx(url):
     return None
 
 async def fetch_catalog(group, cursor=0):
+    global WATCHED_SIG
     sig = await get_watched_sig()
     if not sig:
         sig = await refresh_watched_sig(force=True)
     if not sig:
         return {}
     try:
-        headers = {"user-agent": "MediaHubMX/2", "accept": "application/json", "content-type": "application/json; charset=utf-8", "mediahubmx-signature": sig}
-        data = {"language": "de", "region": "AT", "catalogId": "iptv", "id": "iptv", "adult": False, "search": "", "sort": "name", "filter": {"group": group}, "cursor": cursor, "clientVersion": "3.0.2"}
+        headers = {
+            "user-agent": "MediaHubMX/2", "accept": "application/json",
+            "content-type": "application/json; charset=utf-8",
+            "mediahubmx-signature": sig,
+        }
+        data = {
+            "language": "de", "region": "AT", "catalogId": "iptv", "id": "iptv",
+            "adult": False, "search": "", "sort": "name",
+            "filter": {"group": group}, "cursor": cursor, "clientVersion": "3.0.2"
+        }
         async with httpx.AsyncClient(timeout=30, verify=False) as client:
             r = await client.post("https://vavoo.to/mediahubmx-catalog.json", json=data, headers=headers)
             if r.status_code == 200:
@@ -156,7 +200,7 @@ async def fetch_catalog(group, cursor=0):
                     r2 = await client.post("https://vavoo.to/mediahubmx-catalog.json", json=data, headers=headers)
                     if r2.status_code == 200:
                         return r2.json()
-            add_log(f"Catalog HTTP error '{group}'")
+            add_log(f"Catalog HTTP error for '{group}'")
     except Exception as e:
         add_log(f"Catalog hata ({group}): {e}")
     return {}
@@ -178,13 +222,34 @@ async def fetch_all_catalog(group_name):
         cursor = next_cursor
     return all_items
 
+# ===== Signature auto-refresh background task =====
+
 async def sig_refresh_loop():
+    """Background task: refresh signature every 30 minutes + self-ping every 4 min"""
+    last_refresh = time.time()
     while True:
-        await asyncio.sleep(SIG_REFRESH_INTERVAL)
-        add_log("Otomatik sig yenileme...")
-        await refresh_watched_sig(force=True)
-        RESOLVE_CACHE.clear()
-        add_log("Resolve cache temizlendi")
+        await asyncio.sleep(60)  # Her 60 saniyede bir kontrol et
+        now = time.time()
+        
+        # 30 dakika gectiyse signature yenile
+        if (now - last_refresh) >= SIG_REFRESH_INTERVAL:
+            add_log("Otomatik signature yenileme...")
+            await refresh_watched_sig(force=True)
+            RESOLVE_CACHE.clear()
+            add_log("Resolve cache temizlendi")
+            last_refresh = now
+        
+        # 4 dakika gectiyse kendine ping at (keepalive)
+        if (now - last_refresh) % SELF_PING_INTERVAL < 60:
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=5) as client:
+                    r = await client.get("http://localhost:7860/ping")
+                    add_log(f"Self-ping: {r.status_code}")
+            except Exception as e:
+                add_log(f"Self-ping hata: {e}")
+
+# ===== Channel Fetching =====
 
 async def fetch_channels():
     async with httpx.AsyncClient(timeout=30, verify=False) as client:
