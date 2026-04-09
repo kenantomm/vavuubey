@@ -448,13 +448,28 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans
 .sb-section-title .arrow{font-size:8px;transition:transform .2s}
 .sb-section-title.collapsed .arrow{transform:rotate(-90deg)}
 .sb-section-body.collapsed{display:none}
-.grp-item{display:flex;align-items:center;padding:7px 10px;border-radius:6px;cursor:pointer;transition:.15s;gap:8px;font-size:13px;margin:1px 0}
+.grp-item{display:flex;align-items:center;padding:7px 10px;border-radius:6px;cursor:pointer;transition:.15s;gap:8px;font-size:13px;margin:1px 0;position:relative}
 .grp-item:hover{background:var(--bg3)}
 .grp-item.active{background:var(--blue-bg);color:var(--blue);font-weight:600}
 .grp-item .g-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
 .grp-item .g-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .grp-item .g-cnt{font-size:11px;color:var(--text3);background:var(--bg);padding:1px 7px;border-radius:10px;font-weight:600}
 .grp-item.active .g-cnt{background:rgba(59,130,246,.2);color:var(--blue)}
+
+/* DROP TARGET styles */
+.grp-item.drop-target{background:rgba(34,197,94,.15)!important;border:2px dashed var(--green);border-radius:6px;padding:5px 8px}
+.grp-item.drop-target .g-dot{background:var(--green)!important;box-shadow:0 0 8px var(--green)}
+.grp-item.drop-reject{border:2px dashed var(--red)!important;background:rgba(239,68,68,.1)!important}
+
+/* DRAG styles on table rows */
+.ch-dragging{opacity:.4}
+.ch-drag-clone{position:fixed;pointer-events:none;z-index:9999;background:var(--bg3);border:1px solid var(--blue);border-radius:8px;padding:8px 14px;font-size:13px;color:var(--text);box-shadow:0 8px 24px rgba(0,0,0,.5);display:flex;align-items:center;gap:8px;max-width:300px}
+.ch-drag-clone .dc-icon{font-size:16px}
+
+/* DROP HINT banner */
+.drop-hint{position:fixed;top:0;left:var(--sidebar-w);right:0;height:4px;background:linear-gradient(90deg,var(--blue),var(--green),var(--blue));z-index:100;opacity:0;transition:opacity .2s;pointer-events:none}
+.drop-hint.active{opacity:1;animation:hintPulse 1s infinite}
+@keyframes hintPulse{0%,100%{opacity:.7}50%{opacity:1}}
 
 .sb-footer{padding:12px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:4px}
 .sb-footer .sbtn{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:6px;border:none;background:none;color:var(--text2);font-size:12px;cursor:pointer;transition:.15s;width:100%;text-align:left}
@@ -487,6 +502,8 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans
 .toolbar .search-main input:not(:placeholder-shown)~.sc{display:block}
 .toolbar .search-main .sc:hover{color:var(--text)}
 .toolbar .result-count{font-size:12px;color:var(--text3);white-space:nowrap}
+.drag-hint-bar{font-size:11px;color:var(--blue);display:flex;align-items:center;gap:4px;white-space:nowrap;padding:4px 10px;background:var(--blue-bg);border-radius:6px;border:1px solid rgba(59,130,246,.2)}
+.drag-hint-bar svg{width:14px;height:14px}
 
 /* BUTTONS */
 .btn{display:inline-flex;align-items:center;gap:6px;padding:8px 14px;border-radius:8px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-size:12px;font-weight:500;cursor:pointer;transition:.15s;white-space:nowrap}
@@ -497,6 +514,7 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans
 .btn-blue:hover{background:var(--blue2)}
 .btn-green{background:var(--green);border-color:#16a34a;color:#fff}
 .btn-green:hover{background:#16a34a}
+.btn-green:disabled{background:var(--green);opacity:.5}
 .btn-red{background:var(--red);border-color:#dc2626;color:#fff}
 .btn-red:hover{background:#dc2626}
 .btn-ghost{background:transparent;border-color:transparent}
@@ -515,6 +533,8 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans
 .tbl tr:hover td{background:rgba(59,130,246,.03)}
 .tbl tr.changed td{background:var(--green-bg);border-bottom-color:rgba(34,197,94,.2)}
 .tbl tr.changed:hover td{background:rgba(34,197,94,.15)}
+.tbl tr[draggable=true]{cursor:grab}
+.tbl tr[draggable=true]:active{cursor:grabbing}
 
 .ch-row{display:flex;align-items:center;gap:10px}
 .ch-logo{width:32px;height:32px;border-radius:6px;background:var(--bg);flex-shrink:0;display:flex;align-items:center;justify-content:center;overflow:hidden;border:1px solid var(--border)}
@@ -574,13 +594,14 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans
 </head>
 <body>
 <div class="overlay" id="overlay" onclick="toggleSidebar()"></div>
+<div class="drop-hint" id="dropHint"></div>
 <div class="app">
 
 <!-- SIDEBAR -->
 <aside class="sidebar" id="sidebar">
   <div class="sb-hdr">
     <h1><div class="icon">&#9656;</div> VxParser <span style="color:var(--blue)">Admin</span></h1>
-    <p>Kanal Grup Yonetimi</p>
+    <p>Kanal Grup Yonetimi &bull; Drag &amp; Drop</p>
   </div>
   <div class="sb-search">
     <div class="search-box">
@@ -621,7 +642,7 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans
       <div class="stat-card"><div class="sc-icon purple">&#9999;</div><div class="sc-info"><b id="sChanged">0</b><small>Bekleyen</small></div></div>
     </div>
     <div class="topbar-actions">
-      <button class="btn btn-green" onclick="save()" id="saveBtn">
+      <button class="btn btn-green" id="saveBtn" onclick="save()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
         Kaydet
       </button>
@@ -638,6 +659,10 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans
       <span class="si">&#128269;</span>
       <input type="text" id="mainSearch" placeholder="Kanal adi ile ara..." oninput="onMainSearch(this.value)">
       <button class="sc" onclick="clearMainSearch()">&#10005;</button>
+    </div>
+    <div class="drag-hint-bar" id="dragHintBar">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 9l7-7 7 7M5 15l7 7 7-7"/></svg>
+      Kanallari gruplara surukleyin
     </div>
     <span class="result-count" id="resultCount"></span>
   </div>
@@ -673,9 +698,12 @@ const GRPS=[...TR_GRPS,...DE_GRPS];
 const GRP_COLORS={"TR ULUSAL":"#3b82f6","TR SPOR":"#ef4444","TR SINEMA":"#a855f7","TR SINEMA VOD":"#8b5cf6","TR DIZI":"#ec4899","TR 7/24 DIZI":"#f472b6","TR BELGESEL":"#f59e0b","TR COCUK":"#22c55e","TR MUZIK":"#06b6d4","TR HABER":"#eab308","TR DINI":"#10b981","TR YEREL":"#6b7280","TR RADYO":"#14b8a6","TR 4K":"#f97316","TR 8K":"#fb923c","TR RAW":"#ef4444","DE VOLLPROGRAMM":"#3b82f6","DE NACHRICHTEN":"#ef4444","DE DOKU":"#f59e0b","DE KINDER":"#22c55e","DE FILM":"#a855f7","DE MUSIK":"#06b6d4","DE SPORT":"#ef4444","DE SONSTIGE":"#6b7280"};
 
 let channels=[],overrides={},changes={},selected=new Set(),activeGroup='',searchQ='';
+let dragChanName=null,dragClone=null,dragStarted=false;
 
+/* Safe HTML escaping for text content */
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
-function escJ(s){return JSON.stringify(s)}
+/* Safe JS string literal escaping for inline handlers inside single-quoted attrs */
+function escJS(s){return String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\n/g,'\\n').replace(/\r/g,'\\r')}
 
 async function load(){
   try{
@@ -696,7 +724,7 @@ function buildSidebar(){
   TR_GRPS.forEach(g=>{
     const cnt=grpCounts[g]||0;if(!cnt)return;
     const ovr=Object.keys(overrides).filter(k=>overrides[k]===g).length;
-    h+='<div class="grp-item '+(activeGroup===g?'active':'')+'" onclick="selectGroup(\''+esc(g)+'\')"><div class="g-dot" style="background:'+(GRP_COLORS[g]||'var(--text3)')+'"></div><div class="g-name" title="'+esc(g)+'">'+esc(g.replace('TR ',''))+'</div><div class="g-cnt">'+cnt+(ovr?'<span style="color:var(--yellow);margin-left:3px">+'+ovr+'</span>':'')+'</div></div>';
+    h+='<div class="grp-item '+(activeGroup===g?'active':'')+'" data-grp="'+esc(g)+'" onclick="selectGroup(\''+escJS(g)+'\')"><div class="g-dot" style="background:'+(GRP_COLORS[g]||'var(--text3)')+'"></div><div class="g-name" title="'+esc(g)+'">'+esc(g.replace('TR ',''))+'</div><div class="g-cnt">'+cnt+(ovr?'<span style="color:var(--yellow);margin-left:3px">+'+ovr+'</span>':'')+'</div></div>';
   });
   h+='</div></div>';
 
@@ -704,10 +732,18 @@ function buildSidebar(){
   DE_GRPS.forEach(g=>{
     const cnt=grpCounts[g]||0;if(!cnt)return;
     const ovr=Object.keys(overrides).filter(k=>overrides[k]===g).length;
-    h+='<div class="grp-item '+(activeGroup===g?'active':'')+'" onclick="selectGroup(\''+esc(g)+'\')"><div class="g-dot" style="background:'+(GRP_COLORS[g]||'var(--text3)')+'"></div><div class="g-name" title="'+esc(g)+'">'+esc(g.replace('DE ',''))+'</div><div class="g-cnt">'+cnt+(ovr?'<span style="color:var(--yellow);margin-left:3px">+'+ovr+'</span>':'')+'</div></div>';
+    h+='<div class="grp-item '+(activeGroup===g?'active':'')+'" data-grp="'+esc(g)+'" onclick="selectGroup(\''+escJS(g)+'\')"><div class="g-dot" style="background:'+(GRP_COLORS[g]||'var(--text3)')+'"></div><div class="g-name" title="'+esc(g)+'">'+esc(g.replace('DE ',''))+'</div><div class="g-cnt">'+cnt+(ovr?'<span style="color:var(--yellow);margin-left:3px">+'+ovr+'</span>':'')+'</div></div>';
   });
   h+='</div></div>';
   el.innerHTML=h;
+
+  /* Attach drag events to all group items */
+  el.querySelectorAll('.grp-item[data-grp]').forEach(gi=>{
+    gi.addEventListener('dragover',onGrpDragOver);
+    gi.addEventListener('dragenter',onGrpDragEnter);
+    gi.addEventListener('dragleave',onGrpDragLeave);
+    gi.addEventListener('drop',onGrpDrop);
+  });
 }
 
 function toggleSection(el){el.classList.toggle('collapsed');el.nextElementSibling.classList.toggle('collapsed')}
@@ -755,13 +791,13 @@ function render(){
     else if(isChg)statusTag='<span class="tag tag-chg">&#10003; DEGISTI</span>';
     else statusTag='<span class="tag tag-cur">OTO</span>';
 
-    h+='<tr class="'+rowCls+'">';
+    h+='<tr class="'+rowCls+'" draggable="true" data-chname="'+esc(k)+'">';
     h+='<td><input type="checkbox" class="cb ch-cb" data-name="'+esc(k)+'" '+(isSel?'checked':'')+' onchange="toggleSel(this)"></td>';
     h+='<td><div class="ch-logo">'+logoHtml+'</div></td>';
     h+='<td><div class="ch-info"><div class="ch-name">'+esc(k)+'</div><div class="ch-meta">ID: '+c.id+'</div></div></td>';
     h+='<td><span class="badge '+(c.country==='TR'?'b-tr':'b-de')+'">'+c.country+'</span></td>';
     h+='<td style="color:var(--text2);font-size:12px">'+esc(orig)+'</td>';
-    h+='<td><select class="gsel" onchange="chg('+escJ(k)+',this.value)">';
+    h+='<td><select class="gsel" data-chname="'+esc(k)+'">';
     GRPS.forEach(g=>{h+='<option value="'+g+'"'+(cur===g?' selected':'')+'>'+g+'</option>'});
     h+='</select></td>';
     h+='<td>'+statusTag+'</td>';
@@ -769,6 +805,15 @@ function render(){
   });
   tb.innerHTML=h;
   updStats();
+
+  /* Attach event listeners via delegation for select changes and drag */
+  tb.querySelectorAll('.gsel').forEach(sel=>{
+    sel.addEventListener('change',function(){chgGrp(this.dataset.chname,this.value)});
+  });
+  tb.querySelectorAll('tr[draggable]').forEach(tr=>{
+    tr.addEventListener('dragstart',onRowDragStart);
+    tr.addEventListener('dragend',onRowDragEnd);
+  });
 }
 
 function toggleSel(cb){
@@ -794,7 +839,8 @@ function syncSelectAll(){
 }
 function updBulkBtn(){document.getElementById('bulkBtn').disabled=selected.size===0}
 
-function chg(name,val){
+/* Fixed: change handler using data attributes + addEventListener instead of broken inline escJ */
+function chgGrp(name,val){
   const c=channels.find(x=>x.name===name);if(!c)return;
   if(val===c.grp&&!overrides[name.toUpperCase()])delete changes[name];
   else changes[name]=val;
@@ -826,6 +872,11 @@ async function save(){
     const r=await fetch('/api/admin/overrides',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)});
     if(r.ok){
       Object.entries(changes).forEach(([k,v])=>{overrides[k.toUpperCase()]=v});
+      /* Update local channel list grp so sidebar counts reflect reality */
+      Object.entries(changes).forEach(([k,v])=>{
+        const c=channels.find(x=>x.name===k);
+        if(c)c.grp=v;
+      });
       changes={};selected=new Set();
       buildSidebar();render();
       toast(n+' kanal basariyla kaydedildi!','ok');
@@ -861,7 +912,7 @@ function copyJson(){
 }
 
 async function doReset(){
-  if(!confirm('Tum Manuel Atamalari Silmek Istediğinize Emin Misiniz?'))return;
+  if(!confirm('Tum Manuel Atamalari Silmek Istedi\u011finize Emin Misiniz?'))return;
   try{
     await fetch('/api/admin/overrides',{method:'DELETE'});
     overrides={};changes={};selected=new Set();
@@ -877,7 +928,9 @@ function updStats(){
   document.getElementById('sOverride').textContent=Object.keys(overrides).length;
   const nc=Object.keys(changes).length;
   document.getElementById('sChanged').textContent=nc;
-  document.getElementById('saveBtn').disabled=nc===0;
+  const btn=document.getElementById('saveBtn');
+  if(nc===0){btn.disabled=true;btn.style.opacity='.5'}
+  else{btn.disabled=false;btn.style.opacity='1'}
 }
 
 function toast(msg,type){
@@ -886,6 +939,85 @@ function toast(msg,type){
   t.className='toast show '+(type||'');
   setTimeout(()=>t.className='toast',3000);
 }
+
+/* ===== DRAG & DROP ===== */
+
+function onRowDragStart(e){
+  dragChanName=e.currentTarget.dataset.chname;
+  dragStarted=false;
+  e.dataTransfer.effectAllowed='move';
+  e.dataTransfer.setData('text/plain',dragChanName);
+  /* Custom drag image */
+  const ch=channels.find(x=>x.name===dragChanName);
+  if(ch){
+    dragClone=document.createElement('div');
+    dragClone.className='ch-drag-clone';
+    dragClone.innerHTML='<span class="dc-icon">&#128250;</span><strong>'+esc(ch.name)+'</strong>';
+    document.body.appendChild(dragClone);
+    e.dataTransfer.setDragImage(dragClone,10,20);
+  }
+  e.currentTarget.classList.add('ch-dragging');
+  document.getElementById('dropHint').classList.add('active');
+}
+
+function onRowDragEnd(e){
+  e.currentTarget.classList.remove('ch-dragging');
+  document.getElementById('dropHint').classList.remove('active');
+  if(dragClone){dragClone.remove();dragClone=null}
+  /* Clean up all drop-target classes */
+  document.querySelectorAll('.grp-item.drop-target,.grp-item.drop-reject').forEach(el=>{
+    el.classList.remove('drop-target','drop-reject');
+  });
+  dragChanName=null;
+}
+
+function onGrpDragOver(e){
+  e.preventDefault();
+  e.dataTransfer.dropEffect='move';
+}
+
+function onGrpDragEnter(e){
+  e.preventDefault();
+  const gi=e.currentTarget;
+  if(!gi.dataset.grp)return;
+  gi.classList.add('drop-target');
+  gi.classList.remove('drop-reject');
+}
+
+function onGrpDragLeave(e){
+  const gi=e.currentTarget;
+  /* Only remove if actually leaving the element (not entering a child) */
+  if(!gi.contains(e.relatedTarget)){
+    gi.classList.remove('drop-target','drop-reject');
+  }
+}
+
+function onGrpDrop(e){
+  e.preventDefault();
+  e.stopPropagation();
+  const gi=e.currentTarget;
+  const targetGroup=gi.dataset.grp;
+  gi.classList.remove('drop-target','drop-reject');
+  document.getElementById('dropHint').classList.remove('active');
+
+  if(!dragChanName||!targetGroup)return;
+
+  const c=channels.find(x=>x.name===dragChanName);
+  if(!c)return;
+
+  /* Apply the change */
+  const curGrp=c.grp;
+  if(targetGroup===curGrp&&!overrides[dragChanName.toUpperCase()]){
+    toast(c.name+' zaten '+targetGroup+' grubunda','ok');
+    return;
+  }
+  changes[dragChanName]=targetGroup;
+  buildSidebar();
+  render();
+  toast(c.name+' → '+targetGroup+' (kaydetmek icin Kaydet basin)','ok');
+}
+
+/* ===== KEYBOARD SHORTCUTS ===== */
 
 document.addEventListener('keydown',e=>{
   if((e.ctrlKey||e.metaKey)&&e.key==='s'){e.preventDefault();save()}
