@@ -12,9 +12,8 @@ from video import app
 async def run_startup():
     try:
         await state.startup_sequence()
-        # Start signature refresh loop (every 30 min)
         asyncio.create_task(state.sig_refresh_loop())
-        state.add_log("Signature refresh loop baslatildi (30 dk)")
+        state.add_log("Arka plan gorevleri baslatildi")
     except Exception as e:
         state.add_log(f"Startup CRITICAL: {e}")
         import traceback
