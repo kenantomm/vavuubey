@@ -34,7 +34,7 @@ PORT = 10000
 REFRESH_INTERVAL = 6 * 3600    # 6 hours auto-refresh
 LAST_REFRESH = 0               # Last successful refresh timestamp
 
-# Resolve cache (5 min TTL)
+# Resolve cache (30 min TTL - with expired fallback)
 RESOLVE_CACHE = {}  # {str(ch_id): {"url": resolved_url, "expires": timestamp}}
 
 # Token cache
@@ -45,8 +45,6 @@ _watched_sig_time = 0
 
 # ONCEMLI: Token deneme lock - sonsuz donguyu onlemek icin
 _token_lock = threading.Lock()
-_vavoo_try_count = 0
-_vavoo_cooldown_until = 0  # Basarisiz olursa 5 dk bekle
 
 # Vavoo API headers (used for all Vavoo API calls)
 VAVOO_API_HEADERS = {
@@ -88,33 +86,25 @@ def count_db_channels():
 
 
 # ============================================================
-# 1. VAVOO TOKEN (ping2) - RATE LIMITED (sync, startup only)
+# 1. VAVOO TOKEN (ping2) - sync, startup only
 # ============================================================
 def get_auth_signature(force=False):
     """
     Vavoo ping2 token al.
     force=True ile zorla tekrar dene.
-    Basarisiz olursa 5 dakika cooldown.
+    Cache: 6 saat. Basarisiz olursa 2 dk bekle (eski 10 dk yerine).
     """
-    global _vavoo_sig, _vavoo_sig_time, _vavoo_try_count, _vavoo_cooldown_until
+    global _vavoo_sig, _vavoo_sig_time
 
-    # Cache varsa kullan
-    if _vavoo_sig and (time.time() - _vavoo_sig_time) < 1800:
+    # Cache varsa kullan (6 saat)
+    if _vavoo_sig and (time.time() - _vavoo_sig_time) < 21600:
         return _vavoo_sig
-
-    # Cooldown aktifse bekle
-    if not force and time.time() < _vavoo_cooldown_until:
-        return None
 
     # Lock al - ayni anda birden fazla thread denemesin
     if not _token_lock.acquire(blocking=False):
-        return None  # Baska biri zaten deniyor, bekleme
+        return _vavoo_sig  # Baska biri zaten deniyor, eski degeri dondur
 
     try:
-        # Cooldown kontrolu (lock icinde tekrar kontrol)
-        if not force and time.time() < _vavoo_cooldown_until:
-            return None
-
         slog("Vavoo Token (ping2) aliniyor...")
         headers = {"User-Agent": "VAVOO/2.6", "Accept": "application/json"}
         vec_req = httpx.get("http://mastaaa1987.github.io/repo/veclist.json", headers=headers, timeout=10, verify=False)
@@ -132,53 +122,56 @@ def get_auth_signature(force=False):
         if sig:
             _vavoo_sig = sig
             _vavoo_sig_time = time.time()
-            _vavoo_try_count = 0
             slog("Vavoo Token alindi!")
             return sig
         else:
-            _vavoo_try_count += 1
-            # 2 deneme sonra 10 dakika cooldown
-            if _vavoo_try_count >= 2:
-                _vavoo_cooldown_until = time.time() + 600
-                slog(f"Vavoo Token {2} deneme basarisiz. 10 dakika cooldown.")
-            else:
-                slog("Vavoo Token ALINAMADI (5 deneme)")
+            slog("Vavoo Token ALINAMADI (5 deneme)")
     except Exception as e:
         slog(f"Vavoo Token HATASI: {e}")
     finally:
         _token_lock.release()
 
-    return None
+    return _vavoo_sig  # Eski degeri dondur (bos yerine)
 
 
 # ============================================================
 # 2. LOKKE IMZA (app/ping) - sync, startup only
 # ============================================================
-def get_watchedsig():
+def get_watchedsig(force=False):
+    """
+    Lokke imza al.
+    Cache: 6 saat (eski 30 dk yerine).
+    """
     global _watched_sig, _watched_sig_time
-    if _watched_sig and (time.time() - _watched_sig_time) < 1800:
+
+    # Cache varsa kullan (6 saat)
+    if _watched_sig and (time.time() - _watched_sig_time) < 21600:
         return _watched_sig
 
-    slog("Lokke Imza (app/ping) aliniyor...")
-    headers = {"user-agent": "okhttp/4.11.0", "accept": "application/json", "content-type": "application/json; charset=utf-8"}
-    data = {
-        "token": "", "reason": "boot", "locale": "de", "theme": "dark",
-        "metadata": {
-            "device": {"type": "desktop", "uniqueId": ""},
-            "os": {"name": "linux", "version": "Ubuntu 22.04", "abis": ["x64"], "host": "RENDER"},
-            "app": {"platform": "electron"},
-            "version": {"package": "app.lokke.main", "binary": "1.0.19", "js": "1.0.19"},
-        },
-        "appFocusTime": 173, "playerActive": False, "playDuration": 0,
-        "devMode": True, "hasAddon": True, "castConnected": False,
-        "package": "app.lokke.main", "version": "1.0.19", "process": "app",
-        "firstAppStart": int(time.time() * 1000) - 10000,
-        "lastAppStart": int(time.time() * 1000) - 10000,
-        "ipLocation": 0, "adblockEnabled": True,
-        "proxy": {"supported": ["ss"], "engine": "cu", "enabled": False, "autoServer": True, "id": 0},
-        "iap": {"supported": False},
-    }
+    # Lock al
+    if not _token_lock.acquire(blocking=False):
+        return _watched_sig
+
     try:
+        slog("Lokke Imza (app/ping) aliniyor...")
+        headers = {"user-agent": "okhttp/4.11.0", "accept": "application/json", "content-type": "application/json; charset=utf-8"}
+        data = {
+            "token": "", "reason": "boot", "locale": "de", "theme": "dark",
+            "metadata": {
+                "device": {"type": "desktop", "uniqueId": ""},
+                "os": {"name": "linux", "version": "Ubuntu 22.04", "abis": ["x64"], "host": "RENDER"},
+                "app": {"platform": "electron"},
+                "version": {"package": "app.lokke.main", "binary": "1.0.19", "js": "1.0.19"},
+            },
+            "appFocusTime": 173, "playerActive": False, "playDuration": 0,
+            "devMode": True, "hasAddon": True, "castConnected": False,
+            "package": "app.lokke.main", "version": "1.0.19", "process": "app",
+            "firstAppStart": int(time.time() * 1000) - 10000,
+            "lastAppStart": int(time.time() * 1000) - 10000,
+            "ipLocation": 0, "adblockEnabled": True,
+            "proxy": {"supported": ["ss"], "engine": "cu", "enabled": False, "autoServer": True, "id": 0},
+            "iap": {"supported": False},
+        }
         resp = httpx.post("https://www.lokke.app/api/app/ping", json=data, headers=headers, timeout=15, verify=False)
         result = resp.json()
         sig = result.get("addonSig")
@@ -191,7 +184,10 @@ def get_watchedsig():
             slog(f"Lokke cevap: {list(result.keys())}")
     except Exception as e:
         slog(f"Lokke HATASI: {e}")
-    return None
+    finally:
+        _token_lock.release()
+
+    return _watched_sig  # Eski degeri dondur
 
 
 def get_watched_sig_str():
@@ -206,11 +202,8 @@ async def resolve_mediahubmx(url):
     """Resolve a stream URL via MediaHubMX. Returns resolved URL or None."""
     global _watched_sig
 
-    # Check cache first
-    # (cache is checked in resolve_channel, but this can also be called directly)
-
     if not _watched_sig:
-        # Try to get signature sync (should already be available from startup)
+        # Try to get signature sync
         _watched_sig = get_watchedsig()
     if not _watched_sig:
         slog("Resolve: Lokke signature yok!")
@@ -246,15 +239,19 @@ async def resolve_mediahubmx(url):
 
 
 # ============================================================
-# 4. CHANNEL RESOLVE (async, per-request, with cache)
+# 4. CHANNEL RESOLVE (async, per-request, with cache + fallback)
 # ============================================================
 async def resolve_channel(lid):
     """
     Kanal ID'sine gore stream URL'ini coz.
-    Y1: Check resolve cache -> if cached and not expired, use it
-    Y2: HLS + Lokke (mediahubmx resolve)
-    Y3: URL + vavoo_auth token (rate limited - cooldown var)
-    Y4: Direct URL (fallback)
+    
+    ONCELIK SIRASI (eski hatali siradan degistirildi):
+    Y1: Direct URL (HIZLI - cache varsa hemen don)
+    Y2: HLS + Lokke (mediahubmx resolve - en guvenilir)
+    Y3: URL + vavoo_auth token (fallback)
+    Y4: Expired cache fallback (SON CIARET - en azindan bir sey dondur)
+    
+    CACHE: 30 dakika TTL. Expired cache'i fallback olarak kullanir.
     """
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -273,33 +270,67 @@ async def resolve_channel(lid):
     url = ch["url"]
     hls = ch["hls"]
 
-    # Y0: Check resolve cache
+    # ============================================================
+    # CACHE CHECK - hem gecerli hem expired
+    # ============================================================
     cache_key = str(lid)
+    fallback_url = None
+    
     if cache_key in RESOLVE_CACHE:
         cached = RESOLVE_CACHE[cache_key]
         if cached.get("expires", 0) > time.time():
+            # Cache gecerli - HEMEN DON (en hizli)
             return cached["url"], f"Cache: {name}"
+        else:
+            # Cache expired ama fallback olarak tut
+            fallback_url = cached.get("url")
 
-    # Y1: HLS + Lokke (mediahubmx)
+    # ============================================================
+    # Y1: DIRECT URL - hizli, token gerektirmez
+    # ============================================================
+    if url:
+        # Vavoo URL'leri genelde .m3u8 ile biter, direkt calisabilir
+        if ".m3u8" in url or "vavoo.to" in url:
+            RESOLVE_CACHE[cache_key] = {"url": url, "expires": time.time() + 1800}
+            return url, f"Y1-Direct: {name}"
+
+    # ============================================================
+    # Y2: HLS + Lokke (mediahubmx) - en guvenilir
+    # ============================================================
     if hls:
         resolved = await resolve_mediahubmx(hls)
         if resolved:
-            RESOLVE_CACHE[cache_key] = {"url": resolved, "expires": time.time() + 300}
-            return resolved, f"Y1-HLS: {name}"
+            RESOLVE_CACHE[cache_key] = {"url": resolved, "expires": time.time() + 1800}
+            return resolved, f"Y2-HLS: {name}"
 
-    # Y2: Standart Token (rate limited)
+    # ============================================================
+    # Y3: Vavoo Auth Token ile
+    # ============================================================
     if url:
         sig = get_auth_signature()
         if sig:
             sep = "&" if "?" in url else "?"
             final = url + sep + "n=1&b=5&vavoo_auth=" + sig
-            RESOLVE_CACHE[cache_key] = {"url": final, "expires": time.time() + 300}
-            return final, f"Y2-Auth: {name}"
+            RESOLVE_CACHE[cache_key] = {"url": final, "expires": time.time() + 1800}
+            return final, f"Y3-Auth: {name}"
 
-    # Y3: Direct URL
+    # ============================================================
+    # Y4: DIRECT URL (fallback - token olmadan)
+    # ============================================================
     if url:
-        RESOLVE_CACHE[cache_key] = {"url": url, "expires": time.time() + 300}
-        return url, f"Y3-Direct: {name}"
+        RESOLVE_CACHE[cache_key] = {"url": url, "expires": time.time() + 1800}
+        return url, f"Y4-Direct: {name}"
+
+    # ============================================================
+    # Y5: EXPIRED CACHE FALLBACK (SON CIARET)
+    # Bu cached URL calismayabilir AMA calismayandan iyidir!
+    # Hiçbir şey döndürmezsek IPTV player "kanal bulunamadi" der
+    # Fallback ile en azindan bir deneme şansı veriyoruz
+    # ============================================================
+    if fallback_url:
+        slog(f"[FALLBACK] Kanal {name}: expired cache kullaniliyor (son care)")
+        RESOLVE_CACHE[cache_key] = {"url": fallback_url, "expires": time.time() + 600}
+        return fallback_url, f"Y5-Fallback: {name}"
 
     return None, f"URL yok: {name}"
 

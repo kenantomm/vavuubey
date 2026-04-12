@@ -149,41 +149,49 @@ async def async_fetch_hls_links():
 
 
 def remap_groups():
-    """Remap channels to groups using GROUP_ORDER and GROUP_RULES."""
+    """Remap channels to groups - ONLY channels without a group assignment.
+    Kullanici admin panelde yaptigi grup atamalarini KORUR!
+    Sadece cid=0 (grupsuz) olan kanallari GROUP_RULES'e gore atar.
+    """
     import sqlite3
     conn = sqlite3.connect(state.DB_PATH)
     c = conn.cursor()
-    c.execute("DELETE FROM categories")
-    c.execute("UPDATE channels SET cid=0, grp=''")
-    conn.commit()
 
+    # Mevcut gruplari oku
+    existing_cats = {}
+    c.execute("SELECT cid, name FROM categories")
+    for row in c.fetchall():
+        existing_cats[row[1]] = row[0]
+
+    # GROUP_ORDER'daki tum gruplari categories tablosuna ekle (eksik olanlari)
     for idx, gn in enumerate(state.GROUP_ORDER):
-        c.execute("INSERT OR IGNORE INTO categories(cid,name,sort_order) VALUES(?,?,?)", (idx+1, gn, idx+1))
-    conn.commit()
+        if gn not in existing_cats:
+            c.execute("INSERT OR IGNORE INTO categories(cid,name,sort_order) VALUES(?,?,?)", (idx+1, gn, idx+1))
+            existing_cats[gn] = idx + 1
 
-    c.execute("SELECT lid, name FROM channels")
+    # SADECE grupsuz (cid=0) kanallari remap et
+    c.execute("SELECT lid, name FROM channels WHERE cid=0")
     updated = 0
-    group_counts = {}
     for lid, name in c.fetchall():
         assigned = False
         for gi, gn in enumerate(state.GROUP_ORDER):
             for kw in state.GROUP_RULES.get(gn, []):
                 if kw.lower() in name.lower():
-                    group_counts[gn] = group_counts.get(gn, 0) + 1
-                    c.execute("UPDATE channels SET cid=?,grp=?,sort_order=? WHERE lid=?", (gi+1, gn, group_counts[gn], lid))
+                    cid = existing_cats.get(gn, gi+1)
+                    c.execute("UPDATE channels SET cid=?,grp=? WHERE lid=?", (cid, gn, lid))
                     updated += 1
                     assigned = True
                     break
             if assigned: break
         if not assigned:
-            c.execute("SELECT cid FROM categories WHERE name='DE SONSTIGE'")
-            row = c.fetchone()
-            if row:
-                group_counts["DE SONSTIGE"] = group_counts.get("DE SONSTIGE", 0) + 1
-                c.execute("UPDATE channels SET cid=?,grp='DE SONSTIGE',sort_order=? WHERE lid=?", (row[0], group_counts["DE SONSTIGE"], lid))
+            cat_cid = existing_cats.get("DE SONSTIGE", 0)
+            if cat_cid:
+                c.execute("UPDATE channels SET cid=?,grp='DE SONSTIGE' WHERE lid=?", (cat_cid, lid))
+                updated += 1
+
     conn.commit()
     conn.close()
-    state.slog(f"Grup remap: {updated} kanal")
+    state.slog(f"Grup remap: {updated} grupsuz kanal atandi")
 
 
 async def async_startup_core():
@@ -207,7 +215,18 @@ async def async_startup_core():
         de_count = 0
         conn = sqlite3.connect(state.DB_PATH)
         c = conn.cursor()
-        c.execute("DELETE FROM channels")
+
+        # MEVCUT HLS VERILERINI KORU - silmek yerine update et
+        existing_hls = {}
+        c.execute("SELECT lid, hls FROM channels")
+        for row in c.fetchall():
+            if row[1]:  # hls bos degilse
+                existing_hls[row[0]] = row[1]
+        state.slog(f"Mevcut HLS verisi: {len(existing_hls)} kanal")
+
+        # KANALLARI DELETE+INSERT YERINE upsert yap
+        # Mevcut kanallari koru, yeni kanallari ekle
+        new_lids = set()
         for ch in channels:
             country = state.detect_country(ch)
             if country not in ("TR", "DE", "BOTH"):
@@ -229,15 +248,28 @@ async def async_startup_core():
 
             final_country = country if country != "BOTH" else "TR"
             clean = state.clean_name(name)
+            new_lids.add(ch_id)
+
+            # Mevcut HLS verisini koru!
+            hls_value = existing_hls.get(ch_id, "")
 
             c.execute(
                 "INSERT OR REPLACE INTO channels(lid,name,grp,cid,logo,url,hls,sort_order,country,clean_name) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (ch_id, name, grp, 0, logo, url, "", 9999, final_country, clean)
+                (ch_id, name, grp, 0, logo, url, hls_value, 9999, final_country, clean)
             )
             if final_country == "TR":
                 tr_count += 1
             else:
                 de_count += 1
+
+        # DB'de olup API'de gelmeyen kanallari sil
+        c.execute("SELECT lid FROM channels")
+        db_lids = set(row[0] for row in c.fetchall())
+        removed = db_lids - new_lids
+        if removed:
+            for old_lid in removed:
+                c.execute("DELETE FROM channels WHERE lid=?", (old_lid,))
+            state.slog(f"{len(removed)} eski kanal silindi")
 
         conn.commit()
         conn.close()
