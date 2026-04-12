@@ -1,5 +1,5 @@
 """
-video.py - VavooBey FastAPI application (OPTIMIZED v2)
+video.py - VavooBey FastAPI application (OPTIMIZED v2 - FIX v3)
 Streaming endpoints + Admin Panel
 
 OPTIMIZASYONLAR:
@@ -9,6 +9,9 @@ OPTIMIZASYONLAR:
 - Client disconnect detection (bant genisligi tasarrufu)
 - Retry logic with exponential backoff
 - DNS prefetch + connection warm-up
+
+FIX v3:
+- build_m3u() logo direkt URL kullanir (proxy yerine)
 """
 import asyncio
 import os
@@ -225,7 +228,8 @@ def build_m3u(host: str) -> str:
     lines = ['#EXTM3U url-tvg="" deinterlace="1"']
     for ch in channels:
         logo = ch.get("logo", "")
-        logo_param = f' tvg-logo="{host}/logo/{ch["lid"]}"' if logo else ""
+        # Logo varsa direkt URL kullan (proxy araya girmez, daha hizli ve guvenilir)
+        logo_param = f' tvg-logo="{logo}"' if logo else ""
         grp = ch.get("grp") or ""
         lines.append(f'#EXTINF:-1 group-title="{grp}"{logo_param},{ch["name"]}')
         lines.append(f'{host}/channel/{ch["lid"]}')

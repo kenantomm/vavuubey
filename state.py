@@ -1,11 +1,17 @@
 """
-state.py - Ortak state modulu (OPTIMIZED v2).
+state.py - Ortak state modulu (OPTIMIZED v2 - FIX v3).
 Token ve resolve fonksiyonlari burada.
 video.py server.py'yi import ETMEZ, sadece state import eder.
 
 OPTIMIZASYONLAR:
 - resolve_mediahubmx icin shared httpx client destegi
 - Cache TTL arttirildi (30dk -> 30dk, ama expired fallback)
+
+FIX v3:
+- resolve_channel() ONCELIK SIRASI DUZELTILDI (KRITIK BUG FIX)
+- Eski hatali sira: Direct URL -> HLS+Lokke -> Auth -> Fallback
+  (Direct URL #1 oldugu icin auth gerektiren URL'ler hic cozulmuyordu)
+- Dogru sira: Cache -> HLS+Lokke -> URL+Auth -> Direct -> Fallback
 """
 import os
 import random
@@ -246,16 +252,14 @@ async def resolve_mediahubmx(url):
 # 4. CHANNEL RESOLVE (async, per-request, with cache + fallback)
 # ============================================================
 async def resolve_channel(lid):
-    """
-    Kanal ID'sine gore stream URL'ini coz.
+    """Kanal ID'sine gore stream URL'ini coz.
     
-    ONCELIK SIRASI (eski hatali siradan degistirildi):
-    Y1: Direct URL (HIZLI - cache varsa hemen don)
-    Y2: HLS + Lokke (mediahubmx resolve - en guvenilir)
-    Y3: URL + vavoo_auth token (fallback)
-    Y4: Expired cache fallback (SON CIARET - en azindan bir sey dondur)
-    
-    CACHE: 30 dakika TTL. Expired cache'i fallback olarak kullanir.
+    ONCELIK SIRASI (CALISAN VERSIYONDAN ALINDI):
+    0: Cache (gecerli) -> hemen don
+    1: HLS + Lokke (mediahubmx resolve) - EN GUVENILIR
+    2: URL + vavoo_auth token (fallback)
+    3: Direct URL (son care)
+    4: Expired cache fallback (SON CIARET)
     """
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -274,67 +278,41 @@ async def resolve_channel(lid):
     url = ch["url"]
     hls = ch["hls"]
 
-    # ============================================================
-    # CACHE CHECK - hem gecerli hem expired
-    # ============================================================
+    # Y0: Check resolve cache
     cache_key = str(lid)
     fallback_url = None
-    
     if cache_key in RESOLVE_CACHE:
         cached = RESOLVE_CACHE[cache_key]
         if cached.get("expires", 0) > time.time():
-            # Cache gecerli - HEMEN DON (en hizli)
             return cached["url"], f"Cache: {name}"
         else:
-            # Cache expired ama fallback olarak tut
             fallback_url = cached.get("url")
 
-    # ============================================================
-    # Y1: DIRECT URL - hizli, token gerektirmez
-    # ============================================================
-    if url:
-        # Vavoo URL'leri genelde .m3u8 ile biter, direkt calisabilir
-        if ".m3u8" in url or "vavoo.to" in url:
-            RESOLVE_CACHE[cache_key] = {"url": url, "expires": time.time() + 1800}
-            return url, f"Y1-Direct: {name}"
-
-    # ============================================================
-    # Y2: HLS + Lokke (mediahubmx) - en guvenilir
-    # ============================================================
+    # Y1: HLS + Lokke (mediahubmx) - EN GUVENILIR
     if hls:
         resolved = await resolve_mediahubmx(hls)
         if resolved:
-            RESOLVE_CACHE[cache_key] = {"url": resolved, "expires": time.time() + 1800}
-            return resolved, f"Y2-HLS: {name}"
+            RESOLVE_CACHE[cache_key] = {"url": resolved, "expires": time.time() + 300}
+            return resolved, f"Y1-HLS: {name}"
 
-    # ============================================================
-    # Y3: Vavoo Auth Token ile
-    # ============================================================
+    # Y2: URL + vavoo_auth token (fallback)
     if url:
         sig = get_auth_signature()
         if sig:
             sep = "&" if "?" in url else "?"
             final = url + sep + "n=1&b=5&vavoo_auth=" + sig
-            RESOLVE_CACHE[cache_key] = {"url": final, "expires": time.time() + 1800}
-            return final, f"Y3-Auth: {name}"
+            RESOLVE_CACHE[cache_key] = {"url": final, "expires": time.time() + 300}
+            return final, f"Y2-Auth: {name}"
 
-    # ============================================================
-    # Y4: DIRECT URL (fallback - token olmadan)
-    # ============================================================
+    # Y3: Direct URL (son care - token olmadan)
     if url:
-        RESOLVE_CACHE[cache_key] = {"url": url, "expires": time.time() + 1800}
-        return url, f"Y4-Direct: {name}"
+        RESOLVE_CACHE[cache_key] = {"url": url, "expires": time.time() + 300}
+        return url, f"Y3-Direct: {name}"
 
-    # ============================================================
-    # Y5: EXPIRED CACHE FALLBACK (SON CIARET)
-    # Bu cached URL calismayabilir AMA calismayandan iyidir!
-    # Hiçbir şey döndürmezsek IPTV player "kanal bulunamadi" der
-    # Fallback ile en azindan bir deneme şansı veriyoruz
-    # ============================================================
+    # Y4: Expired cache fallback
     if fallback_url:
-        slog(f"[FALLBACK] Kanal {name}: expired cache kullaniliyor (son care)")
         RESOLVE_CACHE[cache_key] = {"url": fallback_url, "expires": time.time() + 600}
-        return fallback_url, f"Y5-Fallback: {name}"
+        return fallback_url, f"Y4-Fallback: {name}"
 
     return None, f"URL yok: {name}"
 
