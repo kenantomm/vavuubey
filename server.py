@@ -162,10 +162,20 @@ def remap_groups():
 
 
 def startup_sequence():
+    """Main startup sequence. Resilient: sets DATA_READY=True even on partial failure."""
+    global STARTUP_ERROR
     start = time.time()
+
+    # Prevent concurrent startup/refresh
+    if not state.STARTUP_LOCK.acquire(blocking=False):
+        state.slog("startup_sequence zaten calisiyor, atlanacak")
+        return False
+
     try:
         state.slog("=== VxParser Baslangic ===")
         state.slog(f"PORT={state.PORT} DB={state.DB_PATH}")
+
+        fetch_ok = False
 
         # Token'lari sadece 1 kez dene (baslangicta), sonra cooldown
         state.slog("[1/5] Lokke imzasi...")
@@ -179,26 +189,108 @@ def startup_sequence():
         state.slog("[3/5] DB + Kanallar...")
         init_db()
         ok = fetch_vavoo_channels()
-        state.slog(f"[3/5] Kanallar={'OK' if ok else 'BASARISIZ'}")
+        state.slog(f"[3/5] Kanallar={'OK' if ok else 'BASARISIZ - DB fallback deneniyor'}")
+
+        if ok:
+            fetch_ok = True
+        else:
+            # FALLBACK: Check if DB already has channels from a previous run
+            db_count = state.count_db_channels()
+            state.slog(f"[3/5] DB'de {db_count} kanal mevcut")
+            if db_count > 0:
+                state.slog("[3/5] DB'den onceki veriler kullanilacak")
+                fetch_ok = True  # We have data to serve
+            else:
+                state.slog("[3/5] DB bos, remap atlanacak")
 
         state.slog("[4/5] HLS linkleri...")
         fetch_hls_links()
 
         state.slog("[5/5] Grup remap...")
-        remap_groups()
+        if fetch_ok:
+            remap_groups()
+        else:
+            state.slog("[5/5] Kanal yok, remap atlanacak")
 
         state.LOAD_TIME = time.time() - start
         state.DATA_READY = True
-        state.slog(f"=== TAMAM! ({state.LOAD_TIME:.1f}s) ===")
+        state.STARTUP_DONE = True
+        state.LAST_REFRESH = time.time()
+
+        # Log final DB state
+        final_count = state.count_db_channels()
+        state.slog(f"=== TAMAM! ({state.LOAD_TIME:.1f}s, {final_count} kanal) ===")
+        return True
+
     except Exception as e:
         state.STARTUP_ERROR = str(e)
         state.slog(f"!!! HATA: {e}")
         traceback.print_exc()
 
+        # Even on error, check if DB has usable data
+        db_count = state.count_db_channels()
+        if db_count > 0:
+            state.slog(f"Hata olmasina ragmen DB'de {db_count} kanal var, DATA_READY=True")
+            state.DATA_READY = True
+            state.LAST_REFRESH = time.time()
+        else:
+            state.slog("DB bos ve hata olustu, DATA_READY=False (503) ama /ping calisir")
+            state.DATA_READY = True  # Still set True to avoid 503 loop - serve empty playlist
+        state.STARTUP_DONE = True
+        return False
+    finally:
+        state.STARTUP_LOCK.release()
+
+
+def startup_sequence_with_timeout(timeout=120):
+    """Run startup_sequence with a hard timeout."""
+    result = [None]
+
+    def target():
+        result[0] = startup_sequence()
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+
+    if t.is_alive():
+        state.slog(f"!!! startup_sequence {timeout}s zaman asimi! DATA_READY zorla aciliyor")
+        # Timeout hit - check if DB has data
+        db_count = state.count_db_channels()
+        if db_count > 0:
+            state.DATA_READY = True
+            state.slog(f"Timeout sonrasi DB'den {db_count} kanal kullanilacak")
+        else:
+            state.DATA_READY = True  # Avoid permanent 503
+            state.slog("DB bos ama DATA_READY=True zorla acildi (bos playlist)")
+        state.STARTUP_DONE = True
+        state.STARTUP_ERROR = f"Startup timed out after {timeout}s"
+
+
+def periodic_refresh():
+    """Background thread that re-fetches channels every REFRESH_INTERVAL."""
+    while True:
+        time.sleep(state.REFRESH_INTERVAL)
+        state.slog(f"=== Periodik refresh ({state.REFRESH_INTERVAL}s arayla) ===")
+        try:
+            # Reset STARTUP_DONE so we can re-run
+            state.STARTUP_DONE = False
+            state.STARTUP_ERROR = None
+            startup_sequence()
+        except Exception as e:
+            state.slog(f"Periodik refresh HATASI: {e}")
+
 
 def main():
+    state.STARTUP_TIME = time.time()
     state.slog(">>> main() basladi <<<")
-    threading.Thread(target=startup_sequence, daemon=True).start()
+
+    # Start startup in background thread with timeout
+    threading.Thread(target=startup_sequence_with_timeout, args=(120,), daemon=True).start()
+
+    # Start periodic refresh in background
+    threading.Thread(target=periodic_refresh, daemon=True).start()
+
     import uvicorn
     from video import app
     uvicorn.run(app, host="0.0.0.0", port=state.PORT)

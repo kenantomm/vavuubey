@@ -19,12 +19,18 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ============================================================
 DATA_READY = False
 STARTUP_ERROR = None
+STARTUP_DONE = False          # True once startup_sequence finishes (success or fail)
+STARTUP_TIME = None            # time.time() when server started (for uptime calc)
 LOAD_TIME = 0
 STARTUP_LOGS = []
+STARTUP_LOCK = threading.Lock()  # Prevents concurrent startup/refresh
 
 DB_PATH = "/tmp/vxparser.db"
 M3U_PATH = "/tmp/playlist.m3u"
 PORT = 10000
+
+REFRESH_INTERVAL = 6 * 3600    # 6 hours auto-refresh
+LAST_REFRESH = 0               # Last successful refresh timestamp
 
 # Token cache
 _vavoo_sig = None
@@ -42,7 +48,30 @@ def slog(msg):
     timestamp = time.strftime("%H:%M:%S")
     entry = f"[{timestamp}] {msg}"
     STARTUP_LOGS.append(entry)
+    # Keep logs bounded (last 500 entries)
+    if len(STARTUP_LOGS) > 500:
+        del STARTUP_LOGS[:100]
     print(entry)
+
+
+def get_uptime():
+    """Return uptime in seconds, or 0 if not started."""
+    if STARTUP_TIME is None:
+        return 0
+    return int(time.time() - STARTUP_TIME)
+
+
+def count_db_channels():
+    """Count channels in DB. Returns 0 on error."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM channels")
+        count = c.fetchone()[0]
+        conn.close()
+        return count
+    except Exception:
+        return 0
 
 
 # ============================================================
@@ -293,6 +322,7 @@ GROUP_RULES = {
     "DE VIP SPORTS": [
         "Sky Sport","Sky Bundesliga","Eurosport","DAZN","Sport1",
         "beIN DE","beIN Sport DE",
+        "DAZN 1","DAZN 2",
     ],
     "DE VIP SPORTS 2": [
         "Sky Sport Austria","Telekom Sport","Magenta Sport",
@@ -300,6 +330,7 @@ GROUP_RULES = {
     "DE SPORT": [
         "Sportdigital","Motorvision","Sport +","SPORT1",
         "Eurosport 2","Eurosport 3",
+        "Motorvision TV",
     ],
     "DE AUSTRIA": [
         "ORF","Puls 4","Servus","AT ","Austria",

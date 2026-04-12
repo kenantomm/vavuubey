@@ -5,10 +5,11 @@ Streaming endpoints + Admin Panel
 import os
 import re
 import sqlite3
+import time
 from typing import Optional
 
 from fastapi import FastAPI, Request, Response, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse, PlainTextResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, PlainTextResponse, HTMLResponse, JSONResponse
 
 import state
 
@@ -56,6 +57,50 @@ def build_m3u(host: str) -> str:
 
 
 # ============================================================
+# HLS MANIFEST REWRITER (line-by-line, safe)
+# ============================================================
+def rewrite_m3u8(body: str, host: str, lid: int, resolved_url: str) -> str:
+    """
+    Rewrite HLS manifest URLs to go through our proxy.
+    Uses line-by-line processing to avoid corrupting HLS tags (#EXT-X-*).
+    """
+    base_url = resolved_url.rsplit("/", 1)[0] if "/" in resolved_url else resolved_url
+    lines = body.split("\n")
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            # Keep HLS directives and empty lines as-is
+            result.append(line)
+        elif stripped.startswith("http://") or stripped.startswith("https://"):
+            result.append(f"{host}/channel/{lid}/stream?url={stripped}")
+        else:
+            # Relative path
+            full = base_url + "/" + stripped
+            result.append(f"{host}/channel/{lid}/stream?url={full}")
+    return "\n".join(result)
+
+
+def rewrite_m3u8_relative(body: str, lid: int, base_url: str) -> str:
+    """
+    Rewrite HLS manifest URLs for sub-stream proxy (relative paths).
+    Uses line-by-line processing to avoid corrupting HLS tags.
+    """
+    lines = body.split("\n")
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            result.append(line)
+        elif stripped.startswith("http://") or stripped.startswith("https://"):
+            result.append(f"/channel/{lid}/stream?url={stripped}")
+        else:
+            full = base_url + "/" + stripped
+            result.append(f"/channel/{lid}/stream?url={full}")
+    return "\n".join(result)
+
+
+# ============================================================
 # BASIC AUTH (for /admin routes)
 # ============================================================
 async def admin_auth(request: Request) -> Optional[str]:
@@ -77,13 +122,45 @@ async def admin_auth(request: Request) -> Optional[str]:
 
 
 # ============================================================
+# HEALTH / STATUS ENDPOINTS (no auth, always available)
+# ============================================================
+@app.get("/ping")
+async def ping():
+    """Health check endpoint. Always returns 200."""
+    return JSONResponse(content={
+        "status": "ok",
+        "data_ready": state.DATA_READY,
+        "startup_done": state.STARTUP_DONE,
+        "startup_error": state.STARTUP_ERROR,
+        "uptime": state.get_uptime(),
+    }, status_code=200)
+
+
+@app.get("/api/status")
+async def api_status():
+    """Detailed status endpoint. Returns startup logs, channel count, etc."""
+    channel_count = state.count_db_channels()
+    return JSONResponse(content={
+        "status": "ok",
+        "data_ready": state.DATA_READY,
+        "startup_done": state.STARTUP_DONE,
+        "startup_error": state.STARTUP_ERROR,
+        "uptime": state.get_uptime(),
+        "load_time": round(state.LOAD_TIME, 2),
+        "channel_count": channel_count,
+        "last_refresh": state.LAST_REFRESH,
+        "logs": state.STARTUP_LOGS[-50:],  # Last 50 log entries
+    }, status_code=200)
+
+
+# ============================================================
 # STREAMING ENDPOINTS
 # ============================================================
 @app.get("/")
 async def index():
     if not state.DATA_READY:
-        return PlainTextResponse("VxParser is starting up...", status_code=503)
-    return PlainTextResponse("VxParser is running. /admin for management.")
+        return PlainTextResponse("VxParser is starting up... /ping for health check", status_code=503)
+    return PlainTextResponse("VxParser is running. /admin for management.", media_type="text/plain")
 
 
 @app.get("/robots.txt")
@@ -140,7 +217,7 @@ async def player_api(request: Request, action: str = Query("")):
         return {"categories": cats}
     elif action == "":
         return PlainTextResponse(build_m3u(host), media_type="application/x-mpegurl")
-    return PlainTextResponse("Unknown action", status_code=400)
+    return PlainTextResponse("Unknown action", status_code=400, media_type="text/plain")
 
 
 @app.get("/channel/{lid}")
@@ -168,19 +245,9 @@ async def channel_stream(lid: int, request: Request):
     content_type = resp.headers.get("Content-Type", "video/mp4")
 
     if "mpegURL" in content_type or "x-mpegurl" in content_type or "m3u8" in content_type:
-        # HLS manifest - rewrite URLs
+        # HLS manifest - rewrite URLs (line-by-line, safe)
         body = resp.text
-        base_url = resolved_url.rsplit("/", 1)[0] if "/" in resolved_url else resolved_url
-
-        def rewrite_url(match):
-            url = match.group(0)
-            if url.startswith("http"):
-                return f"{host}/channel/{lid}/stream?url={url}"
-            else:
-                full = base_url + "/" + url
-                return f"{host}/channel/{lid}/stream?url={full}"
-
-        body = re.sub(r'https?://[^\s"]+|[^#\n\r][^\n\r]*', rewrite_url, body)
+        body = rewrite_m3u8(body, host, lid, resolved_url)
         return PlainTextResponse(body, media_type="application/vnd.apple.mpegurl")
     else:
         # Direct stream - proxy
@@ -198,7 +265,7 @@ async def channel_stream(lid: int, request: Request):
 async def channel_sub_stream(lid: int, url: str = Query("")):
     """Proxy sub-stream (HLS segments, etc.)."""
     if not url:
-        return PlainTextResponse("No URL provided", status_code=400)
+        return PlainTextResponse("No URL provided", status_code=400, media_type="text/plain")
 
     import requests
     headers_req = {
@@ -217,17 +284,7 @@ async def channel_sub_stream(lid: int, url: str = Query("")):
     if "mpegURL" in content_type or "x-mpegurl" in content_type or "m3u8" in content_type:
         body = resp.text
         base_url = url.rsplit("/", 1)[0] if "/" in url else url
-        host_base = ""
-
-        def rewrite_url(match):
-            u = match.group(0)
-            if u.startswith("http"):
-                return f"/channel/{lid}/stream?url={u}"
-            else:
-                full = base_url + "/" + u
-                return f"/channel/{lid}/stream?url={full}"
-
-        body = re.sub(r'https?://[^\s"]+|[^#\n\r][^\n\r]*', rewrite_url, body)
+        body = rewrite_m3u8_relative(body, lid, base_url)
         return PlainTextResponse(body, media_type="application/vnd.apple.mpegurl")
     else:
         def stream_gen():
@@ -629,7 +686,7 @@ function renderChannels() {
       <td><input type="checkbox" class="ch-check" ${checked} onchange="toggleChannel(${ch.lid}, this.checked)"></td>
       <td><span class="ch-name" title="${escAttr(ch.name)}">${escHtml(ch.name)}</span></td>
       <td>${logo}</td>
-      <td><select class="grp-select" onchange="changeGroup(${ch.lid}, this.value, this)">${grpOpts}</select></td>
+      <td><select class="grp-select" data-original="${ch.cid}" onchange="changeGroup(${ch.lid}, this.value, this)">${grpOpts}</select></td>
       <td><div class="order-btns">
         <button class="order-btn" onclick="reorderChannel(${ch.lid},'up',${idx})" ${idx === 0 ? 'disabled style="opacity:.3"' : ''}>&#9650;</button>
         <button class="order-btn" onclick="reorderChannel(${ch.lid},'down',${idx})" ${idx === channels.length - 1 ? 'disabled style="opacity:.3"' : ''}>&#9660;</button>
@@ -685,9 +742,11 @@ function clearSelection() {
 async function changeGroup(lid, newCid, selectEl) {
   if (isRendering) return; // Skip during render to prevent auto-trigger
   const oldCid = selectEl.getAttribute("data-original") ?? selectEl.value;
+  if (String(newCid) === String(oldCid)) return; // No actual change
   const spinner = document.createElement("span");
   spinner.className = "saving-indicator";
   selectEl.parentNode.appendChild(spinner);
+  selectEl.disabled = true;
   try {
     await api("POST", "/admin/api/channels/assign", { lids: [lid], cid: parseInt(newCid) });
     toast("Group updated", "success");
@@ -698,6 +757,7 @@ async function changeGroup(lid, newCid, selectEl) {
     selectEl.value = oldCid;
   } finally {
     spinner.remove();
+    selectEl.disabled = false;
   }
 }
 
@@ -788,10 +848,11 @@ function debounceSearch() {
 
 // ====== LOGOUT ======
 function logout() {
-  // Basic auth logout: send request with wrong credentials to clear the session
+  // Basic auth logout: send request with wrong credentials to clear the cached session,
+  // then redirect to /admin which will prompt for new credentials.
   fetch('/admin', {
-    headers: { 'Authorization': 'Basic ' + btoa('logout:logout') }
-  }).catch(() => {
+    headers: { 'Authorization': 'Basic ' + btoa('logout:logout' + ':' + Date.now()) }
+  }).finally(() => {
     window.location.href = '/admin';
   });
 }
@@ -1298,3 +1359,56 @@ async def api_normalize_sort(auth: Optional[str] = Depends(admin_auth)):
     conn.close()
 
     return {"success": True, "normalized": updated}
+
+
+@app.post("/admin/api/refresh")
+async def api_refresh_channels(auth: Optional[str] = Depends(admin_auth)):
+    """Manually trigger a re-fetch of channels from Vavoo API."""
+    # Check if a startup/refresh is already running
+    if not state.STARTUP_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="A refresh is already in progress")
+
+    try:
+        state.slog("=== Manual refresh triggered via admin ===")
+        state.STARTUP_DONE = False
+        state.STARTUP_ERROR = None
+
+        # Re-init DB and fetch
+        import server
+        server.init_db()
+        ok = server.fetch_vavoo_channels()
+
+        if ok:
+            server.fetch_hls_links()
+            server.remap_groups()
+            state.LAST_REFRESH = time.time()
+            channel_count = state.count_db_channels()
+            return JSONResponse(content={
+                "success": True,
+                "message": f"Refresh complete. {channel_count} channels in DB.",
+                "channel_count": channel_count,
+            })
+        else:
+            # Fallback: check if DB has data
+            db_count = state.count_db_channels()
+            state.LAST_REFRESH = time.time()
+            if db_count > 0:
+                return JSONResponse(content={
+                    "success": True,
+                    "message": f"Fetch failed but DB has {db_count} channels from previous run.",
+                    "channel_count": db_count,
+                    "fetch_ok": False,
+                })
+            else:
+                return JSONResponse(content={
+                    "success": False,
+                    "message": "Fetch failed and DB is empty.",
+                    "channel_count": 0,
+                    "fetch_ok": False,
+                }, status_code=500)
+    except Exception as e:
+        state.STARTUP_ERROR = str(e)
+        raise HTTPException(status_code=500, detail=f"Refresh error: {e}")
+    finally:
+        state.STARTUP_LOCK.release()
+        state.STARTUP_DONE = True
