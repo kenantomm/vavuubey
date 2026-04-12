@@ -1,5 +1,5 @@
 """
-server.py - VxParser Render entry point
+server.py - VavooBey Render entry point
 video.py'yi IMPORT ETMEZ - circular import yok.
 """
 import os
@@ -15,7 +15,7 @@ import httpx
 import state
 
 state.PORT = int(os.environ.get("PORT", 10000))
-state.DB_PATH = os.environ.get("DB_PATH", "/tmp/vxparser.db")
+state.DB_PATH = os.environ.get("DB_PATH", "/tmp/vavuubey.db")
 state.M3U_PATH = os.environ.get("M3U_PATH", "/tmp/playlist.m3u")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -279,7 +279,7 @@ def startup_sequence():
         return False
 
     try:
-        state.slog("=== VxParser Baslangic ===")
+        state.slog("=== VavooBey Baslangic ===")
         state.slog(f"PORT={state.PORT} DB={state.DB_PATH}")
 
         # Run async core in event loop

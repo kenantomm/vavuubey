@@ -27,7 +27,7 @@ LOAD_TIME = 0
 STARTUP_LOGS = []
 STARTUP_LOCK = threading.Lock()  # Prevents concurrent startup/refresh
 
-DB_PATH = "/tmp/vxparser.db"
+DB_PATH = "/tmp/vavuubey.db"
 M3U_PATH = "/tmp/playlist.m3u"
 PORT = 10000
 

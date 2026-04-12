@@ -1,9 +1,13 @@
 services:
   - type: web
-    name: vxparser
+    name: vavuubey
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python server.py
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.6"
+      - key: ADMIN_USER
+        sync: false
+      - key: ADMIN_PASS
+        sync: false

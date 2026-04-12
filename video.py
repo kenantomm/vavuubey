@@ -1,11 +1,12 @@
 """
-video.py - VxParser FastAPI application
+video.py - VavooBey FastAPI application
 Streaming endpoints + Admin Panel
 """
 import os
 import re
+import secrets
 import sqlite3
-import time
+import time as time_module
 import urllib.parse
 from typing import Optional
 
@@ -18,9 +19,8 @@ import state
 # ============================================================
 # FASTAPI APP
 # ============================================================
-app = FastAPI(title="VxParser", docs_url=None, redoc_url=None)
+app = FastAPI(title="VavooBey", docs_url=None, redoc_url=None)
 
-# Shared httpx client for streaming (created per-request to avoid connection pool issues)
 # Vavoo headers for streaming proxy
 VAVOO_STREAM_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -28,6 +28,73 @@ VAVOO_STREAM_HEADERS = {
     "Origin": "https://vavoo.to",
     "Accept": "*/*",
 }
+
+# ============================================================
+# SESSION-BASED AUTH (NO dev-mode - always require login)
+# ============================================================
+ADMIN_SESSIONS = {}  # {session_token: {"expires": timestamp, "username": str}}
+DEFAULT_ADMIN_USER = "admin"
+DEFAULT_ADMIN_PASS = "vavuubey2024"
+
+
+def get_admin_credentials():
+    """Get admin credentials from env vars, fallback to defaults."""
+    user = os.environ.get("ADMIN_USER", "")
+    pwd = os.environ.get("ADMIN_PASS", "")
+    if not user or not pwd:
+        return DEFAULT_ADMIN_USER, DEFAULT_ADMIN_PASS
+    return user, pwd
+
+
+def verify_admin_credentials(username: str, password: str) -> bool:
+    """Verify admin credentials."""
+    env_user, env_pass = get_admin_credentials()
+    return username == env_user and password == env_pass
+
+
+async def get_admin_session(request: Request) -> Optional[str]:
+    """Get or verify admin session from cookie."""
+    session_token = request.cookies.get("vavuubey_session")
+    if not session_token:
+        return None
+    if session_token in ADMIN_SESSIONS:
+        session = ADMIN_SESSIONS[session_token]
+        if session["expires"] > time_module.time():
+            # Refresh session expiry
+            session["expires"] = time_module.time() + 86400
+            return session_token
+        else:
+            # Session expired, clean up
+            del ADMIN_SESSIONS[session_token]
+    return None
+
+
+async def require_admin(request: Request) -> Optional[str]:
+    """Dependency that requires admin session. ALWAYS enforces auth."""
+    session = await get_admin_session(request)
+    if session:
+        return session
+    # NO dev-mode fallback - always require authentication
+    raise HTTPException(status_code=401, detail="Not authenticated")
+
+
+# ============================================================
+# SECURITY HEADERS MIDDLEWARE
+# ============================================================
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; img-src * data:; style-src 'unsafe-inline' 'self'; script-src 'unsafe-inline' 'self'"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    # Prevent caching of admin pages
+    if request.url.path.startswith("/admin"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+    return response
 
 
 # ============================================================
@@ -40,6 +107,17 @@ def get_db():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     return conn
+
+
+# ============================================================
+# XML HELPERS (for EPG)
+# ============================================================
+def escape_xml(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;")
+
+
+def format_time(ts):
+    return time_module.strftime("%Y%m%d%H%M%S +0000", time_module.gmtime(ts))
 
 
 # ============================================================
@@ -60,7 +138,8 @@ def build_m3u(host: str) -> str:
 
     lines = ['#EXTM3U url-tvg="" deinterlace="1"']
     for ch in channels:
-        logo_param = f' tvg-logo="{ch["logo"]}"' if ch.get("logo") else ""
+        logo = ch.get("logo", "")
+        logo_param = f' tvg-logo="{host}/logo/{ch["lid"]}"' if logo else ""
         grp = ch.get("grp") or ""
         lines.append(f'#EXTINF:-1 group-title="{grp}"{logo_param},{ch["name"]}')
         lines.append(f'{host}/channel/{ch["lid"]}')
@@ -68,27 +147,21 @@ def build_m3u(host: str) -> str:
 
 
 # ============================================================
-# HLS MANIFEST REWRITER (line-by-line, with URL encoding)
+# HLS MANIFEST REWRITER
 # ============================================================
 def rewrite_m3u8(body: str, host: str, lid: int, resolved_url: str) -> str:
-    """
-    Rewrite HLS manifest URLs to go through our proxy.
-    Uses line-by-line processing to avoid corrupting HLS tags (#EXT-X-*).
-    Uses urllib.parse.quote for proper URL encoding.
-    """
+    """Rewrite HLS manifest URLs to go through our proxy."""
     base_url = resolved_url.rsplit("/", 1)[0] if "/" in resolved_url else resolved_url
     lines = body.split("\n")
     result = []
     for line in lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
-            # Keep HLS directives and empty lines as-is
             result.append(line)
         elif stripped.startswith("http://") or stripped.startswith("https://"):
             encoded = urllib.parse.quote(stripped, safe='')
             result.append(f"{host}/channel/{lid}/stream?url={encoded}")
         else:
-            # Relative path
             full = base_url + "/" + stripped
             encoded = urllib.parse.quote(full, safe='')
             result.append(f"{host}/channel/{lid}/stream?url={encoded}")
@@ -96,10 +169,7 @@ def rewrite_m3u8(body: str, host: str, lid: int, resolved_url: str) -> str:
 
 
 def rewrite_m3u8_relative(body: str, lid: int, base_url: str) -> str:
-    """
-    Rewrite HLS manifest URLs for sub-stream proxy (relative paths).
-    Uses urllib.parse.quote for proper URL encoding.
-    """
+    """Rewrite HLS manifest URLs for sub-stream proxy (relative paths)."""
     lines = body.split("\n")
     result = []
     for line in lines:
@@ -114,27 +184,6 @@ def rewrite_m3u8_relative(body: str, lid: int, base_url: str) -> str:
             encoded = urllib.parse.quote(full, safe='')
             result.append(f"/channel/{lid}/stream?url={encoded}")
     return "\n".join(result)
-
-
-# ============================================================
-# BASIC AUTH (for /admin routes)
-# ============================================================
-async def admin_auth(request: Request) -> Optional[str]:
-    """Check basic auth if ADMIN_USER/ADMIN_PASS are set."""
-    user = os.environ.get("ADMIN_USER", "")
-    pw = os.environ.get("ADMIN_PASS", "")
-    if not user or not pw:
-        return None  # No auth required
-    auth = request.headers.get("authorization", "")
-    if auth.startswith("Basic "):
-        import base64
-        try:
-            decoded = base64.b64decode(auth[6:]).decode("utf-8")
-            if decoded == f"{user}:{pw}":
-                return None
-        except Exception:
-            pass
-    raise HTTPException(status_code=401, headers={"WWW-Authenticate": 'Basic realm="VxParser Admin"'})
 
 
 # ============================================================
@@ -154,7 +203,7 @@ async def ping():
 
 @app.get("/api/status")
 async def api_status():
-    """Detailed status endpoint. Returns startup logs, channel count, etc."""
+    """Detailed status endpoint."""
     channel_count = state.count_db_channels()
     return JSONResponse(content={
         "status": "ok",
@@ -165,7 +214,7 @@ async def api_status():
         "load_time": round(state.LOAD_TIME, 2),
         "channel_count": channel_count,
         "last_refresh": state.LAST_REFRESH,
-        "logs": state.STARTUP_LOGS[-50:],  # Last 50 log entries
+        "logs": state.STARTUP_LOGS[-50:],
     }, status_code=200)
 
 
@@ -175,8 +224,8 @@ async def api_status():
 @app.get("/")
 async def index():
     if not state.DATA_READY:
-        return PlainTextResponse("VxParser is starting up... /ping for health check", status_code=503)
-    return PlainTextResponse("VxParser is running. /admin for management.", media_type="text/plain")
+        return PlainTextResponse("VavooBey is starting up... /ping for health check", status_code=503)
+    return PlainTextResponse("VavooBey is running. /admin for management.", media_type="text/plain")
 
 
 @app.get("/robots.txt")
@@ -187,7 +236,7 @@ async def robots_txt():
 @app.get("/get.php")
 async def get_m3u(request: Request):
     if not state.DATA_READY:
-        return PlainTextResponse("#EXTM3U\n# VxParser is starting...", status_code=503)
+        return PlainTextResponse("#EXTM3U\n# VavooBey is starting...", status_code=503)
     host = str(request.base_url).rstrip("/")
     m3u = build_m3u(host)
     return PlainTextResponse(m3u, media_type="application/x-mpegurl")
@@ -196,7 +245,7 @@ async def get_m3u(request: Request):
 @app.get("/player_api.php")
 async def player_api(request: Request, action: str = Query("")):
     if not state.DATA_READY:
-        return PlainTextResponse("VxParser is starting up...", status_code=503)
+        return PlainTextResponse("VavooBey is starting up...", status_code=503)
     host = str(request.base_url).rstrip("/")
     if action == "get_live_streams":
         conn = get_db()
@@ -225,9 +274,6 @@ async def player_api(request: Request, action: str = Query("")):
         c.execute("SELECT cid, name, sort_order FROM categories ORDER BY sort_order")
         cats = []
         for r in c.fetchall():
-            c2 = conn.cursor()
-            c2.execute("SELECT COUNT(*) as cnt FROM channels WHERE cid=?", (r["cid"],))
-            cnt = c2.fetchone()["cnt"]
             cats.append({"category_id": r["cid"], "category_name": r["name"], "parent_id": 0})
         conn.close()
         return {"categories": cats}
@@ -238,11 +284,10 @@ async def player_api(request: Request, action: str = Query("")):
 
 @app.get("/channel/{lid}")
 async def channel_stream(lid: int, request: Request):
-    """Proxy channel stream with HLS rewriting. Fully async with httpx."""
+    """Proxy channel stream with HLS rewriting."""
     if not state.DATA_READY:
-        return PlainTextResponse("VxParser is starting up...", status_code=503)
+        return PlainTextResponse("VavooBey is starting up...", status_code=503)
 
-    # Resolve channel (async, with cache)
     resolved_url, log_msg = await state.resolve_channel(lid)
     if not resolved_url:
         return PlainTextResponse(f"Channel {lid} not resolvable: {log_msg}", status_code=404)
@@ -250,18 +295,16 @@ async def channel_stream(lid: int, request: Request):
     host = str(request.base_url).rstrip("/")
 
     try:
-        async with httpx.AsyncClient(timeout=20, verify=False, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=30, verify=False, follow_redirects=True) as client:
             r = await client.get(resolved_url, headers=VAVOO_STREAM_HEADERS)
 
             content_type = r.headers.get("content-type", "")
 
             if "mpegURL" in content_type or "x-mpegurl" in content_type or "m3u8" in content_type or ".m3u8" in resolved_url:
-                # HLS manifest - rewrite URLs with proper encoding
                 body = r.text
                 body = rewrite_m3u8(body, host, lid, resolved_url)
                 return PlainTextResponse(body, media_type="application/vnd.apple.mpegurl")
             else:
-                # Direct stream - proxy
                 content = r.content
                 ct = content_type or "video/mp4"
                 return StreamingResponse(
@@ -277,24 +320,22 @@ async def channel_stream(lid: int, request: Request):
 
 @app.get("/channel/{lid}/stream")
 async def channel_sub_stream(lid: int, url: str = Query("")):
-    """Proxy sub-stream (HLS segments, etc.). Fully async with httpx."""
+    """Proxy sub-stream (HLS segments, etc.)."""
     if not url:
         return PlainTextResponse("No URL provided", status_code=400, media_type="text/plain")
 
     try:
-        async with httpx.AsyncClient(timeout=20, verify=False, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=30, verify=False, follow_redirects=True) as client:
             r = await client.get(url, headers=VAVOO_STREAM_HEADERS)
 
             content_type = r.headers.get("content-type", "")
 
             if "mpegURL" in content_type or "x-mpegurl" in content_type or ".m3u8" in url:
-                # HLS sub-manifest - rewrite URLs with proper encoding
                 body = r.text
                 base_url = url.rsplit("/", 1)[0] if "/" in url else url
                 body = rewrite_m3u8_relative(body, lid, base_url)
                 return PlainTextResponse(body, media_type="application/vnd.apple.mpegurl")
             else:
-                # Non-HLS content (TS segments, etc.) - stream directly
                 content = r.content
                 ct = content_type or "video/MP2T"
                 return StreamingResponse(
@@ -309,15 +350,108 @@ async def channel_sub_stream(lid: int, url: str = Query("")):
 
 
 # ============================================================
+# EPG ENDPOINT (XMLTV format)
+# ============================================================
+@app.get("/epg.xml")
+async def get_epg():
+    """Generate EPG in XMLTV format with channel info and current programme."""
+    if not state.DATA_READY:
+        return PlainTextResponse("<!-- EPG not ready -->", status_code=503)
+
+    conn = get_db()
+    c = conn.cursor()
+    # Get channels grouped by categories
+    c.execute("""
+        SELECT ch.lid, ch.name, ch.grp, ch.logo, ch.cid,
+               COALESCE(cat.sort_order, 9999) as cat_order
+        FROM channels ch
+        LEFT JOIN categories cat ON ch.cid = cat.cid
+        ORDER BY cat_order, ch.sort_order, ch.name
+    """)
+    channels = c.fetchall()
+    conn.close()
+
+    if not channels:
+        return PlainTextResponse('<?xml version="1.0" encoding="UTF-8"?>\n<tv generator-info-name="VavooBey"/>\n', media_type="application/xml")
+
+    now = int(time_module.time())
+    lines = ['<?xml version="1.0" encoding="UTF-8"?>']
+    lines.append('<tv generator-info-name="VavooBey" source-info-name="VavooBey IPTV">')
+
+    # Channel definitions
+    for ch in channels:
+        ch_id = str(ch["lid"])
+        lines.append(f'  <channel id="{ch_id}">')
+        lines.append(f'    <display-name lang="tr">{escape_xml(ch["name"])}</display-name>')
+        if ch["grp"]:
+            lines.append(f'    <display-name lang="tr">{escape_xml(ch["grp"])}</display-name>')
+        if ch["logo"]:
+            lines.append(f'    <icon src="{escape_xml(ch["logo"])}"/>')
+        lines.append(f'  </channel>')
+
+    # Programme entries - 24h "Yayinda" for each channel
+    for ch in channels:
+        ch_id = str(ch["lid"])
+        start = format_time(now - 3600)
+        stop = format_time(now + 82800)
+        lines.append(f'  <programme start="{start}" stop="{stop}" channel="{ch_id}">')
+        lines.append(f'    <title lang="tr">Canli Yayin</title>')
+        lines.append(f'    <desc lang="tr">{escape_xml(ch["name"])} - Canli Yayin</desc>')
+        lines.append(f'  </programme>')
+
+    lines.append('</tv>')
+    return PlainTextResponse("\n".join(lines), media_type="application/xml")
+
+
+# ============================================================
+# LOGO PROXY ENDPOINT
+# ============================================================
+@app.get("/logo/{lid}")
+async def proxy_logo(lid: int):
+    """Proxy channel logos. Fetches from Vavoo or DB and caches."""
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT logo FROM channels WHERE lid=?", (lid,))
+        row = c.fetchone()
+        conn.close()
+
+        if not row or not row["logo"]:
+            return PlainTextResponse("Not found", status_code=404)
+
+        logo_url = row["logo"]
+
+        # Validate URL scheme
+        if not logo_url.startswith("http://") and not logo_url.startswith("https://"):
+            return PlainTextResponse("Invalid logo URL", status_code=400)
+
+        async with httpx.AsyncClient(timeout=10, verify=False, follow_redirects=True) as client:
+            r = await client.get(logo_url, headers=VAVOO_STREAM_HEADERS)
+            if r.status_code != 200:
+                return PlainTextResponse("Logo fetch failed", status_code=502)
+            ct = r.headers.get("content-type", "image/png")
+            # Ensure it's an image content type
+            if "image" not in ct and "octet-stream" not in ct:
+                ct = "image/png"
+            return Response(content=r.content, media_type=ct)
+    except httpx.TimeoutException:
+        return PlainTextResponse("Logo timeout", status_code=504)
+    except Exception:
+        return PlainTextResponse("Logo fetch failed", status_code=502)
+
+
+# ============================================================
 # ADMIN PANEL HTML
 # ============================================================
 ADMIN_HTML = r'''<!DOCTYPE html>
-<html lang="en">
+<html lang="tr">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="robots" content="noindex,nofollow">
-<title>VxParser Admin</title>
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<title>VavooBey Admin</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -328,6 +462,19 @@ ADMIN_HTML = r'''<!DOCTYPE html>
 }
 html,body{height:100%;font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);overflow:hidden}
 .app{display:flex;height:100vh}
+
+/* Login overlay */
+.login-overlay{position:fixed;inset:0;background:var(--bg);z-index:500;display:flex;align-items:center;justify-content:center}
+.login-overlay.hidden{display:none}
+.login-box{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:40px;width:380px;max-width:90vw;text-align:center}
+.login-box h2{font-size:22px;font-weight:700;margin-bottom:6px}
+.login-box .subtitle{font-size:13px;color:var(--muted);margin-bottom:28px}
+.login-box input{width:100%;background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:10px 14px;border-radius:8px;font-size:14px;outline:none;transition:border-color .2s;margin-bottom:12px}
+.login-box input:focus{border-color:var(--primary)}
+.login-box button{width:100%;background:var(--primary);color:#fff;border:none;padding:11px;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:opacity .2s;margin-top:4px}
+.login-box button:hover{opacity:.85}
+.login-box button:disabled{opacity:.5;cursor:not-allowed}
+.login-error{color:var(--danger);font-size:13px;margin-top:10px;min-height:20px}
 
 /* Sidebar */
 .sidebar{width:280px;min-width:280px;background:var(--sidebar);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
@@ -405,6 +552,7 @@ tbody td:first-child{text-align:center}
 .order-btns{display:flex;gap:4px}
 .order-btn{background:var(--card);border:1px solid var(--border);color:var(--muted);width:24px;height:24px;border-radius:4px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:10px;transition:all .15s}
 .order-btn:hover{color:var(--text);border-color:var(--primary);background:var(--hover)}
+.order-btn:disabled{opacity:.3;cursor:not-allowed}
 
 .empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:60px 20px;color:var(--muted)}
 .empty-state svg{margin-bottom:12px;opacity:.5}
@@ -426,9 +574,6 @@ tbody td:first-child{text-align:center}
 @keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
 @keyframes slideOut{from{transform:translateX(0);opacity:1}to{transform:translateX(100%);opacity:0}}
 
-/* Mini loading on save */
-.saving-indicator{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--primary);border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-left:6px}
-
 /* Responsive */
 @media(max-width:768px){
   .sidebar{width:220px;min-width:220px}
@@ -441,21 +586,34 @@ tbody td:first-child{text-align:center}
 </style>
 </head>
 <body>
-<div class="app">
+
+<!-- Login Overlay (ALWAYS shown first, hidden after successful auth) -->
+<div class="login-overlay" id="loginOverlay">
+  <div class="login-box">
+    <h2>VavooBey</h2>
+    <div class="subtitle">IPTV Kanal Yoneticisi</div>
+    <input type="text" id="loginUser" placeholder="Kullanici Adi" autocomplete="username">
+    <input type="password" id="loginPass" placeholder="Sifre" autocomplete="current-password">
+    <button id="loginBtn" onclick="doLogin()">Giris Yap</button>
+    <div class="login-error" id="loginError"></div>
+  </div>
+</div>
+
+<div class="app" id="mainApp" style="display:none">
   <!-- Sidebar -->
   <aside class="sidebar">
     <div class="sidebar-header">
       <div>
-        <h1><span class="dot" id="statusDot"></span> VxParser</h1>
-        <div class="subtitle">IPTV Channel Manager</div>
+        <h1><span class="dot" id="statusDot"></span> VavooBey</h1>
+        <div class="subtitle">IPTV Kanal Yoneticisi</div>
       </div>
-      <button class="logout-btn" onclick="logout()">Logout</button>
+      <button class="logout-btn" onclick="doLogout()">Cikis</button>
     </div>
     <div class="group-list" id="groupList"></div>
     <div class="sidebar-footer">
       <div class="add-group-form">
-        <input type="text" id="newGroupName" placeholder="New group name..." maxlength="50">
-        <button onclick="createGroup()">+ Add</button>
+        <input type="text" id="newGroupName" placeholder="Yeni grup adi..." maxlength="50">
+        <button onclick="createGroup()">+ Ekle</button>
       </div>
     </div>
   </aside>
@@ -464,37 +622,37 @@ tbody td:first-child{text-align:center}
   <div class="main">
     <div class="toolbar">
       <div class="title-area">
-        <h2 id="currentTitle">All Channels</h2>
-        <div class="channel-count" id="channelCount">0 channels</div>
+        <h2 id="currentTitle">Tum Kanallar</h2>
+        <div class="channel-count" id="channelCount">0 kanal</div>
       </div>
       <div class="search-box">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-        <input type="text" id="searchInput" placeholder="Search channels..." oninput="debounceSearch()">
+        <input type="text" id="searchInput" placeholder="Kanal ara..." oninput="debounceSearch()">
       </div>
     </div>
     <div class="bulk-bar" id="bulkBar">
-      <span class="sel-count" id="selCount">0 selected</span>
-      <select id="bulkGroupSelect"><option value="">Move to group...</option></select>
-      <button class="btn btn-primary" onclick="bulkAssign()">Assign</button>
-      <button class="btn btn-danger" onclick="bulkUngroup()">Remove from Group</button>
-      <button class="btn" onclick="clearSelection()">Cancel</button>
+      <span class="sel-count" id="selCount">0 secili</span>
+      <select id="bulkGroupSelect"><option value="">Gruba tasi...</option></select>
+      <button class="btn btn-primary" onclick="bulkAssign()">Ata</button>
+      <button class="btn btn-danger" onclick="bulkUngroup()">Gruptan Cikar</button>
+      <button class="btn" onclick="clearSelection()">Iptal</button>
     </div>
     <div class="table-wrap">
       <table>
         <thead>
           <tr>
             <th><input type="checkbox" class="ch-check" id="selectAll" onchange="toggleSelectAll(this)"></th>
-            <th>Channel</th>
+            <th>Kanal</th>
             <th></th>
-            <th>Group</th>
-            <th style="width:70px">Order</th>
+            <th>Grup</th>
+            <th style="width:70px">Sira</th>
           </tr>
         </thead>
         <tbody id="channelBody"></tbody>
       </table>
       <div class="empty-state" id="emptyState" style="display:none">
         <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg>
-        <p>No channels found</p>
+        <p>Kanal bulunamadi</p>
       </div>
     </div>
   </div>
@@ -506,17 +664,117 @@ tbody td:first-child{text-align:center}
 <script>
 let groups = [];
 let channels = [];
-let selectedGroup = null; // null = all
+let selectedGroup = null;
 let selectedLids = new Set();
 let searchTimer = null;
 let allGroupsCache = [];
-let isRendering = false; // prevents onchange from firing during render
+let isRendering = false;
+let isLoggedIn = false;
+let authToken = null;
+
+// ====== UTILITY ======
+function escHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s || "";
+  return d.innerHTML;
+}
+function escAttr(s) {
+  return (s || "").replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/'/g,"&#39;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+// ====== AUTH (ALWAYS enforced) ======
+async function checkAuth() {
+  try {
+    const r = await fetch("/admin/api/auth-check");
+    if (r.ok) {
+      const data = await r.json();
+      if (data.authenticated) {
+        isLoggedIn = true;
+        authToken = data.token || null;
+        document.getElementById("loginOverlay").classList.add("hidden");
+        document.getElementById("mainApp").style.display = "flex";
+        return true;
+      }
+    }
+  } catch(e) {}
+  // Not authenticated - ALWAYS show login
+  isLoggedIn = false;
+  document.getElementById("loginOverlay").classList.remove("hidden");
+  document.getElementById("mainApp").style.display = "none";
+  return false;
+}
+
+async function doLogin() {
+  const user = document.getElementById("loginUser").value.trim();
+  const pass = document.getElementById("loginPass").value;
+  const errEl = document.getElementById("loginError");
+  const btn = document.getElementById("loginBtn");
+  if (!user || !pass) { errEl.textContent = "Kullanici adi ve sifre gerekli"; return; }
+  errEl.textContent = "";
+  btn.disabled = true;
+  btn.textContent = "Giris yapiliyor...";
+  try {
+    const r = await fetch("/admin/api/login", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({username: user, password: pass})
+    });
+    if (r.ok) {
+      isLoggedIn = true;
+      document.getElementById("loginOverlay").classList.add("hidden");
+      document.getElementById("mainApp").style.display = "flex";
+      await init();
+    } else {
+      const data = await r.json().catch(() => ({}));
+      errEl.textContent = data.detail || "Giris basarisiz";
+    }
+  } catch(e) {
+    errEl.textContent = "Baglanti hatasi";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Giris Yap";
+  }
+}
+
+async function doLogout() {
+  // 1. Call server logout endpoint
+  try {
+    await fetch("/admin/api/logout", {method: "POST", credentials: "include"});
+  } catch(e) {}
+  // 2. Reset local state
+  isLoggedIn = false;
+  authToken = null;
+  // 3. Clear all local data
+  groups = [];
+  channels = [];
+  selectedGroup = null;
+  selectedLids.clear();
+  // 4. Show login, hide app
+  document.getElementById("loginOverlay").classList.remove("hidden");
+  document.getElementById("mainApp").style.display = "none";
+  // 5. Clear form fields
+  document.getElementById("loginUser").value = "";
+  document.getElementById("loginPass").value = "";
+  document.getElementById("loginError").textContent = "";
+}
+
+// Enter key on login form
+document.getElementById("loginPass").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
+document.getElementById("loginUser").addEventListener("keydown", e => { if (e.key === "Enter") document.getElementById("loginPass").focus(); });
 
 // ====== API HELPERS ======
 async function api(method, url, body) {
-  const opts = { method, headers: { "Content-Type": "application/json" } };
+  const opts = { method, headers: {"Content-Type": "application/json"}, credentials: "include" };
   if (body) opts.body = JSON.stringify(body);
   const r = await fetch(url, opts);
+  if (r.status === 401) {
+    // Session expired - force re-login
+    isLoggedIn = false;
+    authToken = null;
+    document.getElementById("loginOverlay").classList.remove("hidden");
+    document.getElementById("mainApp").style.display = "none";
+    throw new Error("Oturum suresi doldu, tekrar giris yapin");
+  }
   if (!r.ok) {
     const err = await r.json().catch(() => ({ detail: r.statusText }));
     throw new Error(err.detail || "Request failed");
@@ -557,32 +815,18 @@ async function loadGroups() {
 
 function renderSidebar() {
   const list = document.getElementById("groupList");
-  // "All" item
-  let html = `<div class="group-item ${selectedGroup === null ? 'active' : ''}" onclick="selectGroup(null)">
-    <span class="g-icon">&#9776;</span>
-    <span class="g-name">All Channels</span>
-    <span class="g-count">${groups.reduce((s,g) => s + g.count, 0)}</span>
-  </div>`;
-  groups.forEach(g => {
-    html += `<div class="group-item ${selectedGroup === g.cid ? 'active' : ''}" onclick="selectGroup(${g.cid})" data-cid="${g.cid}">
-      <span class="g-icon">&#127909;</span>
-      <span class="g-name" ondblclick="startRename(event, ${g.cid})" title="${g.name}">${escHtml(g.name)}</span>
-      <span class="g-count">${g.count}</span>
-      <span class="g-actions">
-        <button class="g-action-btn" onclick="event.stopPropagation();startRename(event,${g.cid})" title="Rename">&#9998;</button>
-        <button class="g-action-btn delete" onclick="event.stopPropagation();deleteGroup(${g.cid},'${escAttr(g.name)}')" title="Delete">&#128465;</button>
-      </span>
-    </div>`;
+  let html = '<div class="group-item ' + (selectedGroup === null ? 'active' : '') + '" onclick="selectGroup(null)"><span class="g-icon">&#9776;</span><span class="g-name">Tum Kanallar</span><span class="g-count">' + groups.reduce((s,g) => s + g.count, 0) + '</span></div>';
+  groups.forEach((g, idx) => {
+    html += '<div class="group-item ' + (selectedGroup === g.cid ? 'active' : '') + '" onclick="selectGroup(' + g.cid + ')" data-cid="' + g.cid + '"><span class="g-icon">&#127909;</span><span class="g-name" ondblclick="startRename(event, ' + g.cid + ')" title="' + escAttr(g.name) + '">' + escHtml(g.name) + '</span><span class="g-count">' + g.count + '</span><span class="g-actions"><button class="g-action-btn" onclick="event.stopPropagation();reorderGroup(' + g.cid + ',\'up\')" title="Yukari">&#9650;</button><button class="g-action-btn" onclick="event.stopPropagation();reorderGroup(' + g.cid + ',\'down\')" title="Asagi">&#9660;</button><button class="g-action-btn" onclick="event.stopPropagation();startRename(event,' + g.cid + ')" title="Yeniden Adlandir">&#9998;</button><button class="g-action-btn delete" onclick="event.stopPropagation();deleteGroup(' + g.cid + ',\'' + escAttr(g.name).replace(/'/g, "\\'") + '\')" title="Sil">&#128465;</button></span></div>';
   });
   list.innerHTML = html;
 }
 
 function populateGroupDropdowns() {
-  let opts = '<option value="">Move to group...</option>';
-  opts += '<option value="0">Ungrouped</option>';
-  groups.forEach(g => { opts += `<option value="${g.cid}">${escHtml(g.name)}</option>`; });
-  const bulk = document.getElementById("bulkGroupSelect");
-  bulk.innerHTML = opts;
+  let opts = '<option value="">Gruba tasi...</option>';
+  opts += '<option value="0">Grupsuz</option>';
+  groups.forEach(g => { opts += '<option value="' + g.cid + '">' + escHtml(g.name) + '</option>'; });
+  document.getElementById("bulkGroupSelect").innerHTML = opts;
 }
 
 async function selectGroup(cid) {
@@ -591,24 +835,19 @@ async function selectGroup(cid) {
   updateBulkBar();
   document.getElementById("selectAll").checked = false;
   renderSidebar();
-  if (cid === null) {
-    document.getElementById("currentTitle").textContent = "All Channels";
-  } else {
-    const g = groups.find(x => x.cid === cid);
-    document.getElementById("currentTitle").textContent = g ? g.name : "Group";
-  }
+  document.getElementById("currentTitle").textContent = cid === null ? "Tum Kanallar" : (groups.find(x => x.cid === cid) || {}).name || "Grup";
   await loadChannels();
 }
 
 async function createGroup() {
   const input = document.getElementById("newGroupName");
   const name = input.value.trim();
-  if (!name) { toast("Enter a group name", "error"); return; }
+  if (!name) { toast("Grup adi girin", "error"); return; }
   showLoading();
   try {
     await api("POST", "/admin/api/groups/create", { name });
     input.value = "";
-    toast(`Group "${name}" created`, "success");
+    toast('"' + name + '" grubu olusturuldu', "success");
     await loadGroups();
     await loadChannels();
   } catch (e) { toast(e.message, "error"); }
@@ -621,8 +860,7 @@ function startRename(e, cid) {
   if (!item) return;
   const nameEl = item.querySelector(".g-name");
   const oldName = nameEl.textContent;
-  const g = groups.find(x => x.cid === cid);
-  nameEl.innerHTML = `<input class="rename-input" type="text" value="${escAttr(oldName)}" maxlength="50">`;
+  nameEl.innerHTML = '<input class="rename-input" type="text" value="' + escAttr(oldName) + '" maxlength="50">';
   const inp = nameEl.querySelector("input");
   inp.focus();
   inp.select();
@@ -632,28 +870,38 @@ function startRename(e, cid) {
       showLoading();
       try {
         await api("POST", "/admin/api/groups/rename", { cid, name: newName });
-        toast(`Renamed to "${newName}"`, "success");
+        toast('"' + newName + '" olarak yeniden adlandirildi', "success");
         await loadGroups();
         await loadChannels();
       } catch (err) { toast(err.message, "error"); }
       finally { hideLoading(); }
-    } else {
-      renderSidebar();
-    }
+    } else { renderSidebar(); }
   };
   inp.addEventListener("blur", finish);
   inp.addEventListener("keydown", ev => { if (ev.key === "Enter") inp.blur(); if (ev.key === "Escape") { inp.value = oldName; inp.blur(); } });
 }
 
 async function deleteGroup(cid, name) {
-  if (!confirm(`Delete group "${name}"?\nChannels will be moved to Ungrouped.`)) return;
+  if (!confirm('"' + name + '" grubunu silmek istediginize emin misiniz?\nKanallar Grupsuz\'a tasinacaktir.')) return;
   showLoading();
   try {
     await api("POST", "/admin/api/groups/delete", { cid });
-    toast(`Group "${name}" deleted`, "success");
+    toast('"' + name + '" grubu silindi', "success");
     if (selectedGroup === cid) selectedGroup = null;
     await loadGroups();
     await loadChannels();
+  } catch (e) { toast(e.message, "error"); }
+  finally { hideLoading(); }
+}
+
+async function reorderGroup(cid, direction) {
+  showLoading();
+  try {
+    const result = await api("POST", "/admin/api/groups/reorder", { cid, direction });
+    if (result.swapped) {
+      toast("Grup siralama degistirildi", "success");
+    }
+    await loadGroups();
   } catch (e) { toast(e.message, "error"); }
   finally { hideLoading(); }
 }
@@ -673,8 +921,7 @@ function renderChannels() {
   const body = document.getElementById("channelBody");
   const empty = document.getElementById("emptyState");
   const countEl = document.getElementById("channelCount");
-  countEl.textContent = channels.length + " channel" + (channels.length !== 1 ? "s" : "");
-
+  countEl.textContent = channels.length + " kanal";
   if (channels.length === 0) {
     body.innerHTML = "";
     empty.style.display = "flex";
@@ -682,242 +929,262 @@ function renderChannels() {
     return;
   }
   empty.style.display = "none";
-
   let html = "";
   channels.forEach((ch, idx) => {
     const checked = selectedLids.has(ch.lid) ? "checked" : "";
-    const logo = ch.logo ? `<img class="ch-logo" src="${escAttr(ch.logo)}" alt="" onerror="this.style.display='none'">` : `<div class="ch-logo" style="display:flex;align-items:center;justify-content:center;font-size:14px;color:var(--muted)">&#127909;</div>`;
-    // Build group options for individual select
-    let grpOpts = `<option value="0" ${ch.cid == 0 ? 'selected' : ''}>Ungrouped</option>`;
+    const logoSrc = ch.logo ? '/logo/' + ch.lid : '';
+    const logo = ch.logo ? '<img class="ch-logo" src="' + logoSrc + '" alt="" onerror="this.style.display=\'none\'">' : '<div class="ch-logo" style="display:flex;align-items:center;justify-content:center;font-size:14px;color:var(--muted)">&#127909;</div>';
+    let grpOpts = '<option value="0"' + (ch.cid == 0 ? ' selected' : '') + '>Grupsuz</option>';
     groups.forEach(g => {
-      grpOpts += `<option value="${g.cid}" ${ch.cid === g.cid ? 'selected' : ''}>${escHtml(g.name)}</option>`;
+      grpOpts += '<option value="' + g.cid + '"' + (ch.cid === g.cid ? ' selected' : '') + '>' + escHtml(g.name) + '</option>';
     });
-
-    html += `<tr draggable="true" data-lid="${ch.lid}" ondragstart="onDragStart(event)" ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event)" ondragend="onDragEnd(event)">
-      <td><input type="checkbox" class="ch-check" ${checked} onchange="toggleChannel(${ch.lid}, this.checked)"></td>
-      <td><span class="ch-name" title="${escAttr(ch.name)}">${escHtml(ch.name)}</span></td>
-      <td>${logo}</td>
-      <td><select class="grp-select" data-original="${ch.cid}" onchange="changeGroup(${ch.lid}, this.value, this)">${grpOpts}</select></td>
-      <td><div class="order-btns">
-        <button class="order-btn" onclick="reorderChannel(${ch.lid},'up',${idx})" ${idx === 0 ? 'disabled style="opacity:.3"' : ''}>&#9650;</button>
-        <button class="order-btn" onclick="reorderChannel(${ch.lid},'down',${idx})" ${idx === channels.length - 1 ? 'disabled style="opacity:.3"' : ''}>&#9660;</button>
-      </div></td>
-    </tr>`;
+    html += '<tr draggable="true" data-lid="' + ch.lid + '" ondragstart="onDragStart(event)" ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event)" ondragend="onDragEnd(event)"><td><input type="checkbox" class="ch-check" ' + checked + ' onchange="toggleChannel(' + ch.lid + ', this.checked)"></td><td><span class="ch-name" title="' + escAttr(ch.name) + '">' + escHtml(ch.name) + '</span></td><td>' + logo + '</td><td><select class="grp-select" data-original="' + ch.cid + '" onchange="changeGroup(' + ch.lid + ', this.value, this)">' + grpOpts + '</select></td><td><div class="order-btns"><button class="order-btn" onclick="reorderChannel(' + ch.lid + ',\'up\',' + idx + ')"' + (idx === 0 ? ' disabled' : '') + '>&#9650;</button><button class="order-btn" onclick="reorderChannel(' + ch.lid + ',\'down\',' + idx + ')"' + (idx === channels.length - 1 ? ' disabled' : '') + '>&#9660;</button></div></td></tr>';
   });
   body.innerHTML = html;
-  // Use setTimeout to ensure DOM is ready before unblocking onchange handlers
   setTimeout(() => { isRendering = false; }, 50);
 }
 
-// ====== SELECTION ======
-function toggleChannel(lid, checked) {
-  if (checked) selectedLids.add(lid); else selectedLids.delete(lid);
-  updateBulkBar();
-  updateSelectAll();
-}
-
-function toggleSelectAll(el) {
-  const checks = document.querySelectorAll("#channelBody .ch-check");
-  checks.forEach(cb => {
-    cb.checked = el.checked;
-    const tr = cb.closest("tr");
-    if (tr) {
-      const lid = parseInt(tr.dataset.lid);
-      if (el.checked) selectedLids.add(lid); else selectedLids.delete(lid);
-    }
-  });
-  updateBulkBar();
-}
-
-function updateSelectAll() {
-  const checks = document.querySelectorAll("#channelBody .ch-check");
-  const allChecked = checks.length > 0 && Array.from(checks).every(cb => cb.checked);
-  document.getElementById("selectAll").checked = allChecked;
-}
-
-function updateBulkBar() {
-  const bar = document.getElementById("bulkBar");
-  const count = selectedLids.size;
-  document.getElementById("selCount").textContent = count + " selected";
-  if (count > 0) bar.classList.add("visible"); else bar.classList.remove("visible");
-}
-
-function clearSelection() {
-  selectedLids.clear();
-  document.querySelectorAll("#channelBody .ch-check").forEach(cb => cb.checked = false);
-  document.getElementById("selectAll").checked = false;
-  updateBulkBar();
-}
-
-// ====== GROUP CHANGE (individual) ======
-async function changeGroup(lid, newCid, selectEl) {
-  if (isRendering) return; // Skip during render to prevent auto-trigger
-  const oldCid = selectEl.getAttribute("data-original") ?? selectEl.value;
-  if (String(newCid) === String(oldCid)) return; // No actual change
-  const spinner = document.createElement("span");
-  spinner.className = "saving-indicator";
-  selectEl.parentNode.appendChild(spinner);
-  selectEl.disabled = true;
-  try {
-    await api("POST", "/admin/api/channels/assign", { lids: [lid], cid: parseInt(newCid) });
-    toast("Group updated", "success");
-    await loadGroups();
-    await loadChannels();
-  } catch (e) {
-    toast(e.message, "error");
-    selectEl.value = oldCid;
-  } finally {
-    spinner.remove();
-    selectEl.disabled = false;
-  }
-}
-
-// ====== BULK ASSIGN ======
-async function bulkAssign() {
-  const cid = parseInt(document.getElementById("bulkGroupSelect").value);
-  if (isNaN(cid) && document.getElementById("bulkGroupSelect").value !== "0") { toast("Select a group", "error"); return; }
-  const targetCid = cid === 0 ? 0 : cid;
-  if (selectedLids.size === 0) return;
-  showLoading();
-  try {
-    const result = await api("POST", "/admin/api/channels/assign", { lids: Array.from(selectedLids), cid: targetCid });
-    toast(`${result.updated} channels reassigned`, "success");
-    selectedLids.clear();
-    document.getElementById("selectAll").checked = false;
-    updateBulkBar();
-    // Normalize sort_orders and reload
-    await api("POST", "/admin/api/channels/normalize");
-    await loadGroups();
-    await loadChannels();
-  } catch (e) { toast(e.message, "error"); }
-  finally { hideLoading(); }
-}
-
-// ====== BULK UNGROUP ======
-async function bulkUngroup() {
-  if (selectedLids.size === 0) return;
-  showLoading();
-  try {
-    await api("POST", "/admin/api/channels/ungroup", { lids: Array.from(selectedLids) });
-    toast(`${selectedLids.size} channels ungrouped`, "success");
-    selectedLids.clear();
-    document.getElementById("selectAll").checked = false;
-    updateBulkBar();
-    await loadGroups();
-    await loadChannels();
-  } catch (e) { toast(e.message, "error"); }
-  finally { hideLoading(); }
-}
-
-// ====== REORDER ======
-async function reorderChannel(lid, direction, idx) {
-  try {
-    await api("POST", "/admin/api/channels/reorder", { lid, direction });
-    await loadChannels();
-  } catch (e) { toast(e.message, "error"); }
-}
-
 // ====== DRAG & DROP ======
-let dragLid = null;
+let dragSrcLid = null;
 function onDragStart(e) {
-  dragLid = parseInt(e.currentTarget.dataset.lid);
+  dragSrcLid = parseInt(e.currentTarget.dataset.lid);
   e.currentTarget.classList.add("dragging");
   e.dataTransfer.effectAllowed = "move";
 }
 function onDragOver(e) {
   e.preventDefault();
   e.dataTransfer.dropEffect = "move";
-  const tr = e.currentTarget;
-  if (tr.dataset.lid != dragLid) tr.classList.add("drag-over");
+  e.currentTarget.classList.add("drag-over");
 }
 function onDragLeave(e) { e.currentTarget.classList.remove("drag-over"); }
-async function onDrop(e) {
+function onDrop(e) {
   e.preventDefault();
   e.currentTarget.classList.remove("drag-over");
   const targetLid = parseInt(e.currentTarget.dataset.lid);
-  if (dragLid !== null && dragLid !== targetLid) {
-    showLoading();
-    try {
-      await api("POST", "/admin/api/channels/move", { lid: dragLid, target_lid: targetLid });
-      toast("Channel moved", "success");
-      await loadChannels();
-    } catch (err) { toast(err.message, "error"); }
-    finally { hideLoading(); }
+  if (dragSrcLid && targetLid && dragSrcLid !== targetLid) {
+    moveChannel(dragSrcLid, targetLid);
   }
 }
 function onDragEnd(e) {
   e.currentTarget.classList.remove("dragging");
   document.querySelectorAll(".drag-over").forEach(el => el.classList.remove("drag-over"));
-  dragLid = null;
 }
 
-// ====== SEARCH ======
+async function moveChannel(srcLid, targetLid) {
+  try {
+    await api("POST", "/admin/api/channels/move", { lid: srcLid, target_lid: targetLid });
+    toast("Kanal tasindi", "success");
+    await loadChannels();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+// ====== CHANNEL OPERATIONS ======
+function toggleChannel(lid, checked) {
+  if (checked) selectedLids.add(lid); else selectedLids.delete(lid);
+  updateBulkBar();
+}
+
+function toggleSelectAll(el) {
+  const boxes = document.querySelectorAll("#channelBody .ch-check");
+  if (el.checked) {
+    channels.forEach(ch => selectedLids.add(ch.lid));
+    boxes.forEach(b => b.checked = true);
+  } else {
+    selectedLids.clear();
+    boxes.forEach(b => b.checked = false);
+  }
+  updateBulkBar();
+}
+
+function updateBulkBar() {
+  const bar = document.getElementById("bulkBar");
+  const countEl = document.getElementById("selCount");
+  const n = selectedLids.size;
+  if (n > 0) {
+    bar.classList.add("visible");
+    countEl.textContent = n + " secili";
+  } else {
+    bar.classList.remove("visible");
+  }
+}
+
+async function bulkAssign() {
+  const cid = parseInt(document.getElementById("bulkGroupSelect").value);
+  if (!cid && cid !== 0) { toast("Grup secin", "error"); return; }
+  const lids = Array.from(selectedLids);
+  showLoading();
+  try {
+    const result = await api("POST", "/admin/api/channels/assign", { lids, cid });
+    toast(result.updated + " kanal atandi", "success");
+    selectedLids.clear();
+    updateBulkBar();
+    document.getElementById("selectAll").checked = false;
+    await loadGroups();
+    await loadChannels();
+  } catch (e) { toast(e.message, "error"); }
+  finally { hideLoading(); }
+}
+
+async function bulkUngroup() {
+  const lids = Array.from(selectedLids);
+  showLoading();
+  try {
+    const result = await api("POST", "/admin/api/channels/ungroup", { lids });
+    toast(result.ungrouped + " kanal gruptan cikarildi", "success");
+    selectedLids.clear();
+    updateBulkBar();
+    document.getElementById("selectAll").checked = false;
+    await loadGroups();
+    await loadChannels();
+  } catch (e) { toast(e.message, "error"); }
+  finally { hideLoading(); }
+}
+
+function clearSelection() {
+  selectedLids.clear();
+  updateBulkBar();
+  document.getElementById("selectAll").checked = false;
+  renderChannels();
+}
+
+async function changeGroup(lid, newCid, selectEl) {
+  const origCid = parseInt(selectEl.dataset.original);
+  if (parseInt(newCid) === origCid) return;
+  showLoading();
+  try {
+    await api("POST", "/admin/api/channels/assign", { lids: [lid], cid: parseInt(newCid) });
+    selectEl.dataset.original = newCid;
+    toast("Kanal grup degistirildi", "success");
+    await loadGroups();
+    await loadChannels();
+  } catch (e) {
+    toast(e.message, "error");
+    selectEl.value = origCid;
+  }
+  finally { hideLoading(); }
+}
+
+async function reorderChannel(lid, direction, idx) {
+  try {
+    const result = await api("POST", "/admin/api/channels/reorder", { lid, direction });
+    if (result.swapped) {
+      toast("Kanal siralamasi degistirildi", "success");
+      await loadChannels();
+    }
+  } catch (e) { toast(e.message, "error"); }
+}
+
 function debounceSearch() {
   clearTimeout(searchTimer);
-  searchTimer = setTimeout(() => loadChannels(), 300);
+  searchTimer = setTimeout(async () => { await loadChannels(); }, 300);
 }
 
-// ====== LOGOUT ======
-function logout() {
-  // Use XMLHttpRequest with explicit wrong credentials.
-  // This forces the browser to send a 401 and clear the cached credentials.
-  const xhr = new XMLHttpRequest();
-  xhr.open('GET', '/admin', true, '__logout__', '__logout__');
-  xhr.onload = function() {
-    window.location.replace('/admin?t=' + Date.now());
-  };
-  xhr.onerror = function() {
-    window.location.replace('/admin?t=' + Date.now());
-  };
-  xhr.send();
+// ====== REFRESH ======
+async function doRefresh() {
+  showLoading();
+  try {
+    const result = await api("POST", "/admin/api/refresh");
+    toast(result.message || "Refresh tamamlandi", result.success ? "success" : "error");
+    await loadGroups();
+    await loadChannels();
+  } catch (e) { toast(e.message, "error"); }
+  finally { hideLoading(); }
 }
-
-// ====== UTILS ======
-function escHtml(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
-function escAttr(s) { return s.replace(/"/g, "&quot;").replace(/'/g, "&#39;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
-
-// ====== KEYBOARD SHORTCUTS ======
-document.addEventListener("keydown", e => {
-  // Ctrl+A to select all channels when not focused on input
-  if ((e.ctrlKey || e.metaKey) && e.key === "a" && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "SELECT") {
-    e.preventDefault();
-    document.getElementById("selectAll").checked = true;
-    toggleSelectAll(document.getElementById("selectAll"));
-  }
-});
-
-// Enter key on new group input
-document.getElementById("newGroupName").addEventListener("keydown", e => {
-  if (e.key === "Enter") createGroup();
-});
 
 // ====== INIT ======
 async function init() {
   try {
-    // Normalize sort_orders first to fix any duplicate sort_order issues
-    await api("POST", "/admin/api/channels/normalize");
     await loadGroups();
     await loadChannels();
   } catch (e) {
-    toast("Failed to load data: " + e.message, "error");
+    toast("Veri yukleme hatasi: " + e.message, "error");
   }
 }
-init();
+
+// Boot: always check auth first
+checkAuth();
 </script>
-</body>
-</html>'''
+'''
 
 
 # ============================================================
-# ADMIN API ENDPOINTS
+# ADMIN AUTH ENDPOINTS
+# ============================================================
+@app.get("/admin/api/auth-check")
+async def auth_check(request: Request):
+    """Check if user is authenticated by verifying session cookie."""
+    session = await get_admin_session(request)
+    return {"authenticated": session is not None, "requires_login": session is None}
+
+
+@app.post("/admin/api/login")
+async def admin_login(request: Request):
+    """Login endpoint - validates credentials, creates session cookie."""
+    body = await request.json()
+    username = body.get("username", "")
+    password = body.get("password", "")
+
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="Kullanici adi ve sifre gerekli")
+
+    if not verify_admin_credentials(username, password):
+        raise HTTPException(status_code=403, detail="Gecersiz kimlik bilgileri")
+
+    # Create session
+    token = secrets.token_urlsafe(32)
+    ADMIN_SESSIONS[token] = {"expires": time_module.time() + 86400, "username": username}
+
+    # Clean up expired sessions
+    now = time_module.time()
+    expired = [k for k, v in ADMIN_SESSIONS.items() if v["expires"] <= now]
+    for k in expired:
+        del ADMIN_SESSIONS[k]
+
+    response = JSONResponse({"success": True, "message": "Giris basarili"})
+    response.set_cookie(
+        key="vavuubey_session",
+        value=token,
+        httponly=True,
+        max_age=86400,
+        samesite="strict",
+        secure=False,  # Set True if using HTTPS
+        path="/"
+    )
+    return response
+
+
+@app.post("/admin/api/logout")
+async def admin_logout(request: Request):
+    """Logout endpoint - removes session from server AND client."""
+    # Remove session from server
+    session_token = request.cookies.get("vavuubey_session")
+    if session_token and session_token in ADMIN_SESSIONS:
+        del ADMIN_SESSIONS[session_token]
+
+    # Clear cookie
+    response = JSONResponse({"success": True})
+    response.delete_cookie(
+        key="vavuubey_session",
+        path="/",
+        samesite="strict"
+    )
+    return response
+
+
+# ============================================================
+# ADMIN PAGE
 # ============================================================
 @app.get("/admin", response_class=HTMLResponse)
-async def admin_page(auth: Optional[str] = Depends(admin_auth)):
+async def admin_page():
+    """Serve admin panel HTML. Auth is enforced client-side AND server-side."""
     return HTMLResponse(ADMIN_HTML)
 
 
+# ============================================================
+# ADMIN API ENDPOINTS (require session auth)
+# ============================================================
 @app.get("/admin/api/groups")
-async def api_get_groups(auth: Optional[str] = Depends(admin_auth)):
+async def api_get_groups(auth: Optional[str] = Depends(require_admin)):
     """List all groups with channel counts."""
     conn = get_db()
     c = conn.cursor()
@@ -929,17 +1196,16 @@ async def api_get_groups(auth: Optional[str] = Depends(admin_auth)):
         c2.execute("SELECT COUNT(*) as cnt FROM channels WHERE cid=?", (cid,))
         cnt = c2.fetchone()["cnt"]
         groups.append({"cid": cid, "name": r["name"], "sort_order": r["sort_order"], "count": cnt})
-    # Count ungrouped
     c.execute("SELECT COUNT(*) as cnt FROM channels WHERE cid=0")
     ungrouped = c.fetchone()["cnt"]
     if ungrouped > 0:
-        groups.append({"cid": 0, "name": "Ungrouped", "sort_order": 99999, "count": ungrouped})
+        groups.append({"cid": 0, "name": "Grupsuz", "sort_order": 99999, "count": ungrouped})
     conn.close()
     return groups
 
 
 @app.post("/admin/api/groups/create")
-async def api_create_group(request: Request, auth: Optional[str] = Depends(admin_auth)):
+async def api_create_group(request: Request, auth: Optional[str] = Depends(require_admin)):
     """Create a new group."""
     body = await request.json()
     name = body.get("name", "").strip()
@@ -950,13 +1216,11 @@ async def api_create_group(request: Request, auth: Optional[str] = Depends(admin
 
     conn = get_db()
     c = conn.cursor()
-    # Check duplicate
     c.execute("SELECT cid FROM categories WHERE name=?", (name,))
     if c.fetchone():
         conn.close()
         raise HTTPException(status_code=409, detail="Group already exists")
 
-    # Get max sort_order
     c.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 as nxt FROM categories")
     nxt = c.fetchone()["nxt"]
     c.execute("INSERT INTO categories(name, sort_order) VALUES(?, ?)", (name, nxt))
@@ -967,7 +1231,7 @@ async def api_create_group(request: Request, auth: Optional[str] = Depends(admin
 
 
 @app.post("/admin/api/groups/rename")
-async def api_rename_group(request: Request, auth: Optional[str] = Depends(admin_auth)):
+async def api_rename_group(request: Request, auth: Optional[str] = Depends(require_admin)):
     """Rename a group."""
     body = await request.json()
     cid = body.get("cid")
@@ -983,7 +1247,6 @@ async def api_rename_group(request: Request, auth: Optional[str] = Depends(admin
         raise HTTPException(status_code=404, detail="Group not found")
 
     c.execute("UPDATE categories SET name=? WHERE cid=?", (name, cid))
-    # Also update the grp field on all channels in this group
     c.execute("UPDATE channels SET grp=? WHERE cid=?", (name, cid))
     conn.commit()
     conn.close()
@@ -991,7 +1254,7 @@ async def api_rename_group(request: Request, auth: Optional[str] = Depends(admin
 
 
 @app.post("/admin/api/groups/delete")
-async def api_delete_group(request: Request, auth: Optional[str] = Depends(admin_auth)):
+async def api_delete_group(request: Request, auth: Optional[str] = Depends(require_admin)):
     """Delete a group. Channels become ungrouped."""
     body = await request.json()
     cid = body.get("cid")
@@ -1005,9 +1268,7 @@ async def api_delete_group(request: Request, auth: Optional[str] = Depends(admin
         conn.close()
         raise HTTPException(status_code=404, detail="Group not found")
 
-    # Move channels to ungrouped
     c.execute("UPDATE channels SET cid=0, grp='' WHERE cid=?", (cid,))
-    # Delete category
     c.execute("DELETE FROM categories WHERE cid=?", (cid,))
     conn.commit()
     conn.close()
@@ -1015,24 +1276,52 @@ async def api_delete_group(request: Request, auth: Optional[str] = Depends(admin
 
 
 @app.post("/admin/api/groups/reorder")
-async def api_reorder_groups(request: Request, auth: Optional[str] = Depends(admin_auth)):
-    """Reorder groups."""
+async def api_reorder_groups(request: Request, auth: Optional[str] = Depends(require_admin)):
+    """Reorder groups - swap with neighbor (up/down)."""
     body = await request.json()
-    items = body.get("groups", [])
-    if not items:
-        raise HTTPException(status_code=400, detail="groups array required")
-
     conn = get_db()
     c = conn.cursor()
-    c.execute("BEGIN")
-    for item in items:
-        cid = item.get("cid")
-        sort_order = item.get("sort_order")
-        if cid is not None and sort_order is not None:
-            c.execute("UPDATE categories SET sort_order=? WHERE cid=?", (sort_order, cid))
-    conn.commit()
+
+    if "cid" in body and "direction" in body:
+        cid = body.get("cid")
+        direction = body.get("direction")
+        if not cid or direction not in ("up", "down"):
+            conn.close()
+            raise HTTPException(status_code=400, detail="cid and direction required")
+
+        c.execute("SELECT cid, sort_order FROM categories WHERE cid=?", (cid,))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Group not found")
+
+        current_order = row["sort_order"]
+
+        if direction == "up":
+            c.execute("SELECT cid, sort_order FROM categories WHERE sort_order < ? ORDER BY sort_order DESC LIMIT 1", (current_order,))
+        else:
+            c.execute("SELECT cid, sort_order FROM categories WHERE sort_order > ? ORDER BY sort_order ASC LIMIT 1", (current_order,))
+
+        neighbor = c.fetchone()
+        if not neighbor:
+            conn.close()
+            return {"success": True, "swapped": False}
+
+        try:
+            c.execute("BEGIN")
+            c.execute("UPDATE categories SET sort_order=? WHERE cid=?", (neighbor["sort_order"], cid))
+            c.execute("UPDATE categories SET sort_order=? WHERE cid=?", (current_order, neighbor["cid"]))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            conn.close()
+            raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+        conn.close()
+        return {"success": True, "swapped": True}
+
     conn.close()
-    return {"success": True}
+    raise HTTPException(status_code=400, detail="cid and direction required")
 
 
 @app.get("/admin/api/channels")
@@ -1040,72 +1329,34 @@ async def api_get_channels(
     request: Request,
     group_id: Optional[int] = Query(None),
     search: Optional[str] = Query(None),
-    auth: Optional[str] = Depends(admin_auth)
+    auth: Optional[str] = Depends(require_admin)
 ):
     """List channels with optional group filter and search."""
     conn = get_db()
     c = conn.cursor()
 
     if group_id is not None and group_id > 0:
-        # Filter by group
         if search:
-            c.execute("""
-                SELECT lid, name, grp, cid, logo, url, hls, sort_order
-                FROM channels
-                WHERE cid=? AND (name LIKE ? OR grp LIKE ?)
-                ORDER BY sort_order, name
-            """, (group_id, f"%{search}%", f"%{search}%"))
+            c.execute("""SELECT lid, name, grp, cid, logo, url, hls, sort_order FROM channels WHERE cid=? AND (name LIKE ? OR grp LIKE ?) ORDER BY sort_order, name""", (group_id, f"%{search}%", f"%{search}%"))
         else:
-            c.execute("""
-                SELECT lid, name, grp, cid, logo, url, hls, sort_order
-                FROM channels
-                WHERE cid=?
-                ORDER BY sort_order, name
-            """, (group_id,))
+            c.execute("""SELECT lid, name, grp, cid, logo, url, hls, sort_order FROM channels WHERE cid=? ORDER BY sort_order, name""", (group_id,))
     elif group_id == 0:
-        # Ungrouped only
         if search:
-            c.execute("""
-                SELECT lid, name, grp, cid, logo, url, hls, sort_order
-                FROM channels
-                WHERE cid=0 AND (name LIKE ? OR grp LIKE ?)
-                ORDER BY sort_order, name
-            """, (f"%{search}%", f"%{search}%"))
+            c.execute("""SELECT lid, name, grp, cid, logo, url, hls, sort_order FROM channels WHERE cid=0 AND (name LIKE ? OR grp LIKE ?) ORDER BY sort_order, name""", (f"%{search}%", f"%{search}%"))
         else:
-            c.execute("""
-                SELECT lid, name, grp, cid, logo, url, hls, sort_order
-                FROM channels
-                WHERE cid=0
-                ORDER BY sort_order, name
-            """)
+            c.execute("""SELECT lid, name, grp, cid, logo, url, hls, sort_order FROM channels WHERE cid=0 ORDER BY sort_order, name""")
     else:
-        # All channels
         if search:
-            c.execute("""
-                SELECT ch.lid, ch.name, ch.grp, ch.cid, ch.logo, ch.url, ch.hls, ch.sort_order
-                FROM channels ch
-                LEFT JOIN categories cat ON ch.cid = cat.cid
-                WHERE (ch.name LIKE ? OR ch.grp LIKE ?)
-                ORDER BY COALESCE(cat.sort_order, 9999), ch.sort_order, ch.name
-            """, (f"%{search}%", f"%{search}%"))
+            c.execute("""SELECT ch.lid, ch.name, ch.grp, ch.cid, ch.logo, ch.url, ch.hls, ch.sort_order FROM channels ch LEFT JOIN categories cat ON ch.cid = cat.cid WHERE (ch.name LIKE ? OR ch.grp LIKE ?) ORDER BY COALESCE(cat.sort_order, 9999), ch.sort_order, ch.name""", (f"%{search}%", f"%{search}%"))
         else:
-            c.execute("""
-                SELECT ch.lid, ch.name, ch.grp, ch.cid, ch.logo, ch.url, ch.hls, ch.sort_order
-                FROM channels ch
-                LEFT JOIN categories cat ON ch.cid = cat.cid
-                ORDER BY COALESCE(cat.sort_order, 9999), ch.sort_order, ch.name
-            """)
+            c.execute("""SELECT ch.lid, ch.name, ch.grp, ch.cid, ch.logo, ch.url, ch.hls, ch.sort_order FROM channels ch LEFT JOIN categories cat ON ch.cid = cat.cid ORDER BY COALESCE(cat.sort_order, 9999), ch.sort_order, ch.name""")
 
     result = []
     for r in c.fetchall():
         result.append({
-            "lid": r["lid"],
-            "name": r["name"],
-            "grp": r["grp"] or "",
-            "cid": r["cid"] or 0,
-            "logo": r["logo"] or "",
-            "url": r["url"] or "",
-            "hls": r["hls"] or "",
+            "lid": r["lid"], "name": r["name"], "grp": r["grp"] or "",
+            "cid": r["cid"] or 0, "logo": r["logo"] or "",
+            "url": r["url"] or "", "hls": r["hls"] or "",
             "sort_order": r["sort_order"],
         })
     conn.close()
@@ -1113,26 +1364,20 @@ async def api_get_channels(
 
 
 @app.post("/admin/api/channels/assign")
-async def api_assign_channels(request: Request, auth: Optional[str] = Depends(admin_auth)):
-    """
-    Batch assign channels to a group.
-    CRITICAL: Uses a single transaction to update ALL channels.
-    Also normalizes sort_orders so channels get unique sequential order.
-    """
+async def api_assign_channels(request: Request, auth: Optional[str] = Depends(require_admin)):
+    """Batch assign channels to a group."""
     body = await request.json()
     lids = body.get("lids", [])
     cid = body.get("cid")
 
     if not lids or not isinstance(lids, list) or len(lids) == 0:
-        raise HTTPException(status_code=400, detail="lids array required with at least 1 ID")
+        raise HTTPException(status_code=400, detail="lids array required")
     if cid is None:
         raise HTTPException(status_code=400, detail="cid required")
 
     if cid == 0:
-        # Ungroup
         target_grp = ""
     else:
-        # Look up group name
         conn = get_db()
         c = conn.cursor()
         c.execute("SELECT name FROM categories WHERE cid=?", (cid,))
@@ -1145,44 +1390,27 @@ async def api_assign_channels(request: Request, auth: Optional[str] = Depends(ad
     conn = get_db()
     c = conn.cursor()
 
-    # CRITICAL FIX: Single transaction for ALL updates
     try:
         c.execute("BEGIN")
         for lid in lids:
             c.execute("UPDATE channels SET cid=?, grp=? WHERE lid=?", (cid, target_grp, lid))
-        # Commit the group assignment first
         conn.commit()
     except Exception as e:
         conn.rollback()
         conn.close()
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
-    # Verify the updates actually landed
     c.execute("SELECT COUNT(*) as cnt FROM channels WHERE cid=? AND lid IN ({})".format(
         ",".join("?" * len(lids))), [cid] + list(lids))
     saved_count = c.fetchone()["cnt"]
-
-    if saved_count != len(lids):
-        conn.close()
-        raise HTTPException(status_code=500, detail=f"Only {saved_count}/{len(lids)} channels updated")
-
-    # Normalize sort_orders for the target group:
-    # Give each channel a unique sequential sort_order
-    c.execute("SELECT lid FROM channels WHERE cid=? ORDER BY sort_order, name", (cid,))
-    group_lids = [r["lid"] for r in c.fetchall()]
-    c.execute("BEGIN")
-    for idx, glid in enumerate(group_lids):
-        c.execute("UPDATE channels SET sort_order=? WHERE lid=?", (idx + 1, glid))
-    conn.commit()
     conn.close()
 
     return {"success": True, "updated": saved_count}
 
 
 @app.post("/admin/api/channels/reorder")
-async def api_reorder_channel(request: Request, auth: Optional[str] = Depends(admin_auth)):
-    """Reorder a channel within its group (swap with neighbor).
-    Uses name as tiebreaker when sort_orders are equal."""
+async def api_reorder_channel(request: Request, auth: Optional[str] = Depends(require_admin)):
+    """Reorder a channel within its group (swap with neighbor)."""
     body = await request.json()
     lid = body.get("lid")
     direction = body.get("direction", "up")
@@ -1193,7 +1421,6 @@ async def api_reorder_channel(request: Request, auth: Optional[str] = Depends(ad
     conn = get_db()
     c = conn.cursor()
 
-    # Get the channel (include name for tiebreaker)
     c.execute("SELECT lid, cid, sort_order, name FROM channels WHERE lid=?", (lid,))
     ch = c.fetchone()
     if not ch:
@@ -1205,33 +1432,15 @@ async def api_reorder_channel(request: Request, auth: Optional[str] = Depends(ad
     ch_name = ch["name"]
 
     if direction == "up":
-        # Find the channel just above in the same group
-        # Use name as tiebreaker when sort_orders are equal
-        c.execute("""
-            SELECT lid, sort_order FROM channels
-            WHERE cid=? AND lid != ? AND (
-                sort_order < ? OR
-                (sort_order = ? AND name < ?)
-            )
-            ORDER BY sort_order DESC, name DESC LIMIT 1
-        """, (ch_cid, lid, ch_sort, ch_sort, ch_name))
+        c.execute("""SELECT lid, sort_order FROM channels WHERE cid=? AND lid != ? AND (sort_order < ? OR (sort_order = ? AND name < ?)) ORDER BY sort_order DESC, name DESC LIMIT 1""", (ch_cid, lid, ch_sort, ch_sort, ch_name))
     else:
-        # Find the channel just below
-        c.execute("""
-            SELECT lid, sort_order FROM channels
-            WHERE cid=? AND lid != ? AND (
-                sort_order > ? OR
-                (sort_order = ? AND name > ?)
-            )
-            ORDER BY sort_order ASC, name ASC LIMIT 1
-        """, (ch_cid, lid, ch_sort, ch_sort, ch_name))
+        c.execute("""SELECT lid, sort_order FROM channels WHERE cid=? AND lid != ? AND (sort_order > ? OR (sort_order = ? AND name > ?)) ORDER BY sort_order ASC, name ASC LIMIT 1""", (ch_cid, lid, ch_sort, ch_sort, ch_name))
 
     neighbor = c.fetchone()
     if not neighbor:
         conn.close()
         return {"success": True, "swapped": False}
 
-    # Swap sort_orders
     try:
         c.execute("BEGIN")
         c.execute("UPDATE channels SET sort_order=? WHERE lid=?", (neighbor["sort_order"], lid))
@@ -1247,8 +1456,8 @@ async def api_reorder_channel(request: Request, auth: Optional[str] = Depends(ad
 
 
 @app.post("/admin/api/channels/move")
-async def api_move_channel(request: Request, auth: Optional[str] = Depends(admin_auth)):
-    """Move a channel to a specific position (drag & drop target)."""
+async def api_move_channel(request: Request, auth: Optional[str] = Depends(require_admin)):
+    """Move a channel to a specific position (drag & drop)."""
     body = await request.json()
     lid = body.get("lid")
     target_lid = body.get("target_lid")
@@ -1259,14 +1468,12 @@ async def api_move_channel(request: Request, auth: Optional[str] = Depends(admin
     conn = get_db()
     c = conn.cursor()
 
-    # Get source channel
     c.execute("SELECT lid, cid, sort_order FROM channels WHERE lid=?", (lid,))
     src = c.fetchone()
     if not src:
         conn.close()
         raise HTTPException(status_code=404, detail="Source channel not found")
 
-    # Get target channel
     c.execute("SELECT lid, cid, sort_order FROM channels WHERE lid=?", (target_lid,))
     tgt = c.fetchone()
     if not tgt:
@@ -1276,24 +1483,14 @@ async def api_move_channel(request: Request, auth: Optional[str] = Depends(admin
     src_cid = src["cid"]
     tgt_cid = tgt["cid"]
 
-    # If different groups, just reassign (assign handles grp name)
     if src_cid != tgt_cid:
         try:
             c.execute("BEGIN")
-            # Look up target group name
             c.execute("SELECT name FROM categories WHERE cid=?", (tgt_cid,))
             cat_row = c.fetchone()
             target_grp = cat_row["name"] if cat_row else ""
-
-            # Get all sort_orders in target group, find insert position
-            c.execute("SELECT sort_order FROM channels WHERE cid=? ORDER BY sort_order", (tgt_cid,))
-            orders = [r["sort_order"] for r in c.fetchall()]
             target_order = tgt["sort_order"]
-
-            # Shift everything at or after target position down by 1
             c.execute("UPDATE channels SET sort_order=sort_order+1 WHERE cid=? AND sort_order>=?", (tgt_cid, target_order))
-
-            # Set the moved channel's position
             c.execute("UPDATE channels SET cid=?, grp=?, sort_order=? WHERE lid=?", (tgt_cid, target_grp, target_order, lid))
             conn.commit()
         except Exception as e:
@@ -1303,7 +1500,6 @@ async def api_move_channel(request: Request, auth: Optional[str] = Depends(admin
         conn.close()
         return {"success": True, "new_group": tgt_cid}
     else:
-        # Same group: reorder by swapping sort_orders
         try:
             c.execute("BEGIN")
             c.execute("UPDATE channels SET sort_order=? WHERE lid=?", (tgt["sort_order"], lid))
@@ -1318,17 +1514,15 @@ async def api_move_channel(request: Request, auth: Optional[str] = Depends(admin
 
 
 @app.post("/admin/api/channels/ungroup")
-async def api_ungroup_channels(request: Request, auth: Optional[str] = Depends(admin_auth)):
-    """Remove channels from their group (set to ungrouped)."""
+async def api_ungroup_channels(request: Request, auth: Optional[str] = Depends(require_admin)):
+    """Remove channels from their group."""
     body = await request.json()
     lids = body.get("lids", [])
-
     if not lids or not isinstance(lids, list) or len(lids) == 0:
         raise HTTPException(status_code=400, detail="lids array required")
 
     conn = get_db()
     c = conn.cursor()
-
     try:
         c.execute("BEGIN")
         for lid in lids:
@@ -1339,29 +1533,22 @@ async def api_ungroup_channels(request: Request, auth: Optional[str] = Depends(a
         conn.close()
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
-    # Verify
     c.execute("SELECT COUNT(*) as cnt FROM channels WHERE cid=0 AND lid IN ({})".format(
         ",".join("?" * len(lids))), list(lids))
     saved_count = c.fetchone()["cnt"]
     conn.close()
-
     return {"success": True, "ungrouped": saved_count}
 
 
 @app.post("/admin/api/channels/normalize")
-async def api_normalize_sort(auth: Optional[str] = Depends(admin_auth)):
-    """Normalize sort_orders so every channel has a unique sequential order within its group.
-    Fixes the root cause where all channels in a group had identical sort_order values."""
+async def api_normalize_sort(auth: Optional[str] = Depends(require_admin)):
+    """Normalize sort_orders."""
     conn = get_db()
     c = conn.cursor()
-
-    # Get all channels grouped by cid, ordered by name for stable ordering
     c.execute("SELECT lid, cid FROM channels ORDER BY cid, sort_order, name")
     rows = c.fetchall()
-
     current_cid = None
     order = 0
-    updated = 0
     c.execute("BEGIN")
     for row in rows:
         if row["cid"] != current_cid:
@@ -1369,17 +1556,14 @@ async def api_normalize_sort(auth: Optional[str] = Depends(admin_auth)):
             order = 1
         c.execute("UPDATE channels SET sort_order=? WHERE lid=?", (order, row["lid"]))
         order += 1
-        updated += 1
     conn.commit()
     conn.close()
-
-    return {"success": True, "normalized": updated}
+    return {"success": True, "normalized": len(rows)}
 
 
 @app.post("/admin/api/refresh")
-async def api_refresh_channels(auth: Optional[str] = Depends(admin_auth)):
+async def api_refresh_channels(auth: Optional[str] = Depends(require_admin)):
     """Manually trigger a re-fetch of channels from Vavoo API."""
-    # Check if a startup/refresh is already running
     if not state.STARTUP_LOCK.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="A refresh is already in progress")
 
@@ -1388,106 +1572,72 @@ async def api_refresh_channels(auth: Optional[str] = Depends(admin_auth)):
         state.STARTUP_DONE = False
         state.STARTUP_ERROR = None
 
-        # Run async startup core in a new event loop
         import asyncio
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            fetch_ok = loop.run_until_complete(async_startup_core_for_refresh())
+            # Import server functions
+            import server
+            server.init_db()
+
+            # Get signatures
+            lokke = state.get_watchedsig()
+            vavoo = state.get_auth_signature(force=True)
+
+            # Fetch channels
+            channels = await server.async_fetch_vavoo_channels()
+
+            fetch_ok = False
+            if channels:
+                import sqlite3 as sqlite3_mod
+                conn = sqlite3_mod.connect(state.DB_PATH)
+                c = conn.cursor()
+                c.execute("DELETE FROM channels")
+                for ch in channels:
+                    country = state.detect_country(ch)
+                    if country not in ("TR", "DE", "BOTH"):
+                        continue
+                    name = ch.get("name", "Unknown")
+                    url = ch.get("url", "")
+                    logo = ch.get("logo", "")
+                    group = ch.get("group", "")
+                    grp = state.remap_group(name, group)
+                    ch_id = 0
+                    m = re.search(r'/play\d+/(\d+)\.m3u8', url)
+                    if m:
+                        ch_id = int(m.group(1))
+                    if ch_id == 0:
+                        ch_id = abs(hash(name)) % 9999999
+                    final_country = country if country != "BOTH" else "TR"
+                    clean = state.clean_name(name)
+                    c.execute("INSERT OR REPLACE INTO channels(lid,name,grp,cid,logo,url,hls,sort_order,country,clean_name) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                              (ch_id, name, grp, 0, logo, url, "", 9999, final_country, clean))
+                conn.commit()
+                conn.close()
+                fetch_ok = True
+
+            # Fetch HLS links
+            if fetch_ok:
+                await server.async_fetch_hls_links()
+
+            # Remap groups
+            if fetch_ok:
+                server.remap_groups()
+
         finally:
             loop.close()
 
-        state.LAST_REFRESH = time.time()
+        state.LAST_REFRESH = time_module.time()
         channel_count = state.count_db_channels()
 
-        if fetch_ok:
-            return JSONResponse(content={
-                "success": True,
-                "message": f"Refresh complete. {channel_count} channels in DB.",
-                "channel_count": channel_count,
-            })
-        else:
-            db_count = state.count_db_channels()
-            state.LAST_REFRESH = time.time()
-            if db_count > 0:
-                return JSONResponse(content={
-                    "success": True,
-                    "message": f"Fetch failed but DB has {db_count} channels from previous run.",
-                    "channel_count": db_count,
-                    "fetch_ok": False,
-                })
-            else:
-                return JSONResponse(content={
-                    "success": False,
-                    "message": "Fetch failed and DB is empty.",
-                    "channel_count": 0,
-                    "fetch_ok": False,
-                }, status_code=500)
+        return JSONResponse(content={
+            "success": True,
+            "message": f"Refresh complete. {channel_count} channels.",
+            "channel_count": channel_count,
+        })
     except Exception as e:
         state.STARTUP_ERROR = str(e)
         raise HTTPException(status_code=500, detail=f"Refresh error: {e}")
     finally:
         state.STARTUP_LOCK.release()
         state.STARTUP_DONE = True
-
-
-async def async_startup_core_for_refresh():
-    """Same as async_startup_core in server.py but called from admin refresh endpoint."""
-    import server
-    server.init_db()
-
-    state.slog("[refresh] Lokke imzasi...")
-    lokke = state.get_watchedsig()
-    state.slog(f"[refresh] Lokke={'OK' if lokke else 'BASARISIZ'}")
-
-    state.slog("[refresh] Vavoo token...")
-    vavoo = state.get_auth_signature(force=True)
-
-    # Fetch channels async
-    channels = await server.async_fetch_vavoo_channels()
-
-    if channels:
-        # Filter and save
-        import sqlite3
-        conn = sqlite3.connect(state.DB_PATH)
-        c = conn.cursor()
-        c.execute("DELETE FROM channels")
-        for ch in channels:
-            country = state.detect_country(ch)
-            if country not in ("TR", "DE", "BOTH"):
-                continue
-
-            name = ch.get("name", "Unknown")
-            url = ch.get("url", "")
-            logo = ch.get("logo", "")
-            group = ch.get("group", "")
-            grp = state.remap_group(name, group)
-            ch_id = 0
-
-            m = re.search(r'/play\d+/(\d+)\.m3u8', url)
-            if m:
-                ch_id = int(m.group(1))
-            if ch_id == 0:
-                ch_id = abs(hash(name)) % 9999999
-
-            final_country = country if country != "BOTH" else "TR"
-            clean = state.clean_name(name)
-
-            c.execute(
-                "INSERT OR REPLACE INTO channels(lid,name,grp,cid,logo,url,hls,sort_order,country,clean_name) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (ch_id, name, grp, 0, logo, url, "", 9999, final_country, clean)
-            )
-
-        conn.commit()
-        conn.close()
-        state.slog(f"[refresh] Kanallar kaydedildi")
-
-        # Fetch HLS links
-        await server.async_fetch_hls_links()
-
-        # Remap groups
-        server.remap_groups()
-
-        return True
-    else:
-        return state.count_db_channels() > 0

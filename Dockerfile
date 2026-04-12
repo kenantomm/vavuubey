@@ -9,6 +9,6 @@ COPY . .
 EXPOSE 7860
 
 ENV PORT=7860
-ENV DB_PATH=/data/vxparser.db
+ENV DB_PATH=/data/vavuubey.db
 
 CMD ["python", "server.py"]
