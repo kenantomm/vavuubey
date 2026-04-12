@@ -1,1208 +1,1229 @@
-from fastapi import FastAPI, Request, Depends, HTTPException
-from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse, Response, HTMLResponse
-from fastapi.routing import APIRoute
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-import state
-import httpx
-import time
+"""
+video.py - VxParser FastAPI application
+Streaming endpoints + Admin Panel
+"""
 import os
+import re
+import io
+import csv
+import sqlite3
 import secrets
+from contextlib import asynccontextmanager
+from typing import Optional
 
-app = FastAPI(title="Omer")
+from fastapi import FastAPI, Request, Response, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse, PlainTextResponse, HTMLResponse, RedirectResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi.staticfiles import StaticFiles
 
-# Admin protection via HTTP Basic Auth (set via env vars ADMIN_USER + ADMIN_PASS)
-ADMIN_USER = os.environ.get("ADMIN_USER", "")
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "")
+import state
 
-security = HTTPBasic()
+# ============================================================
+# FASTAPI APP
+# ============================================================
+app = FastAPI(title="VxParser", docs_url=None, redoc_url=None)
 
-def verify_admin(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
-    """Verify admin credentials via HTTP Basic Auth. If no ADMIN_USER/ADMIN_PASS set, allow all."""
-    if not ADMIN_USER and not ADMIN_PASS:
-        return True
-    correct_user = secrets.compare_digest(credentials.username or "", ADMIN_USER)
-    correct_pass = secrets.compare_digest(credentials.password or "", ADMIN_PASS)
-    if not (correct_user and correct_pass):
-        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
-    return True
 
-VAVOO_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Referer": "https://vavoo.to/",
-    "Origin": "https://vavoo.to",
-    "Accept": "*/*",
-}
+# ============================================================
+# DATABASE HELPER
+# ============================================================
+def get_db():
+    """Get a database connection with row_factory."""
+    conn = sqlite3.connect(state.DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
 
-def detect_host(request: Request) -> str:
-    forwarded = request.headers.get("X-Forwarded-Proto", "https")
-    host = request.headers.get("Host", request.url.hostname or "localhost")
-    return f"{forwarded}://{host}"
 
+# ============================================================
+# M3U BUILDER
+# ============================================================
 def build_m3u(host: str) -> str:
-    """Build M3U playlist with tvg-id, tvg-logo, tvg-name"""
+    """Build M3U playlist from DB with proper group ordering."""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("""
+        SELECT ch.lid, ch.name, ch.url, ch.hls, ch.logo, ch.grp, ch.sort_order
+        FROM channels ch
+        LEFT JOIN categories cat ON ch.cid = cat.cid
+        ORDER BY COALESCE(cat.sort_order, 9999), ch.sort_order, ch.name
+    """)
+    channels = [dict(r) for r in c.fetchall()]
+    conn.close()
+
     lines = ['#EXTM3U url-tvg="" deinterlace="1"']
-    channels = state.get_all_channels(ordered=True)
     for ch in channels:
-        ch_id = ch["id"]
-        ch_name = ch["name"]
-        ch_grp = ch["grp"]
-        ch_logo = ch.get("picon", "") or ch.get("logo", "")
-        ch_tvg_id = ch.get("tvg_id", "")
-        
-        attrs = []
-        if ch_tvg_id:
-            attrs.append(f'tvg-id="{ch_tvg_id}"')
-        if ch_logo:
-            attrs.append(f'tvg-logo="{ch_logo}"')
-        attrs.append(f'group-title="{ch_grp}"')
-        
-        attr_str = " ".join(attrs)
-        lines.append(f'#EXTINF:-1 {attr_str},{ch_name}')
-        lines.append(f'{host}/channel/{ch_id}')
+        logo_param = f' tvg-logo="{ch["logo"]}"' if ch.get("logo") else ""
+        grp = ch.get("grp") or ""
+        lines.append(f'#EXTINF:-1 group-title="{grp}"{logo_param},{ch["name"]}')
+        lines.append(f'{host}/channel/{ch["lid"]}')
     return "\n".join(lines)
 
+
+# ============================================================
+# BASIC AUTH (for /admin routes)
+# ============================================================
+async def admin_auth(request: Request) -> Optional[str]:
+    """Check basic auth if ADMIN_USER/ADMIN_PASS are set."""
+    user = os.environ.get("ADMIN_USER", "")
+    pw = os.environ.get("ADMIN_PASS", "")
+    if not user or not pw:
+        return None  # No auth required
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Basic "):
+        import base64
+        try:
+            decoded = base64.b64decode(auth[6:]).decode("utf-8")
+            if decoded == f"{user}:{pw}":
+                return None
+        except Exception:
+            pass
+    raise HTTPException(status_code=401, headers={"WWW-Authenticate": 'Basic realm="VxParser Admin"'})
+
+
+# ============================================================
+# STREAMING ENDPOINTS
+# ============================================================
+@app.get("/")
+async def index():
+    if not state.DATA_READY:
+        return PlainTextResponse("VxParser is starting up...", status_code=503)
+    return PlainTextResponse("VxParser is running. /admin for management.")
+
+
 @app.get("/get.php")
-async def get_m3u(request: Request, username: str = "", password: str = "", type: str = "m3u_plus"):
-    host = detect_host(request)
-    return PlainTextResponse(build_m3u(host), media_type="audio/x-mpegurl")
+async def get_m3u(request: Request):
+    if not state.DATA_READY:
+        return PlainTextResponse("#EXTM3U\n# VxParser is starting...", status_code=503)
+    host = str(request.base_url).rstrip("/")
+    m3u = build_m3u(host)
+    return PlainTextResponse(m3u, media_type="application/x-mpegurl")
+
 
 @app.get("/player_api.php")
-async def player_api(request: Request, username: str = "", password: str = "", action: str = ""):
-    host = detect_host(request)
-    if action == "get_live_categories":
-        groups = {}
-        for ch in state.get_all_channels(ordered=True):
-            groups[ch["grp"]] = groups.get(ch["grp"], 0) + 1
-        return JSONResponse([{"category_id": str(i+1), "category_name": g, "parent_id": 0} for i, g in enumerate(groups.keys())])
-    elif action == "get_live_streams":
-        return JSONResponse([{
-            "num": i+1,
-            "name": ch["name"],
-            "stream_type": "live",
-            "stream_id": ch["id"],
-            "stream_icon": ch.get("picon", "") or ch.get("logo", ""),
-            "epg_channel_id": ch.get("tvg_id", ""),
-            "added": "",
-            "category_id": "",
-            "custom_sid": "",
-            "tv_archive": 0,
-            "direct_source": "",
-            "tv_archive_duration": 0
-        } for i, ch in enumerate(state.get_all_channels(ordered=True))])
-    return PlainTextResponse(build_m3u(host), media_type="audio/x-mpegurl")
+async def player_api(request: Request, action: str = Query("")):
+    if not state.DATA_READY:
+        return PlainTextResponse("VxParser is starting up...", status_code=503)
+    host = str(request.base_url).rstrip("/")
+    if action == "get_live_streams":
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("""
+            SELECT ch.lid, ch.name, ch.grp, ch.logo, ch.sort_order
+            FROM channels ch
+            LEFT JOIN categories cat ON ch.cid = cat.cid
+            ORDER BY COALESCE(cat.sort_order, 9999), ch.sort_order, ch.name
+        """)
+        streams = []
+        for r in c.fetchall():
+            streams.append({
+                "num": r["lid"],
+                "name": r["name"],
+                "group": r["grp"] or "",
+                "logo": r["logo"] or "",
+                "stream_type": "live",
+                "stream_id": r["lid"],
+            })
+        conn.close()
+        return {"streams": streams}
+    elif action == "get_live_categories":
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT cid, name, sort_order FROM categories ORDER BY sort_order")
+        cats = []
+        for r in c.fetchall():
+            c2 = conn.cursor()
+            c2.execute("SELECT COUNT(*) as cnt FROM channels WHERE cid=?", (r["cid"],))
+            cnt = c2.fetchone()["cnt"]
+            cats.append({"category_id": r["cid"], "category_name": r["name"], "parent_id": 0})
+        conn.close()
+        return {"categories": cats}
+    elif action == "":
+        return PlainTextResponse(build_m3u(host), media_type="application/x-mpegurl")
+    return PlainTextResponse("Unknown action", status_code=400)
 
-# ===== EPG Endpoints =====
 
-@app.get("/epg.xml")
-async def get_epg_xml():
-    """Serve EPG XML file"""
+@app.get("/channel/{lid}")
+async def channel_stream(lid: int, request: Request):
+    """Proxy channel stream with HLS rewriting."""
+    if not state.DATA_READY:
+        return PlainTextResponse("VxParser is starting up...", status_code=503)
+
+    resolved_url, log_msg = state.resolve_channel(lid)
+    if not resolved_url:
+        return PlainTextResponse(f"Channel {lid} not resolvable: {log_msg}", status_code=404)
+
+    import requests
+    host = str(request.base_url).rstrip("/")
+    headers_req = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "*/*",
+    }
+
     try:
-        import epg
-        xml_str = epg.get_cached_epg_xml()
-        if xml_str:
-            return PlainTextResponse(xml_str, media_type="application/xml; charset=utf-8")
+        resp = requests.get(resolved_url, headers=headers_req, stream=True, timeout=15, verify=False)
     except Exception as e:
-        state.add_log(f"EPG XML serve error: {e}")
-    return PlainTextResponse('<?xml version="1.0" encoding="utf-8"?><tv></tv>', media_type="application/xml; charset=utf-8")
+        return PlainTextResponse(f"Stream error: {e}", status_code=502)
 
-@app.get("/epg.xml.gz")
-async def get_epg_gz():
-    """Serve gzipped EPG XML"""
-    try:
-        import epg
-        gz_data = epg.get_cached_epg_gz()
-        if gz_data:
-            return Response(content=gz_data, media_type="application/x-gzip",
-                          headers={"Content-Disposition": "attachment; filename=epg.xml.gz"})
-    except Exception as e:
-        state.add_log(f"EPG GZ serve error: {e}")
-    import gzip
-    empty = gzip.compress(b'<?xml version="1.0" encoding="utf-8"?><tv></tv>')
-    return Response(content=empty, media_type="application/x-gzip")
+    content_type = resp.headers.get("Content-Type", "video/mp4")
 
-@app.get("/xmltv.xml")
-async def get_xmltv():
-    """Serve XMLTV format EPG (alias for epg.xml)"""
-    return await get_epg_xml()
+    if "mpegURL" in content_type or "x-mpegurl" in content_type or "m3u8" in content_type:
+        # HLS manifest - rewrite URLs
+        body = resp.text
+        base_url = resolved_url.rsplit("/", 1)[0] if "/" in resolved_url else resolved_url
 
-# ===== Picon Proxy Endpoint =====
+        def rewrite_url(match):
+            url = match.group(0)
+            if url.startswith("http"):
+                return f"{host}/channel/{lid}/stream?url={url}"
+            else:
+                full = base_url + "/" + url
+                return f"{host}/channel/{lid}/stream?url={full}"
 
-@app.get("/picon/{ch_name:path}")
-async def get_picon(ch_name: str):
-    """Proxy picon images to avoid CORS and mixed content issues"""
-    try:
-        channels = state.get_all_channels(ordered=False)
-        for ch in channels:
-            ch_norm = ch["name"].upper().strip()
-            req_norm = ch_name.upper().strip().replace("_", " ").replace("-", " ")
-            if ch_norm == req_norm or ch_norm in req_norm or req_norm in ch_norm:
-                picon_url = ch.get("picon", "") or ch.get("logo", "")
-                if picon_url:
-                    async with httpx.AsyncClient(timeout=10, verify=False) as client:
-                        r = await client.get(picon_url, follow_redirects=True)
-                        if r.status_code == 200:
-                            ct = r.headers.get("content-type", "image/png")
-                            return Response(content=r.content, media_type=ct)
-                break
-    except Exception:
-        pass
-    import base64
-    tiny_png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPj/HwADBwIAMCbHYQAAAABJRU5ErkJggg==")
-    return Response(content=tiny_png, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+        body = re.sub(r'https?://[^\s"]+|[^#\n\r][^\n\r]*', rewrite_url, body)
+        return PlainTextResponse(body, media_type="application/vnd.apple.mpegurl")
+    else:
+        # Direct stream - proxy
+        def stream_gen():
+            try:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        yield chunk
+            except Exception:
+                pass
+        return StreamingResponse(stream_gen(), media_type=content_type)
 
-# ===== Channel Stream Endpoints =====
 
-@app.get("/channel/{ch_id}")
-async def channel_stream(ch_id: int):
-    """Resolve channel stream and proxy it"""
-    ch = state.get_channel(ch_id)
-    if not ch:
-        return JSONResponse({"error": "Not found"}, status_code=404)
-
-    cache_key = str(ch_id)
-    if cache_key in state.RESOLVE_CACHE:
-        cached = state.RESOLVE_CACHE[cache_key]
-        if cached.get("expires", 0) > time.time():
-            return await proxy_stream(cached["url"], ch_id)
-
-    hls = ch.get("hls", "")
-    if hls:
-        state.add_log(f"[{ch_id}] Catalog HLS resolve: {hls[:80]}")
-        resolved = await state.resolve_mediahubmx(hls)
-        if resolved:
-            state.RESOLVE_CACHE[cache_key] = {"url": resolved, "expires": time.time() + 300}
-            return await proxy_stream(resolved, ch_id)
-
-    url = ch.get("url", "")
-    if url:
-        resolved = await state.resolve_mediahubmx(url)
-        if resolved:
-            state.RESOLVE_CACHE[cache_key] = {"url": resolved, "expires": time.time() + 300}
-            return await proxy_stream(resolved, ch_id)
-
-    if url:
-        return await proxy_stream(url, ch_id)
-
-    return JSONResponse({"error": "Could not resolve stream"}, status_code=502)
-
-async def proxy_stream(url, ch_id):
-    """Fetch and proxy a stream URL with rewriting for HLS"""
-    try:
-        async with httpx.AsyncClient(timeout=20, verify=False, follow_redirects=True) as client:
-            r = await client.get(url, headers=VAVOO_HEADERS)
-            if r.status_code != 200:
-                return JSONResponse({"error": f"upstream {r.status_code}", "url": url, "body": r.text[:200]}, status_code=502)
-            
-            content_type = r.headers.get("content-type", "")
-            text = r.text
-            base = url.rsplit("/", 1)[0] + "/"
-
-            def rewrite(line):
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    return line
-                if line.startswith("http"):
-                    return f"/channel/{ch_id}/stream?url={line}"
-                else:
-                    abs_url = base + line if not line.startswith("/") else f"https://vavoo.to{line}"
-                    return f"/channel/{ch_id}/stream?url={abs_url}"
-
-            lines = text.split("\n")
-            rewritten = "\n".join(rewrite(l) for l in lines)
-            return PlainTextResponse(rewritten, media_type="application/vnd.apple.mpegurl")
-    except httpx.TimeoutException:
-        return JSONResponse({"error": "timeout"}, status_code=504)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-@app.get("/channel/{ch_id}/stream")
-async def channel_substream(ch_id: int, url: str):
+@app.get("/channel/{lid}/stream")
+async def channel_sub_stream(lid: int, url: str = Query("")):
+    """Proxy sub-stream (HLS segments, etc.)."""
     if not url:
-        return JSONResponse({"error": "no url"}, status_code=400)
+        return PlainTextResponse("No URL provided", status_code=400)
+
+    import requests
+    headers_req = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "*/*",
+        "Referer": url.rsplit("/", 1)[0] if "/" in url else url,
+    }
+
     try:
-        async with httpx.AsyncClient(timeout=20, verify=False, follow_redirects=True) as client:
-            r = await client.get(url, headers=VAVOO_HEADERS)
-            if r.status_code != 200:
-                return JSONResponse({"error": f"upstream {r.status_code}"}, status_code=502)
-            content_type = r.headers.get("content-type", "")
-            if "mpegurl" in content_type or ".m3u8" in url:
-                text = r.text
-                base = url.rsplit("/", 1)[0] + "/"
-                def rewrite(line):
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        return line
-                    if line.startswith("http"):
-                        return f"/channel/{ch_id}/stream?url={line}"
-                    else:
-                        abs_url = base + line if not line.startswith("/") else f"https://vavoo.to{line}"
-                        return f"/channel/{ch_id}/stream?url={abs_url}"
-                lines = text.split("\n")
-                rewritten = "\n".join(rewrite(l) for l in lines)
-                return PlainTextResponse(rewritten, media_type="application/vnd.apple.mpegurl")
-            return StreamingResponse(iter([r.content]), media_type=content_type or "video/MP2T", headers={"Content-Length": str(len(r.content))})
-    except httpx.TimeoutException:
-        return JSONResponse({"error": "timeout"}, status_code=504)
+        resp = requests.get(url, headers=headers_req, stream=True, timeout=15, verify=False)
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return PlainTextResponse(f"Stream error: {e}", status_code=502)
 
-# ===== Utility Endpoints =====
+    content_type = resp.headers.get("Content-Type", "video/mp4")
 
-def add_log(msg):
-    state.add_log(msg)
+    if "mpegURL" in content_type or "x-mpegurl" in content_type or "m3u8" in content_type:
+        body = resp.text
+        base_url = url.rsplit("/", 1)[0] if "/" in url else url
+        host_base = ""
 
-@app.get("/ping")
-@app.head("/ping")
-async def ping():
-    """Lightweight health check for UptimeRobot/cron-job - returns 200 OK"""
-    return PlainTextResponse("pong", status_code=200, media_type="text/plain")
+        def rewrite_url(match):
+            u = match.group(0)
+            if u.startswith("http"):
+                return f"/channel/{lid}/stream?url={u}"
+            else:
+                full = base_url + "/" + u
+                return f"/channel/{lid}/stream?url={full}"
 
-@app.get("/")
-async def root(request: Request):
-    host = detect_host(request)
-    return PlainTextResponse(
-        f"Omer Online\n"
-    )
+        body = re.sub(r'https?://[^\s"]+|[^#\n\r][^\n\r]*', rewrite_url, body)
+        return PlainTextResponse(body, media_type="application/vnd.apple.mpegurl")
+    else:
+        def stream_gen():
+            try:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        yield chunk
+            except Exception:
+                pass
+        return StreamingResponse(stream_gen(), media_type=content_type)
 
-# ===== robots.txt =====
 
-@app.get("/robots.txt")
-async def robots_txt():
-    return PlainTextResponse("User-agent: *\nDisallow: /\n", media_type="text/plain")
-
-# ===== Admin Panel =====
-
-ALL_GROUPS = [
-    "TR ULUSAL", "TR SPOR", "TR SINEMA", "TR SINEMA VOD", "TR DIZI", "TR 7/24 DIZI",
-    "TR BELGESEL", "TR COCUK", "TR MUZIK", "TR HABER", "TR DINI", "TR YEREL",
-    "TR RADYO", "TR 4K", "TR 8K", "TR RAW",
-    "DE VOLLPROGRAMM", "DE NACHRICHTEN", "DE DOKU", "DE KINDER", "DE FILM",
-    "DE MUSIK", "DE SPORT", "DE SONSTIGE",
-]
-
-@app.get("/admin")
-async def admin_page(request: Request, auth: bool = Depends(verify_admin)):
-    return HTMLResponse(ADMIN_HTML)
-
-@app.get("/api/admin/channels")
-async def admin_get_channels(request: Request, auth: bool = Depends(verify_admin)):
-    channels = state.get_all_channels(ordered=True)
-    overrides = state.get_all_overrides()
-    return JSONResponse([{
-        "name": c["name"], "grp": c["grp"], "country": c["country"],
-        "id": c["id"], "logo": c.get("picon", "") or c.get("logo", ""),
-        "has_override": c["name"].upper().strip() in overrides
-    } for c in channels])
-
-@app.get("/api/admin/overrides")
-async def admin_get_overrides(request: Request, auth: bool = Depends(verify_admin)):
-    return JSONResponse(state.get_all_overrides())
-
-@app.post("/api/admin/overrides")
-async def admin_save_overrides(request: Request, auth: bool = Depends(verify_admin)):
-    data = await request.json()
-    if not isinstance(data, dict):
-        return JSONResponse({"error": "dict expected"}, status_code=400)
-    count = state.batch_set_overrides(data)
-    return JSONResponse({"ok": True, "count": count})
-
-@app.delete("/api/admin/overrides")
-async def admin_clear_overrides(request: Request, auth: bool = Depends(verify_admin)):
-    state.delete_all_overrides()
-    return JSONResponse({"ok": True})
-
-@app.get("/api/admin/overrides/export")
-async def admin_export_overrides(request: Request, auth: bool = Depends(verify_admin)):
-    overrides = state.get_all_overrides()
-    import json
-    text = json.dumps(overrides, indent=2, ensure_ascii=False)
-    return PlainTextResponse(text, media_type="application/json",
-                             headers={"Content-Disposition": "attachment; filename=omer-overrides.json"})
-
-@app.post("/api/admin/overrides/import")
-async def admin_import_overrides(request: Request, auth: bool = Depends(verify_admin)):
-    data = await request.json()
-    if not isinstance(data, dict):
-        return JSONResponse({"error": "dict expected"}, status_code=400)
-    count = state.import_overrides(data)
-    return JSONResponse({"ok": True, "imported": count})
-
-@app.post("/api/admin/reorder")
-async def admin_reorder(request: Request, auth: bool = Depends(verify_admin)):
-    data = await request.json()
-    channel_name = data.get("channel", "")
-    direction = data.get("direction", "")
-    if not channel_name or direction not in ("up", "down"):
-        return JSONResponse({"error": "channel and direction required"}, status_code=400)
-    success, msg = state.reorder_channel(channel_name, direction)
-    if success:
-        return JSONResponse({"ok": True, "message": msg})
-    return JSONResponse({"ok": False, "message": msg}, status_code=400)
-
-@app.post("/api/admin/reorder-to")
-async def admin_reorder_to(request: Request, auth: bool = Depends(verify_admin)):
-    """Move a channel to a specific position index within its group (for drag-to-reorder)"""
-    data = await request.json()
-    channel_name = data.get("channel", "")
-    target_index = data.get("target_index", -1)
-    if not channel_name or target_index < 0:
-        return JSONResponse({"error": "channel and target_index required"}, status_code=400)
-    success, msg = state.reorder_channel_to_position(channel_name, target_index)
-    if success:
-        return JSONResponse({"ok": True, "message": msg})
-    return JSONResponse({"ok": False, "message": msg}, status_code=400)
-
-ADMIN_HTML = r"""<!DOCTYPE html>
-<html lang="tr">
+# ============================================================
+# ADMIN PANEL HTML
+# ============================================================
+ADMIN_HTML = r'''<!DOCTYPE html>
+<html lang="en">
 <head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex, nofollow, noarchive">
-<title>Omer Admin</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex,nofollow">
+<title>VxParser Admin</title>
 <style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#0a0e17;--bg2:#111827;--bg3:#1a2236;--bg4:#232d42;
-  --border:#2a3550;--border2:#3a4a6b;
-  --text:#e2e8f0;--text2:#94a3b8;--text3:#64748b;
-  --blue:#3b82f6;--blue2:#2563eb;--blue-bg:rgba(59,130,246,.1);
-  --green:#22c55e;--green-bg:rgba(34,197,94,.1);
-  --red:#ef4444;--red-bg:rgba(239,68,68,.1);
-  --yellow:#f59e0b;--yellow-bg:rgba(245,158,11,.1);
-  --purple:#a855f7;--purple-bg:rgba(168,85,247,.1);
-  --sidebar-w:280px;
+  --bg:#0f1117;--sidebar:#1a1d27;--card:#1e2233;--primary:#4f8cff;
+  --success:#22c55e;--warning:#f59e0b;--danger:#ef4444;
+  --text:#e2e8f0;--muted:#94a3b8;--border:#2d3348;
+  --hover:#252a3a;--input-bg:#151822;
 }
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow:hidden}
+html,body{height:100%;font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);overflow:hidden}
 .app{display:flex;height:100vh}
-.sidebar{width:var(--sidebar-w);min-width:var(--sidebar-w);background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;height:100vh;overflow:hidden;transition:transform .3s}
+
+/* Sidebar */
+.sidebar{width:280px;min-width:280px;background:var(--sidebar);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+.sidebar-header{padding:20px 16px 12px;border-bottom:1px solid var(--border)}
+.sidebar-header h1{font-size:18px;font-weight:700;display:flex;align-items:center;gap:8px}
+.sidebar-header h1 .dot{width:8px;height:8px;border-radius:50%;background:var(--success);display:inline-block}
+.sidebar-header .subtitle{font-size:11px;color:var(--muted);margin-top:4px}
+.group-list{flex:1;overflow-y:auto;padding:8px}
+.group-list::-webkit-scrollbar{width:4px}
+.group-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+.group-item{display:flex;align-items:center;padding:9px 12px;border-radius:8px;cursor:pointer;transition:background .15s;gap:8px;margin-bottom:2px;position:relative;user-select:none}
+.group-item:hover{background:var(--hover)}
+.group-item.active{background:var(--primary);color:#fff}
+.group-item.active .g-count{background:rgba(255,255,255,.2);color:#fff}
+.group-item .g-icon{font-size:14px;opacity:.7;width:20px;text-align:center;flex-shrink:0}
+.group-item .g-name{flex:1;font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.group-item .g-count{font-size:11px;background:var(--border);color:var(--muted);padding:1px 7px;border-radius:10px;flex-shrink:0}
+.group-item .g-actions{display:none;gap:2px;flex-shrink:0}
+.group-item:hover .g-actions{display:flex}
+.g-action-btn{background:none;border:none;color:var(--muted);cursor:pointer;padding:2px 5px;border-radius:4px;font-size:12px;transition:all .15s}
+.g-action-btn:hover{color:var(--text);background:rgba(255,255,255,.1)}
+.g-action-btn.delete:hover{color:var(--danger)}
+.sidebar-footer{padding:12px;border-top:1px solid var(--border)}
+.add-group-form{display:flex;gap:6px}
+.add-group-form input{flex:1;background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:6px;font-size:12px;outline:none;transition:border-color .2s}
+.add-group-form input:focus{border-color:var(--primary)}
+.add-group-form button{background:var(--primary);color:#fff;border:none;padding:7px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;transition:opacity .2s;white-space:nowrap}
+.add-group-form button:hover{opacity:.85}
+
+/* Rename input */
+.rename-input{background:var(--input-bg);border:1px solid var(--primary);color:var(--text);padding:2px 6px;border-radius:4px;font-size:13px;outline:none;width:100%}
+
+/* Main content */
 .main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.toolbar{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;flex-shrink:0;flex-wrap:wrap}
+.toolbar .title-area{flex:1;min-width:200px}
+.toolbar .title-area h2{font-size:16px;font-weight:600}
+.toolbar .title-area .channel-count{font-size:12px;color:var(--muted);margin-top:2px}
+.search-box{position:relative;width:260px}
+.search-box input{width:100%;background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:8px 12px 8px 34px;border-radius:8px;font-size:13px;outline:none;transition:border-color .2s}
+.search-box input:focus{border-color:var(--primary)}
+.search-box svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--muted)}
+.bulk-bar{display:none;align-items:center;gap:10px;padding:8px 20px;background:rgba(79,140,255,.08);border-bottom:1px solid rgba(79,140,255,.2);flex-shrink:0}
+.bulk-bar.visible{display:flex}
+.bulk-bar .sel-count{font-size:13px;color:var(--primary);font-weight:600;white-space:nowrap}
+.bulk-bar select{background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:6px;font-size:12px;outline:none;cursor:pointer}
+.bulk-bar .btn{padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:var(--card);color:var(--text);font-size:12px;cursor:pointer;transition:all .15s;font-weight:500}
+.bulk-bar .btn:hover{background:var(--hover)}
+.bulk-bar .btn.btn-primary{background:var(--primary);border-color:var(--primary);color:#fff}
+.bulk-bar .btn.btn-danger{color:var(--danger);border-color:rgba(239,68,68,.3)}
+.bulk-bar .btn.btn-danger:hover{background:rgba(239,68,68,.1)}
 
-/* SIDEBAR */
-.sb-hdr{padding:20px;border-bottom:1px solid var(--border);background:linear-gradient(135deg,var(--bg2),var(--bg3))}
-.sb-hdr h1{font-size:18px;font-weight:700;display:flex;align-items:center;gap:10px}
-.sb-hdr h1 .icon{width:32px;height:32px;background:linear-gradient(135deg,var(--blue),var(--purple));border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;color:#fff}
-.sb-hdr p{font-size:11px;color:var(--text3);margin-top:4px;letter-spacing:.3px}
-
-.sb-search{padding:12px}
-.sb-search .search-box{position:relative}
-.sb-search input{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:9px 12px 9px 36px;border-radius:8px;font-size:13px;outline:none;transition:.2s}
-.sb-search input:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(59,130,246,.15)}
-.sb-search .s-icon{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--text3);font-size:14px;pointer-events:none}
-.sb-search .s-clear{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text3);cursor:pointer;font-size:16px;display:none;padding:2px 4px;border-radius:4px}
-.sb-search .s-clear:hover{color:var(--text);background:var(--bg3)}
-.sb-search input:not(:placeholder-shown)~.s-clear{display:block}
-
-.sb-groups{flex:1;overflow-y:auto;padding:4px 8px 16px}
-.sb-groups::-webkit-scrollbar{width:4px}
-.sb-groups::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
-.sb-section{margin-top:8px}
-.sb-section-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;color:var(--text3);padding:8px 10px 4px;display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none}
-.sb-section-title:hover{color:var(--text2)}
-.sb-section-title .arrow{font-size:8px;transition:transform .2s}
-.sb-section-title.collapsed .arrow{transform:rotate(-90deg)}
-.sb-section-body.collapsed{display:none}
-.grp-item{display:flex;align-items:center;padding:7px 10px;border-radius:6px;cursor:pointer;transition:.15s;gap:8px;font-size:13px;margin:1px 0;position:relative}
-.grp-item:hover{background:var(--bg3)}
-.grp-item.active{background:var(--blue-bg);color:var(--blue);font-weight:600}
-.grp-item .g-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
-.grp-item .g-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.grp-item .g-cnt{font-size:11px;color:var(--text3);background:var(--bg);padding:1px 7px;border-radius:10px;font-weight:600}
-.grp-item.active .g-cnt{background:rgba(59,130,246,.2);color:var(--blue)}
-
-/* DROP TARGET styles */
-.grp-item.drop-target{background:rgba(34,197,94,.15)!important;border:2px dashed var(--green);border-radius:6px;padding:5px 8px}
-.grp-item.drop-target .g-dot{background:var(--green)!important;box-shadow:0 0 8px var(--green)}
-.grp-item.drop-reject{border:2px dashed var(--red)!important;background:rgba(239,68,68,.1)!important}
-
-/* DRAG styles on table rows */
-.ch-dragging{opacity:.4}
-.ch-drag-clone{position:fixed;pointer-events:none;z-index:9999;background:var(--bg3);border:1px solid var(--blue);border-radius:8px;padding:8px 14px;font-size:13px;color:var(--text);box-shadow:0 8px 24px rgba(0,0,0,.5);display:flex;align-items:center;gap:8px;max-width:300px}
-.ch-drag-clone .dc-icon{font-size:16px}
-
-/* ROW DROP INDICATOR - blue line between rows */
-.drop-indicator{height:3px;background:var(--blue);border-radius:2px;margin:-1px 0;box-shadow:0 0 8px var(--blue);pointer-events:none;z-index:5;transition:opacity .1s;animation:dropPulse .8s infinite}
-.drop-indicator::before{content:'';position:absolute;left:0;top:-4px;width:10px;height:10px;background:var(--blue);border-radius:50%}
-.drop-indicator::after{content:'';position:absolute;right:0;top:-4px;width:10px;height:10px;background:var(--blue);border-radius:50%}
-.drop-indicator{position:relative;overflow:visible}
-@keyframes dropPulse{0%,100%{opacity:.6}50%{opacity:1}}
-
-/* ROW hover drop target */
-.tbl tr.row-drop-above td{border-top:2px solid var(--blue)!important}
-.tbl tr.row-drop-below td{border-bottom:2px solid var(--blue)!important}
-
-/* DROP HINT banner */
-.drop-hint{position:fixed;top:0;left:var(--sidebar-w);right:0;height:4px;background:linear-gradient(90deg,var(--blue),var(--green),var(--blue));z-index:100;opacity:0;transition:opacity .2s;pointer-events:none}
-.drop-hint.active{opacity:1;animation:hintPulse 1s infinite}
-@keyframes hintPulse{0%,100%{opacity:.7}50%{opacity:1}}
-
-.sb-footer{padding:12px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:4px}
-.sb-footer .sbtn{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:6px;border:none;background:none;color:var(--text2);font-size:12px;cursor:pointer;transition:.15s;width:100%;text-align:left}
-.sb-footer .sbtn:hover{background:var(--bg3);color:var(--text)}
-.sb-footer .sbtn svg{width:16px;height:16px;flex-shrink:0}
-
-/* TOP BAR */
-.topbar{padding:16px 24px;border-bottom:1px solid var(--border);background:var(--bg2);display:flex;align-items:center;gap:16px;flex-shrink:0}
-.topbar .mob-toggle{display:none;background:none;border:none;color:var(--text);font-size:20px;cursor:pointer;padding:4px}
-.stats-row{display:flex;gap:12px;flex:1;flex-wrap:wrap}
-.stat-card{display:flex;align-items:center;gap:10px;padding:8px 16px;background:var(--bg);border:1px solid var(--border);border-radius:10px;min-width:120px}
-.stat-card .sc-icon{width:36px;height:36px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
-.stat-card .sc-icon.blue{background:var(--blue-bg);color:var(--blue)}
-.stat-card .sc-icon.green{background:var(--green-bg);color:var(--green)}
-.stat-card .sc-icon.yellow{background:var(--yellow-bg);color:var(--yellow)}
-.stat-card .sc-icon.purple{background:var(--purple-bg);color:var(--purple)}
-.stat-card .sc-info b{display:block;font-size:18px;font-weight:700;line-height:1.2}
-.stat-card .sc-info small{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px}
-.topbar-actions{display:flex;gap:8px;flex-shrink:0}
-
-/* TOOLBAR */
-.toolbar{padding:12px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;background:var(--bg2);flex-shrink:0;flex-wrap:wrap}
-.toolbar .bulk-sel{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2)}
-.toolbar .bulk-sel label{cursor:pointer;display:flex;align-items:center;gap:4px}
-.toolbar .search-main{position:relative;flex:1;max-width:400px}
-.toolbar .search-main input{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px 36px 8px 36px;border-radius:8px;font-size:13px;outline:none;transition:.2s}
-.toolbar .search-main input:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(59,130,246,.15)}
-.toolbar .search-main .si{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--text3);font-size:13px;pointer-events:none}
-.toolbar .search-main .sc{position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text3);cursor:pointer;font-size:14px;padding:2px;display:none;border-radius:4px}
-.toolbar .search-main input:not(:placeholder-shown)~.sc{display:block}
-.toolbar .search-main .sc:hover{color:var(--text)}
-.toolbar .result-count{font-size:12px;color:var(--text3);white-space:nowrap}
-.drag-hint-bar{font-size:11px;color:var(--blue);display:flex;align-items:center;gap:4px;white-space:nowrap;padding:4px 10px;background:var(--blue-bg);border-radius:6px;border:1px solid rgba(59,130,246,.2)}
-.drag-hint-bar svg{width:14px;height:14px}
-
-/* BUTTONS */
-.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 14px;border-radius:8px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-size:12px;font-weight:500;cursor:pointer;transition:.15s;white-space:nowrap}
-.btn:hover{background:var(--bg4);border-color:var(--border2)}
-.btn:disabled{opacity:.4;cursor:not-allowed}
-.btn svg{width:14px;height:14px}
-.btn-blue{background:var(--blue);border-color:var(--blue2);color:#fff}
-.btn-blue:hover{background:var(--blue2)}
-.btn-green{background:var(--green);border-color:#16a34a;color:#fff}
-.btn-green:hover{background:#16a34a}
-.btn-green:disabled{background:var(--green);opacity:.5}
-.btn-red{background:var(--red);border-color:#dc2626;color:#fff}
-.btn-red:hover{background:#dc2626}
-.btn-ghost{background:transparent;border-color:transparent}
-.btn-ghost:hover{background:var(--bg3)}
-.btn-ghost:active{background:var(--blue-bg);color:var(--blue)}
-
-/* REORDER buttons */
-.reorder-btn{width:26px;height:26px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--text2);font-size:11px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:.15s;padding:0}
-.reorder-btn:hover{background:var(--blue-bg);color:var(--blue);border-color:var(--blue)}
-.reorder-btn:active{transform:scale(.92)}
-
-/* TABLE */
-.table-wrap{flex:1;overflow-y:auto;padding:0 24px 24px}
+/* Table */
+.table-wrap{flex:1;overflow-y:auto;padding:0}
 .table-wrap::-webkit-scrollbar{width:6px}
 .table-wrap::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
-.tbl{background:var(--bg2);border:1px solid var(--border);border-radius:12px;overflow:hidden}
-.tbl table{width:100%;border-collapse:collapse}
-.tbl thead{position:sticky;top:0;z-index:3}
-.tbl th{background:var(--bg3);padding:10px 14px;text-align:left;font-size:11px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--border)}
-.tbl td{padding:8px 14px;border-bottom:1px solid var(--border);font-size:13px;vertical-align:middle}
-.tbl tr:last-child td{border-bottom:none}
-.tbl tr:hover td{background:rgba(59,130,246,.03)}
-.tbl tr.changed td{background:var(--green-bg);border-bottom-color:rgba(34,197,94,.2)}
-.tbl tr.changed:hover td{background:rgba(34,197,94,.15)}
-.tbl tr[draggable=true]{cursor:grab}
-.tbl tr[draggable=true]:active{cursor:grabbing}
+table{width:100%;border-collapse:collapse}
+thead{position:sticky;top:0;z-index:10}
+thead th{background:var(--sidebar);padding:10px 14px;text-align:left;font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--border);white-space:nowrap}
+thead th:first-child{width:40px;text-align:center}
+thead th:nth-child(3){width:50px}
+tbody tr{border-bottom:1px solid var(--border);transition:background .1s;cursor:default}
+tbody tr:hover{background:var(--hover)}
+tbody tr.dragging{opacity:.4}
+tbody tr.drag-over{border-top:2px solid var(--primary)}
+tbody td{padding:8px 14px;font-size:13px;vertical-align:middle}
+tbody td:first-child{text-align:center}
+.ch-check{width:16px;height:16px;accent-color:var(--primary);cursor:pointer}
+.ch-logo{width:36px;height:36px;border-radius:6px;object-fit:contain;background:var(--input-bg);border:1px solid var(--border)}
+.ch-name{font-weight:500;max-width:300px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.grp-select{background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12px;outline:none;cursor:pointer;min-width:160px;transition:border-color .2s}
+.grp-select:focus{border-color:var(--primary)}
+.order-btns{display:flex;gap:4px}
+.order-btn{background:var(--card);border:1px solid var(--border);color:var(--muted);width:24px;height:24px;border-radius:4px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:10px;transition:all .15s}
+.order-btn:hover{color:var(--text);border-color:var(--primary);background:var(--hover)}
 
-.ch-row{display:flex;align-items:center;gap:10px}
-.ch-logo{width:32px;height:32px;border-radius:6px;background:var(--bg);flex-shrink:0;display:flex;align-items:center;justify-content:center;overflow:hidden;border:1px solid var(--border)}
-.ch-logo img{width:100%;height:100%;object-fit:contain}
-.ch-logo .placeholder{font-size:14px;color:var(--text3)}
-.ch-info .ch-name{font-weight:500;font-size:13px}
-.ch-info .ch-meta{font-size:10px;color:var(--text3);margin-top:1px}
-.badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:6px;font-size:10px;font-weight:700;letter-spacing:.3px}
-.b-tr{background:var(--blue-bg);color:var(--blue)}
-.b-de{background:var(--red-bg);color:var(--red)}
-.gsel{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:6px;font-size:12px;width:200px;outline:none;cursor:pointer;transition:.2s}
-.gsel:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(59,130,246,.15)}
-.tag{display:inline-flex;align-items:center;gap:3px;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600}
-.tag-ovr{background:var(--yellow-bg);color:var(--yellow)}
-.tag-chg{background:var(--green-bg);color:var(--green)}
-.tag-cur{background:var(--bg3);color:var(--text2)}
-.cb{width:16px;height:16px;accent-color:var(--blue);cursor:pointer}
+.empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:60px 20px;color:var(--muted)}
+.empty-state svg{margin-bottom:12px;opacity:.5}
+.empty-state p{font-size:14px}
 
-/* TOAST */
-.toast{position:fixed;bottom:24px;right:24px;background:var(--bg3);border:1px solid var(--border);border-radius:10px;padding:12px 20px;transform:translateY(100px);opacity:0;transition:.3s cubic-bezier(.4,0,.2,1);z-index:999;font-size:13px;display:flex;align-items:center;gap:8px;box-shadow:0 8px 32px rgba(0,0,0,.4)}
-.toast.show{transform:translateY(0);opacity:1}
-.toast.ok{border-color:var(--green)}.toast.ok .t-dot{background:var(--green)}
-.toast.err{border-color:var(--red)}.toast.err .t-dot{background:var(--red)}
-.toast .t-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+/* Loading overlay */
+.loading-overlay{position:fixed;inset:0;background:rgba(15,17,23,.6);display:none;align-items:center;justify-content:center;z-index:100}
+.loading-overlay.active{display:flex}
+.spinner{width:32px;height:32px;border:3px solid var(--border);border-top-color:var(--primary);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 
-#fileIn{display:none}
-.empty{text-align:center;padding:60px 20px;color:var(--text3)}
-.empty .em-icon{font-size:40px;margin-bottom:12px;opacity:.5}
-.empty p{font-size:14px}
+/* Toast */
+.toast-container{position:fixed;bottom:20px;right:20px;z-index:200;display:flex;flex-direction:column-reverse;gap:8px}
+.toast{padding:12px 18px;border-radius:8px;font-size:13px;font-weight:500;color:#fff;animation:slideIn .3s ease;box-shadow:0 4px 20px rgba(0,0,0,.4);max-width:360px;word-break:break-word}
+.toast.success{background:#16a34a}
+.toast.error{background:#dc2626}
+.toast.info{background:#2563eb}
+.toast.removing{animation:slideOut .3s ease forwards}
+@keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
+@keyframes slideOut{from{transform:translateX(0);opacity:1}to{transform:translateX(100%);opacity:0}}
 
-.overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:90}
+/* Mini loading on save */
+.saving-indicator{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--primary);border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-left:6px}
+
+/* Responsive */
 @media(max-width:768px){
-  .sidebar{position:fixed;left:0;top:0;z-index:95;transform:translateX(-100%)}
-  .sidebar.open{transform:translateX(0)}
-  .overlay.show{display:block}
-  .topbar .mob-toggle{display:block}
-  .stats-row{gap:8px}
-  .stat-card{min-width:80px;padding:6px 10px}
-  .stat-card .sc-info b{font-size:15px}
-  .gsel{width:140px;font-size:11px}
-  .table-wrap{padding:0 12px 12px}
-  .toolbar{padding:10px 12px}
-  .tbl td,.tbl th{padding:6px 8px;font-size:11px}
-  .ch-logo{width:28px;height:28px}
+  .sidebar{width:220px;min-width:220px}
+  .toolbar{padding:12px 14px}
+  .search-box{width:180px}
 }
-
-::-webkit-scrollbar{width:6px;height:6px}
-::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
-::-webkit-scrollbar-thumb:hover{background:var(--border2)}
-
-@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
-.tbl tr{animation:fadeIn .15s ease-out}
-
-/* PAGINATION */
-.pager{display:flex;align-items:center;justify-content:center;gap:4px;padding:12px 0;flex-wrap:wrap}
-.pbtn{background:var(--bg3);border:1px solid var(--border);color:var(--text2);padding:5px 10px;border-radius:6px;font-size:12px;cursor:pointer;transition:.15s;min-width:32px;text-align:center}
-.pbtn:hover{background:var(--bg4);color:var(--text);border-color:var(--border2)}
-.pbtn.active{background:var(--blue);border-color:var(--blue2);color:#fff;font-weight:600}
-.pdots{color:var(--text3);padding:0 4px;font-size:14px}
-.psel{background:var(--bg);border:1px solid var(--border);color:var(--text2);padding:5px 8px;border-radius:6px;font-size:11px;outline:none;cursor:pointer;margin-left:8px}
-.psel:focus{border-color:var(--blue)}
+@media(max-width:600px){
+  .sidebar{display:none}
+}
 </style>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
 <body>
-<div class="overlay" id="overlay" onclick="toggleSidebar()"></div>
-<div class="drop-hint" id="dropHint"></div>
 <div class="app">
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <h1><span class="dot" id="statusDot"></span> VxParser</h1>
+      <div class="subtitle">IPTV Channel Manager</div>
+    </div>
+    <div class="group-list" id="groupList"></div>
+    <div class="sidebar-footer">
+      <div class="add-group-form">
+        <input type="text" id="newGroupName" placeholder="New group name..." maxlength="50">
+        <button onclick="createGroup()">+ Add</button>
+      </div>
+    </div>
+  </aside>
 
-<!-- SIDEBAR -->
-<aside class="sidebar" id="sidebar">
-  <div class="sb-hdr">
-    <h1><div class="icon">&#9656;</div> Omer <span style="color:var(--blue)">Admin</span></h1>
-    <p>Kanal Grup Yonetimi &bull; Drag &amp; Drop</p>
-  </div>
-  <div class="sb-search">
-    <div class="search-box">
-      <span class="s-icon">&#128269;</span>
-      <input type="text" id="sideSearch" placeholder="Kanal ara..." oninput="onSideSearch(this.value)">
-      <button class="s-clear" onclick="clearSideSearch()">&#10005;</button>
+  <!-- Main -->
+  <div class="main">
+    <div class="toolbar">
+      <div class="title-area">
+        <h2 id="currentTitle">All Channels</h2>
+        <div class="channel-count" id="channelCount">0 channels</div>
+      </div>
+      <div class="search-box">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input type="text" id="searchInput" placeholder="Search channels..." oninput="debounceSearch()">
+      </div>
     </div>
-  </div>
-  <div class="sb-groups" id="sbGroups"></div>
-  <div class="sb-footer">
-    <button class="sbtn" onclick="doExport()">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
-      Disa Aktar JSON
-    </button>
-    <button class="sbtn" onclick="document.getElementById('fileIn').click()">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/></svg>
-      Ice Aktar JSON
-    </button>
-    <button class="sbtn" onclick="copyJson()">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-      Kopyala
-    </button>
-    <button class="sbtn" style="color:var(--red)" onclick="doReset()">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-      Sifirla
-    </button>
-  </div>
-</aside>
-
-<!-- MAIN -->
-<div class="main">
-  <div class="topbar">
-    <button class="mob-toggle" onclick="toggleSidebar()">&#9776;</button>
-    <div class="stats-row">
-      <div class="stat-card"><div class="sc-icon blue">&#128250;</div><div class="sc-info"><b id="sTotal">-</b><small>Toplam</small></div></div>
-      <div class="stat-card"><div class="sc-icon green">&#128193;</div><div class="sc-info"><b id="sGroups">-</b><small>Grup</small></div></div>
-      <div class="stat-card"><div class="sc-icon yellow">&#9998;</div><div class="sc-info"><b id="sOverride">0</b><small>Override</small></div></div>
-      <div class="stat-card"><div class="sc-icon purple">&#9999;</div><div class="sc-info"><b id="sChanged">0</b><small>Bekleyen</small></div></div>
+    <div class="bulk-bar" id="bulkBar">
+      <span class="sel-count" id="selCount">0 selected</span>
+      <select id="bulkGroupSelect"><option value="">Move to group...</option></select>
+      <button class="btn btn-primary" onclick="bulkAssign()">Assign</button>
+      <button class="btn btn-danger" onclick="bulkUngroup()">Remove from Group</button>
+      <button class="btn" onclick="clearSelection()">Cancel</button>
     </div>
-    <div class="topbar-actions">
-      <button class="btn btn-green" id="saveBtn" onclick="save()">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
-        Kaydet
-      </button>
-    </div>
-  </div>
-
-  <div class="toolbar">
-    <div class="bulk-sel">
-      <label><input type="checkbox" class="cb" id="selectAll" onchange="toggleSelectAll()"> Tumunu Sec</label>
-      <select class="gsel" id="bulkGroup" style="width:180px"><option value="">Toplu Tasi...</option></select>
-      <button class="btn btn-blue" onclick="bulkMove()" id="bulkBtn" disabled>Uygula</button>
-    </div>
-    <div class="search-main">
-      <span class="si">&#128269;</span>
-      <input type="text" id="mainSearch" placeholder="Kanal adi ile ara..." oninput="onMainSearch(this.value)">
-      <button class="sc" onclick="clearMainSearch()">&#10005;</button>
-    </div>
-    <div class="drag-hint-bar" id="dragHintBar">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 9l7-7 7 7M5 15l7 7 7-7"/></svg>
-      Kanallari surukleyerek siralayin veya gruplara tasimayin
-    </div>
-    <span class="result-count" id="resultCount"></span>
-  </div>
-
-  <div class="table-wrap">
-    <div class="tbl">
+    <div class="table-wrap">
       <table>
         <thead>
           <tr>
-            <th style="width:36px"><input type="checkbox" class="cb" id="selectAll2" onchange="toggleSelectAll()"></th>
-            <th style="width:44px"></th>
-            <th>Kanal</th>
-            <th style="width:70px">Ulke</th>
-            <th style="width:160px">Grup</th>
-            <th style="width:200px">Yeni Grup</th>
-            <th style="width:90px">Sira</th>
-            <th style="width:80px">Durum</th>
+            <th><input type="checkbox" class="ch-check" id="selectAll" onchange="toggleSelectAll(this)"></th>
+            <th>Channel</th>
+            <th></th>
+            <th>Group</th>
+            <th style="width:70px">Order</th>
           </tr>
         </thead>
-        <tbody id="list"></tbody>
+        <tbody id="channelBody"></tbody>
       </table>
+      <div class="empty-state" id="emptyState" style="display:none">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg>
+        <p>No channels found</p>
+      </div>
     </div>
-    <div id="pager"></div>
   </div>
 </div>
 
-<input type="file" id="fileIn" accept=".json" onchange="doImport(event)">
-</div>
-<div class="toast" id="toast"><span class="t-dot"></span><span id="toastMsg"></span></div>
+<div class="loading-overlay" id="loadingOverlay"><div class="spinner"></div></div>
+<div class="toast-container" id="toastContainer"></div>
 
 <script>
-const TR_GRPS=["TR ULUSAL","TR SPOR","TR SINEMA","TR SINEMA VOD","TR DIZI","TR 7/24 DIZI","TR BELGESEL","TR COCUK","TR MUZIK","TR HABER","TR DINI","TR YEREL","TR RADYO","TR 4K","TR 8K","TR RAW"];
-const DE_GRPS=["DE VOLLPROGRAMM","DE NACHRICHTEN","DE DOKU","DE KINDER","DE FILM","DE MUSIK","DE SPORT","DE SONSTIGE"];
-const GRPS=[...TR_GRPS,...DE_GRPS];
-const GRP_COLORS={"TR ULUSAL":"#3b82f6","TR SPOR":"#ef4444","TR SINEMA":"#a855f7","TR SINEMA VOD":"#8b5cf6","TR DIZI":"#ec4899","TR 7/24 DIZI":"#f472b6","TR BELGESEL":"#f59e0b","TR COCUK":"#22c55e","TR MUZIK":"#06b6d4","TR HABER":"#eab308","TR DINI":"#10b981","TR YEREL":"#6b7280","TR RADYO":"#14b8a6","TR 4K":"#f97316","TR 8K":"#fb923c","TR RAW":"#ef4444","DE VOLLPROGRAMM":"#3b82f6","DE NACHRICHTEN":"#ef4444","DE DOKU":"#f59e0b","DE KINDER":"#22c55e","DE FILM":"#a855f7","DE MUSIK":"#06b6d4","DE SPORT":"#ef4444","DE SONSTIGE":"#6b7280"};
+let groups = [];
+let channels = [];
+let selectedGroup = null; // null = all
+let selectedLids = new Set();
+let searchTimer = null;
+let allGroupsCache = [];
 
-let channels=[],overrides={},changes={},selected=new Set(),activeGroup='',searchQ='';
-let dragChanName=null,dragClone=null,dragStarted=false;
-let curPage=1,pageSize=100;
-
-/* Safe HTML escaping for text content */
-function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
-/* Safe JS string literal escaping for inline handlers inside single-quoted attrs */
-function escJS(s){return String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\n/g,'\\n').replace(/\r/g,'\\r')}
-
-async function load(){
-  try{
-    const r=await fetch('/api/admin/channels');channels=await r.json();
-    const r2=await fetch('/api/admin/overrides');overrides=await r2.json();
-    changes={};selected=new Set();
-    buildSidebar();fillBulkGroup();render();
-  }catch(e){toast('Veri yuklenemedi: '+e,'err')}
-}
-
-function buildSidebar(){
-  const el=document.getElementById('sbGroups');
-  const grpCounts={};channels.forEach(c=>{grpCounts[c.grp]=(grpCounts[c.grp]||0)+1});
-  let h='';
-  h+='<div class="grp-item '+(activeGroup===''?'active':'')+'" onclick="selectGroup(\'\')"><div class="g-dot" style="background:var(--text2)"></div><div class="g-name">Tumunu Goster</div><div class="g-cnt">'+channels.length+'</div></div>';
-
-  h+='<div class="sb-section"><div class="sb-section-title" onclick="toggleSection(this)"><span class="arrow">&#9660;</span> Turk Kanallari ('+TR_GRPS.filter(g=>grpCounts[g]).length+')</div><div class="sb-section-body">';
-  TR_GRPS.forEach(g=>{
-    const cnt=grpCounts[g]||0;if(!cnt)return;
-    const ovr=Object.keys(overrides).filter(k=>overrides[k]===g).length;
-    h+='<div class="grp-item '+(activeGroup===g?'active':'')+'" data-grp="'+esc(g)+'" onclick="selectGroup(\''+escJS(g)+'\')"><div class="g-dot" style="background:'+(GRP_COLORS[g]||'var(--text3)')+'"></div><div class="g-name" title="'+esc(g)+'">'+esc(g.replace('TR ',''))+'</div><div class="g-cnt">'+cnt+(ovr?'<span style="color:var(--yellow);margin-left:3px">+'+ovr+'</span>':'')+'</div></div>';
-  });
-  h+='</div></div>';
-
-  h+='<div class="sb-section"><div class="sb-section-title" onclick="toggleSection(this)"><span class="arrow">&#9660;</span> Alman Kanallari ('+DE_GRPS.filter(g=>grpCounts[g]).length+')</div><div class="sb-section-body">';
-  DE_GRPS.forEach(g=>{
-    const cnt=grpCounts[g]||0;if(!cnt)return;
-    const ovr=Object.keys(overrides).filter(k=>overrides[k]===g).length;
-    h+='<div class="grp-item '+(activeGroup===g?'active':'')+'" data-grp="'+esc(g)+'" onclick="selectGroup(\''+escJS(g)+'\')"><div class="g-dot" style="background:'+(GRP_COLORS[g]||'var(--text3)')+'"></div><div class="g-name" title="'+esc(g)+'">'+esc(g.replace('DE ',''))+'</div><div class="g-cnt">'+cnt+(ovr?'<span style="color:var(--yellow);margin-left:3px">+'+ovr+'</span>':'')+'</div></div>';
-  });
-  h+='</div></div>';
-  el.innerHTML=h;
-
-  /* Attach drag events to all group items */
-  el.querySelectorAll('.grp-item[data-grp]').forEach(gi=>{
-    gi.addEventListener('dragover',onGrpDragOver);
-    gi.addEventListener('dragenter',onGrpDragEnter);
-    gi.addEventListener('dragleave',onGrpDragLeave);
-    gi.addEventListener('drop',onGrpDrop);
-  });
-}
-
-function toggleSection(el){el.classList.toggle('collapsed');el.nextElementSibling.classList.toggle('collapsed')}
-function selectGroup(g){activeGroup=g;searchQ='';curPage=1;document.getElementById('sideSearch').value='';document.getElementById('mainSearch').value='';selected=new Set();buildSidebar();render()}
-function onSideSearch(v){searchQ=v.toUpperCase();activeGroup='';curPage=1;document.getElementById('mainSearch').value='';selected=new Set();buildSidebar();render()}
-function onMainSearch(v){searchQ=v.toUpperCase();activeGroup='';curPage=1;selected=new Set();document.getElementById('sideSearch').value='';buildSidebar();render()}
-function clearSideSearch(){document.getElementById('sideSearch').value='';searchQ='';curPage=1;buildSidebar();render()}
-function clearMainSearch(){document.getElementById('mainSearch').value='';searchQ='';curPage=1;buildSidebar();render()}
-function toggleSidebar(){document.getElementById('sidebar').classList.toggle('open');document.getElementById('overlay').classList.toggle('show')}
-
-function fillBulkGroup(){
-  const sel=document.getElementById('bulkGroup');
-  sel.innerHTML='<option value="">Toplu Tasi...</option>';
-  GRPS.forEach(g=>{sel.innerHTML+='<option value="'+g+'">'+g+'</option>'});
-}
-
-function getFiltered(){
-  return channels.filter(c=>{
-    if(activeGroup&&c.grp!==activeGroup)return false;
-    if(searchQ&&!c.name.toUpperCase().includes(searchQ))return false;
-    return true;
-  });
-}
-
-function render(){
-  const fl=getFiltered();
-  const tb=document.getElementById('list');
-  const totalPages=Math.max(1,Math.ceil(fl.length/pageSize));
-  if(curPage>totalPages)curPage=totalPages;
-  const start=(curPage-1)*pageSize;
-  const pageItems=fl.slice(start,start+pageSize);
-
-  document.getElementById('resultCount').textContent=fl.length+' kanal (Sayfa '+curPage+'/'+totalPages+')';
-
-  if(!fl.length){tb.innerHTML='<tr><td colspan="8"><div class="empty"><div class="em-icon">&#128250;</div><p>Kanal bulunamadi</p></div></td></tr>';updStats();renderPagination(0);return}
-
-  /* Build rows using DocumentFragment for speed */
-  const frag=document.createDocumentFragment();
-  const tmp=document.createElement('tbody');
-  let h='';
-  pageItems.forEach(c=>{
-    const k=c.name,orig=c.grp;
-    const isOvr=overrides.hasOwnProperty(k.toUpperCase());
-    const isChg=changes.hasOwnProperty(k);
-    const cur=isChg?changes[k]:orig;
-    const rowCls=isChg?'changed':'';
-    const isSel=selected.has(k);
-    const logo=c.logo||'';
-    const logoHtml=logo?'<img src="'+esc(logo)+'" onerror="this.parentElement.innerHTML=\'<span class=placeholder>&#9656;</span>\'" loading="lazy">':'<span class="placeholder">&#9656;</span>';
-
-    let statusTag='';
-    if(isOvr&&!isChg)statusTag='<span class="tag tag-ovr">&#9998; OVR</span>';
-    else if(isChg)statusTag='<span class="tag tag-chg">&#10003; DEGISTI</span>';
-    else statusTag='<span class="tag tag-cur">OTO</span>';
-
-    h+='<tr class="'+rowCls+'" draggable="true" data-chname="'+esc(k)+'">';
-    h+='<td><input type="checkbox" class="cb ch-cb" data-name="'+esc(k)+'" '+(isSel?'checked':'')+' onchange="toggleSel(this)"></td>';
-    h+='<td><div class="ch-logo">'+logoHtml+'</div></td>';
-    h+='<td><div class="ch-info"><div class="ch-name">'+esc(k)+'</div><div class="ch-meta">ID: '+c.id+'</div></div></td>';
-    h+='<td><span class="badge '+(c.country==='TR'?'b-tr':'b-de')+'">'+c.country+'</span></td>';
-    h+='<td style="color:var(--text2);font-size:12px">'+esc(orig)+'</td>';
-    h+='<td><select class="gsel" data-chname="'+esc(k)+'">';
-    GRPS.forEach(g=>{h+='<option value="'+g+'"'+(cur===g?' selected':'')+'>'+g+'</option>'});
-    h+='</select></td>';
-    h+='<td><div style="display:flex;gap:3px"><button class="reorder-btn" onclick="moveChannel(\''+escJS(k)+'\',\'up\')" title="Yukari tas">&#9650;</button><button class="reorder-btn" onclick="moveChannel(\''+escJS(k)+'\',\'down\')" title="Asagi tas">&#9660;</button></div></td>';
-    h+='<td>'+statusTag+'</td>';
-    h+='</tr>';
-  });
-  tmp.innerHTML=h;
-  while(tmp.firstChild)frag.appendChild(tmp.firstChild);
-  tb.innerHTML='';
-  tb.appendChild(frag);
-  updStats();
-  renderPagination(totalPages);
-
-  /* Attach event listeners via delegation */
-  tb.querySelectorAll('.gsel').forEach(sel=>{
-    sel.addEventListener('change',function(){chgGrp(this.dataset.chname,this.value)});
-  });
-  tb.querySelectorAll('tr[draggable]').forEach(tr=>{
-    tr.addEventListener('dragstart',onRowDragStart);
-    tr.addEventListener('dragend',onRowDragEnd);
-  });
-}
-
-function renderPagination(totalPages){
-  let el=document.getElementById('pager');
-  if(!el)return;
-  if(totalPages<=1){el.innerHTML='';return}
-  let h='<div class="pager">';
-  if(curPage>1)h+='<button class="pbtn" onclick="goPage('+(curPage-1)+')">&#9664;</button>';
-  /* Show max 7 page buttons around current */
-  let startP=Math.max(1,curPage-3),endP=Math.min(totalPages,curPage+3);
-  if(startP>1)h+='<button class="pbtn" onclick="goPage(1)">1</button>';
-  if(startP>2)h+='<span class="pdots">...</span>';
-  for(let i=startP;i<=endP;i++){
-    h+='<button class="pbtn '+(i===curPage?'active':'')+'" onclick="goPage('+i+')">'+i+'</button>';
+// ====== API HELPERS ======
+async function api(method, url, body) {
+  const opts = { method, headers: { "Content-Type": "application/json" } };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(url, opts);
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(err.detail || "Request failed");
   }
-  if(endP<totalPages-1)h+='<span class="pdots">...</span>';
-  if(endP<totalPages)h+='<button class="pbtn" onclick="goPage('+totalPages+')">'+totalPages+'</button>';
-  if(curPage<totalPages)h+='<button class="pbtn" onclick="goPage('+(curPage+1)+')">&#9654;</button>';
-  h+='<select class="psel" onchange="pageSize=parseInt(this.value);curPage=1;render()">';
-  [100,200,500,1000].forEach(n=>{h+='<option value="'+n+'"'+(pageSize===n?' selected':'')+'">'+n+' / sayfa</option>'});
-  h+='</select></div>';
-  el.innerHTML=h;
+  return r.json();
 }
 
-function goPage(p){curPage=p;render();document.querySelector('.table-wrap').scrollTop=0}
-
-function toggleSel(cb){
-  const name=cb.dataset.name;
-  if(cb.checked)selected.add(name);else selected.delete(name);
-  syncSelectAll();
-}
-function toggleSelectAll(){
-  const fl=getFiltered();
-  const checked=document.getElementById('selectAll').checked;
-  selected.clear();
-  if(checked)fl.forEach(c=>selected.add(c.name));
-  document.getElementById('selectAll2').checked=checked;
-  document.querySelectorAll('.ch-cb').forEach(cb=>{cb.checked=checked});
-  updBulkBtn();
-}
-function syncSelectAll(){
-  const fl=getFiltered();
-  const allSel=fl.length>0&&fl.every(c=>selected.has(c.name));
-  document.getElementById('selectAll').checked=allSel;
-  document.getElementById('selectAll2').checked=allSel;
-  updBulkBtn();
-}
-function updBulkBtn(){document.getElementById('bulkBtn').disabled=selected.size===0}
-
-/* Fixed: change handler using data attributes + addEventListener instead of broken inline escJ */
-function chgGrp(name,val){
-  const c=channels.find(x=>x.name===name);if(!c)return;
-  if(val===c.grp&&!overrides[name.toUpperCase()])delete changes[name];
-  else changes[name]=val;
-  render();
+// ====== TOAST ======
+function toast(msg, type = "info") {
+  const el = document.createElement("div");
+  el.className = "toast " + type;
+  el.textContent = msg;
+  document.getElementById("toastContainer").appendChild(el);
+  setTimeout(() => {
+    el.classList.add("removing");
+    setTimeout(() => el.remove(), 300);
+  }, 3000);
 }
 
-function bulkMove(){
-  const grp=document.getElementById('bulkGroup').value;
-  if(!grp||selected.size===0)return;
-  selected.forEach(name=>{
-    const c=channels.find(x=>x.name===name);
-    if(c){
-      if(grp===c.grp&&!overrides[name.toUpperCase()])delete changes[name];
-      else changes[name]=grp;
-    }
+// ====== LOADING ======
+let loadingCount = 0;
+function showLoading() {
+  loadingCount++;
+  document.getElementById("loadingOverlay").classList.add("active");
+}
+function hideLoading() {
+  loadingCount--;
+  if (loadingCount <= 0) { loadingCount = 0; document.getElementById("loadingOverlay").classList.remove("active"); }
+}
+
+// ====== GROUPS ======
+async function loadGroups() {
+  groups = await api("GET", "/admin/api/groups");
+  allGroupsCache = groups;
+  renderSidebar();
+  populateGroupDropdowns();
+}
+
+function renderSidebar() {
+  const list = document.getElementById("groupList");
+  // "All" item
+  let html = `<div class="group-item ${selectedGroup === null ? 'active' : ''}" onclick="selectGroup(null)">
+    <span class="g-icon">&#9776;</span>
+    <span class="g-name">All Channels</span>
+    <span class="g-count">${groups.reduce((s,g) => s + g.count, 0)}</span>
+  </div>`;
+  groups.forEach(g => {
+    html += `<div class="group-item ${selectedGroup === g.cid ? 'active' : ''}" onclick="selectGroup(${g.cid})" data-cid="${g.cid}">
+      <span class="g-icon">&#127909;</span>
+      <span class="g-name" ondblclick="startRename(event, ${g.cid})" title="${g.name}">${escHtml(g.name)}</span>
+      <span class="g-count">${g.count}</span>
+      <span class="g-actions">
+        <button class="g-action-btn" onclick="event.stopPropagation();startRename(event,${g.cid})" title="Rename">&#9998;</button>
+        <button class="g-action-btn delete" onclick="event.stopPropagation();deleteGroup(${g.cid},'${escAttr(g.name)}')" title="Delete">&#128465;</button>
+      </span>
+    </div>`;
   });
-  selected=new Set();
-  document.getElementById('bulkGroup').value='';
-  buildSidebar();render();
-  toast(Object.keys(changes).length+' bekleyen degisiklik','ok');
+  list.innerHTML = html;
 }
 
-function revert(name){delete changes[name];render()}
-
-async function save(){
-  const n=Object.keys(changes).length;
-  if(!n){toast('Kaydedilecek degisiklik yok');return}
-  try{
-    const r=await fetch('/api/admin/overrides',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)});
-    if(r.ok){
-      Object.entries(changes).forEach(([k,v])=>{overrides[k.toUpperCase()]=v});
-      /* Update local channel list grp so sidebar counts reflect reality */
-      Object.entries(changes).forEach(([k,v])=>{
-        const c=channels.find(x=>x.name===k);
-        if(c)c.grp=v;
-      });
-      changes={};selected=new Set();
-      buildSidebar();render();
-      toast(n+' kanal basariyla kaydedildi!','ok');
-    }else toast('Sunucu hatasi!','err');
-  }catch(e){toast('Hata: '+e,'err')}
+function populateGroupDropdowns() {
+  let opts = '<option value="">Move to group...</option>';
+  opts += '<option value="0">Ungrouped</option>';
+  groups.forEach(g => { opts += `<option value="${g.cid}">${escHtml(g.name)}</option>`; });
+  const bulk = document.getElementById("bulkGroupSelect");
+  bulk.innerHTML = opts;
 }
 
-async function doExport(){
-  try{
-    const r=await fetch('/api/admin/overrides/export');
-    const blob=await r.blob();const a=document.createElement('a');
-    a.href=URL.createObjectURL(blob);a.download='omer-overrides.json';a.click();
-    toast('JSON dosyasi indirildi','ok');
-  }catch(e){toast('Export hatasi','err')}
-}
-
-function doImport(ev){
-  const f=ev.target.files[0];if(!f)return;
-  const rd=new FileReader();
-  rd.onload=async(e)=>{
-    try{
-      const d=JSON.parse(e.target.result);
-      const r=await fetch('/api/admin/overrides/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
-      if(r.ok){const j=await r.json();toast(j.imported+' override yuklendi','ok');load()}
-      else toast('Import hatasi','err');
-    }catch(ex){toast('JSON parse hatasi','err')}
-  };rd.readAsText(f);ev.target.value='';
-}
-
-function copyJson(){
-  const t=JSON.stringify(overrides,null,2);
-  navigator.clipboard.writeText(t).then(()=>toast('Panoya kopyalandi!','ok')).catch(()=>toast('Kopyalama hatasi','err'));
-}
-
-async function doReset(){
-  if(!confirm('Tum Manuel Atamalari Silmek Istedi\u011finize Emin Misiniz?'))return;
-  try{
-    await fetch('/api/admin/overrides',{method:'DELETE'});
-    overrides={};changes={};selected=new Set();
-    buildSidebar();render();
-    toast('Tum atamalar sifirlandi','ok');
-  }catch(e){toast('Hata','err')}
-}
-
-function updStats(){
-  document.getElementById('sTotal').textContent=channels.length;
-  const g=new Set(channels.map(c=>c.grp));
-  document.getElementById('sGroups').textContent=g.size;
-  document.getElementById('sOverride').textContent=Object.keys(overrides).length;
-  const nc=Object.keys(changes).length;
-  document.getElementById('sChanged').textContent=nc;
-  const btn=document.getElementById('saveBtn');
-  if(nc===0){btn.disabled=true;btn.style.opacity='.5'}
-  else{btn.disabled=false;btn.style.opacity='1'}
-}
-
-function toast(msg,type){
-  document.getElementById('toastMsg').textContent=msg;
-  const t=document.getElementById('toast');
-  t.className='toast show '+(type||'');
-  setTimeout(()=>t.className='toast',3000);
-}
-
-/* ===== DRAG & DROP ===== */
-let dragDropTarget=null; /* 'table' or 'sidebar' */
-let dropIndicatorEl=null;
-let lastDropRow=null;
-
-function onRowDragStart(e){
-  dragChanName=e.currentTarget.dataset.chname;
-  dragDropTarget=null;
-  e.dataTransfer.effectAllowed='move';
-  e.dataTransfer.setData('text/plain',dragChanName);
-  /* Custom drag image */
-  const ch=channels.find(x=>x.name===dragChanName);
-  if(ch){
-    dragClone=document.createElement('div');
-    dragClone.className='ch-drag-clone';
-    dragClone.innerHTML='<span class="dc-icon">&#128250;</span><strong>'+esc(ch.name)+'</strong>';
-    document.body.appendChild(dragClone);
-    e.dataTransfer.setDragImage(dragClone,10,20);
+async function selectGroup(cid) {
+  selectedGroup = cid;
+  selectedLids.clear();
+  updateBulkBar();
+  document.getElementById("selectAll").checked = false;
+  renderSidebar();
+  if (cid === null) {
+    document.getElementById("currentTitle").textContent = "All Channels";
+  } else {
+    const g = groups.find(x => x.cid === cid);
+    document.getElementById("currentTitle").textContent = g ? g.name : "Group";
   }
-  e.currentTarget.classList.add('ch-dragging');
-  document.getElementById('dropHint').classList.add('active');
+  await loadChannels();
 }
 
-function onRowDragEnd(e){
-  e.currentTarget.classList.remove('ch-dragging');
-  document.getElementById('dropHint').classList.remove('active');
-  if(dragClone){dragClone.remove();dragClone=null}
-  /* Clean up */
-  document.querySelectorAll('.grp-item.drop-target,.grp-item.drop-reject').forEach(el=>{
-    el.classList.remove('drop-target','drop-reject');
-  });
-  document.querySelectorAll('.row-drop-above,.row-drop-below').forEach(el=>{
-    el.classList.remove('row-drop-above','row-drop-below');
-  });
-  if(dropIndicatorEl&&dropIndicatorEl.parentNode){dropIndicatorEl.remove()}
-  dropIndicatorEl=null;lastDropRow=null;
-  dragChanName=null;dragDropTarget=null;
+async function createGroup() {
+  const input = document.getElementById("newGroupName");
+  const name = input.value.trim();
+  if (!name) { toast("Enter a group name", "error"); return; }
+  showLoading();
+  try {
+    await api("POST", "/admin/api/groups/create", { name });
+    input.value = "";
+    toast(`Group "${name}" created`, "success");
+    await loadGroups();
+    await loadChannels();
+  } catch (e) { toast(e.message, "error"); }
+  finally { hideLoading(); }
 }
 
-/* ===== TABLE ROW DRAG (intra-group reorder) ===== */
-
-function onTableDragOver(e){
-  e.preventDefault();
-  e.dataTransfer.dropEffect='move';
-  dragDropTarget='table';
-  /* Find the row we're hovering over */
-  const tbody=document.getElementById('list');
-  const rows=Array.from(tbody.querySelectorAll('tr[data-chname]'));
-  const mouseY=e.clientY;
-  let closestRow=null;
-  let closestDist=Infinity;
-  let insertBefore=true;
-
-  for(let i=0;i<rows.length;i++){
-    const rect=rows[i].getBoundingClientRect();
-    const midY=rect.top+rect.height/2;
-    const dist=Math.abs(mouseY-midY);
-    if(dist<closestDist){
-      closestDist=dist;
-      closestRow=rows[i];
-      insertBefore=mouseY<midY;
-    }
-  }
-
-  /* Clean previous highlights */
-  if(lastDropRow&&lastDropRow!==closestRow){
-    lastDropRow.classList.remove('row-drop-above','row-drop-below');
-  }
-
-  if(closestRow){
-    closestRow.classList.remove('row-drop-above','row-drop-below');
-    if(insertBefore){
-      closestRow.classList.add('row-drop-above');
-    }else{
-      closestRow.classList.add('row-drop-below');
-    }
-    lastDropRow=closestRow;
-  }
-}
-
-function onTableDragLeave(e){
-  const tbody=document.getElementById('list');
-  if(!tbody.contains(e.relatedTarget)){
-    if(lastDropRow){
-      lastDropRow.classList.remove('row-drop-above','row-drop-below');
-      lastDropRow=null;
-    }
-  }
-}
-
-async function onTableDrop(e){
-  e.preventDefault();
+function startRename(e, cid) {
   e.stopPropagation();
-  const tbody=document.getElementById('list');
-  if(lastDropRow){lastDropRow.classList.remove('row-drop-above','row-drop-below');lastDropRow=null}
-  if(dropIndicatorEl&&dropIndicatorEl.parentNode){dropIndicatorEl.remove()}
-  dropIndicatorEl=null;
-  document.getElementById('dropHint').classList.remove('active');
-  if(!dragChanName)return;
+  const item = e.target.closest(".group-item") || e.target.closest('[data-cid]');
+  if (!item) return;
+  const nameEl = item.querySelector(".g-name");
+  const oldName = nameEl.textContent;
+  const g = groups.find(x => x.cid === cid);
+  nameEl.innerHTML = `<input class="rename-input" type="text" value="${escAttr(oldName)}" maxlength="50">`;
+  const inp = nameEl.querySelector("input");
+  inp.focus();
+  inp.select();
+  const finish = async () => {
+    const newName = inp.value.trim();
+    if (newName && newName !== oldName) {
+      showLoading();
+      try {
+        await api("POST", "/admin/api/groups/rename", { cid, name: newName });
+        toast(`Renamed to "${newName}"`, "success");
+        await loadGroups();
+        await loadChannels();
+      } catch (err) { toast(err.message, "error"); }
+      finally { hideLoading(); }
+    } else {
+      renderSidebar();
+    }
+  };
+  inp.addEventListener("blur", finish);
+  inp.addEventListener("keydown", ev => { if (ev.key === "Enter") inp.blur(); if (ev.key === "Escape") { inp.value = oldName; inp.blur(); } });
+}
 
-  /* Find target row and insert position from mouse Y */
-  const rows=Array.from(tbody.querySelectorAll('tr[data-chname]'));
-  let targetChName=null,placeBefore=true;
-  for(let i=0;i<rows.length;i++){
-    const rect=rows[i].getBoundingClientRect();
-    const midY=rect.top+rect.height/2;
-    if(e.clientY<midY){targetChName=rows[i].dataset.chname;placeBefore=true;break}
-    if(i===rows.length-1){targetChName=rows[i].dataset.chname;placeBefore=false}
+async function deleteGroup(cid, name) {
+  if (!confirm(`Delete group "${name}"?\nChannels will be moved to Ungrouped.`)) return;
+  showLoading();
+  try {
+    await api("POST", "/admin/api/groups/delete", { cid });
+    toast(`Group "${name}" deleted`, "success");
+    if (selectedGroup === cid) selectedGroup = null;
+    await loadGroups();
+    await loadChannels();
+  } catch (e) { toast(e.message, "error"); }
+  finally { hideLoading(); }
+}
+
+// ====== CHANNELS ======
+async function loadChannels() {
+  const search = document.getElementById("searchInput").value.trim();
+  let url = "/admin/api/channels?";
+  if (selectedGroup !== null) url += "group_id=" + selectedGroup + "&";
+  if (search) url += "search=" + encodeURIComponent(search);
+  channels = await api("GET", url);
+  renderChannels();
+}
+
+function renderChannels() {
+  const body = document.getElementById("channelBody");
+  const empty = document.getElementById("emptyState");
+  const countEl = document.getElementById("channelCount");
+  countEl.textContent = channels.length + " channel" + (channels.length !== 1 ? "s" : "");
+
+  if (channels.length === 0) {
+    body.innerHTML = "";
+    empty.style.display = "flex";
+    return;
   }
-  if(!targetChName||targetChName===dragChanName)return;
+  empty.style.display = "none";
 
-  /* Find the group and calculate correct target index within the group */
-  const dragCh=channels.find(c=>c.name===dragChanName);
-  if(!dragCh)return;
-  const grp=dragCh.grp;
-  const groupList=channels.filter(c=>c.grp===grp);
-  const targetIdx=groupList.findIndex(c=>c.name===targetChName);
-  const dragIdx=groupList.findIndex(c=>c.name===dragChanName);
-  if(targetIdx<0||dragIdx<0)return;
-
-  /* Calculate final position: API removes dragged item first, then inserts at target_index */
-  let finalIdx;
-  if(placeBefore){
-    finalIdx=dragIdx<targetIdx?targetIdx-1:targetIdx;
-  }else{
-    finalIdx=dragIdx<targetIdx?targetIdx:targetIdx+1;
-  }
-  finalIdx=Math.max(0,Math.min(finalIdx,groupList.length-1));
-
-  try{
-    const r=await fetch('/api/admin/reorder-to',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({channel:dragChanName,target_index:finalIdx})
+  let html = "";
+  channels.forEach((ch, idx) => {
+    const checked = selectedLids.has(ch.lid) ? "checked" : "";
+    const logo = ch.logo ? `<img class="ch-logo" src="${escAttr(ch.logo)}" alt="" onerror="this.style.display='none'">` : `<div class="ch-logo" style="display:flex;align-items:center;justify-content:center;font-size:14px;color:var(--muted)">&#127909;</div>`;
+    // Build group options for individual select
+    let grpOpts = `<option value="0" ${ch.cid == 0 ? 'selected' : ''}>Ungrouped</option>`;
+    groups.forEach(g => {
+      grpOpts += `<option value="${g.cid}" ${ch.cid === g.cid ? 'selected' : ''}>${escHtml(g.name)}</option>`;
     });
-    const j=await r.json();
-    if(j.ok){
-      toast(j.message,'ok');
-      const r2=await fetch('/api/admin/channels');channels=await r2.json();
-      buildSidebar();render();
-    }else{toast(j.message||'Hata','err')}
-  }catch(ex){toast('Hata: '+ex,'err')}
-}
 
-function onGrpDragOver(e){
-  e.preventDefault();
-  e.dataTransfer.dropEffect='move';
-}
-
-function onGrpDragEnter(e){
-  e.preventDefault();
-  const gi=e.currentTarget;
-  if(!gi.dataset.grp)return;
-  gi.classList.add('drop-target');
-  gi.classList.remove('drop-reject');
-}
-
-function onGrpDragLeave(e){
-  const gi=e.currentTarget;
-  /* Only remove if actually leaving the element (not entering a child) */
-  if(!gi.contains(e.relatedTarget)){
-    gi.classList.remove('drop-target','drop-reject');
-  }
-}
-
-function onGrpDrop(e){
-  e.preventDefault();
-  e.stopPropagation();
-  const gi=e.currentTarget;
-  const targetGroup=gi.dataset.grp;
-  gi.classList.remove('drop-target','drop-reject');
-  document.getElementById('dropHint').classList.remove('active');
-
-  if(!targetGroup)return;
-
-  /* Collect all channels to move: dragged + all selected (if multi-select) */
-  let namesToMove=[];
-  if(dragChanName)namesToMove.push(dragChanName);
-  /* If there are other selected channels (checkbox), include them too */
-  if(selected.size>0){
-    selected.forEach(name=>{if(!namesToMove.includes(name))namesToMove.push(name)});
-  }
-
-  if(!namesToMove.length)return;
-
-  let movedCount=0,skippedCount=0;
-  namesToMove.forEach(name=>{
-    const c=channels.find(x=>x.name===name);
-    if(!c)return;
-    const curGrp=c.grp;
-    if(targetGroup===curGrp&&!overrides[name.toUpperCase()]){
-      skippedCount++;
-      return;
-    }
-    changes[name]=targetGroup;
-    movedCount++;
+    html += `<tr draggable="true" data-lid="${ch.lid}" ondragstart="onDragStart(event)" ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event)" ondragend="onDragEnd(event)">
+      <td><input type="checkbox" class="ch-check" ${checked} onchange="toggleChannel(${ch.lid}, this.checked)"></td>
+      <td><span class="ch-name" title="${escAttr(ch.name)}">${escHtml(ch.name)}</span></td>
+      <td>${logo}</td>
+      <td><select class="grp-select" onchange="changeGroup(${ch.lid}, this.value, this)">${grpOpts}</select></td>
+      <td><div class="order-btns">
+        <button class="order-btn" onclick="reorderChannel(${ch.lid},'up',${idx})" ${idx === 0 ? 'disabled style="opacity:.3"' : ''}>&#9650;</button>
+        <button class="order-btn" onclick="reorderChannel(${ch.lid},'down',${idx})" ${idx === channels.length - 1 ? 'disabled style="opacity:.3"' : ''}>&#9660;</button>
+      </div></td>
+    </tr>`;
   });
+  body.innerHTML = html;
+}
 
-  /* Clear selection after drop */
-  selected=new Set();
+// ====== SELECTION ======
+function toggleChannel(lid, checked) {
+  if (checked) selectedLids.add(lid); else selectedLids.delete(lid);
+  updateBulkBar();
+  updateSelectAll();
+}
 
-  buildSidebar();
-  render();
+function toggleSelectAll(el) {
+  const checks = document.querySelectorAll("#channelBody .ch-check");
+  checks.forEach(cb => {
+    cb.checked = el.checked;
+    const tr = cb.closest("tr");
+    if (tr) {
+      const lid = parseInt(tr.dataset.lid);
+      if (el.checked) selectedLids.add(lid); else selectedLids.delete(lid);
+    }
+  });
+  updateBulkBar();
+}
 
-  if(movedCount===1){
-    toast(namesToMove[0]+' → '+targetGroup+' (Kaydet basin)','ok');
-  }else if(movedCount>1){
-    toast(movedCount+' kanal '+targetGroup+' grubuna tasindi (Kaydet basin)','ok');
-  }else if(skippedCount>0){
-    toast(skippedCount+' kanal zaten '+targetGroup+' grubunda','ok');
+function updateSelectAll() {
+  const checks = document.querySelectorAll("#channelBody .ch-check");
+  const allChecked = checks.length > 0 && Array.from(checks).every(cb => cb.checked);
+  document.getElementById("selectAll").checked = allChecked;
+}
+
+function updateBulkBar() {
+  const bar = document.getElementById("bulkBar");
+  const count = selectedLids.size;
+  document.getElementById("selCount").textContent = count + " selected";
+  if (count > 0) bar.classList.add("visible"); else bar.classList.remove("visible");
+}
+
+function clearSelection() {
+  selectedLids.clear();
+  document.querySelectorAll("#channelBody .ch-check").forEach(cb => cb.checked = false);
+  document.getElementById("selectAll").checked = false;
+  updateBulkBar();
+}
+
+// ====== GROUP CHANGE (individual) ======
+async function changeGroup(lid, newCid, selectEl) {
+  const oldCid = selectEl.getAttribute("data-original") ?? selectEl.value;
+  const spinner = document.createElement("span");
+  spinner.className = "saving-indicator";
+  selectEl.parentNode.appendChild(spinner);
+  try {
+    await api("POST", "/admin/api/channels/assign", { lids: [lid], cid: parseInt(newCid) });
+    toast("Group updated", "success");
+    await loadGroups();
+    await loadChannels();
+  } catch (e) {
+    toast(e.message, "error");
+    selectEl.value = oldCid;
+  } finally {
+    spinner.remove();
   }
 }
 
-/* ===== CHANNEL REORDER (up/down within group) ===== */
-
-async function moveChannel(name,dir){
-  try{
-    const r=await fetch('/api/admin/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:name,direction:dir})});
-    const j=await r.json();
-    if(j.ok){
-      toast(j.message,'ok');
-      /* Reload channel data to reflect new order */
-      const r2=await fetch('/api/admin/channels');channels=await r2.json();
-      buildSidebar();render();
-    }else{
-      toast(j.message||'Hata','err');
-    }
-  }catch(e){toast('Hata: '+e,'err')}
+// ====== BULK ASSIGN ======
+async function bulkAssign() {
+  const cid = parseInt(document.getElementById("bulkGroupSelect").value);
+  if (isNaN(cid) && document.getElementById("bulkGroupSelect").value !== "0") { toast("Select a group", "error"); return; }
+  const targetCid = cid === 0 ? 0 : cid;
+  if (selectedLids.size === 0) return;
+  showLoading();
+  try {
+    await api("POST", "/admin/api/channels/assign", { lids: Array.from(selectedLids), cid: targetCid });
+    toast(`${selectedLids.size} channels reassigned`, "success");
+    selectedLids.clear();
+    document.getElementById("selectAll").checked = false;
+    updateBulkBar();
+    await loadGroups();
+    await loadChannels();
+  } catch (e) { toast(e.message, "error"); }
+  finally { hideLoading(); }
 }
 
-/* ===== KEYBOARD SHORTCUTS ===== */
+// ====== BULK UNGROUP ======
+async function bulkUngroup() {
+  if (selectedLids.size === 0) return;
+  showLoading();
+  try {
+    await api("POST", "/admin/api/channels/ungroup", { lids: Array.from(selectedLids) });
+    toast(`${selectedLids.size} channels ungrouped`, "success");
+    selectedLids.clear();
+    document.getElementById("selectAll").checked = false;
+    updateBulkBar();
+    await loadGroups();
+    await loadChannels();
+  } catch (e) { toast(e.message, "error"); }
+  finally { hideLoading(); }
+}
 
-document.addEventListener('keydown',e=>{
-  if((e.ctrlKey||e.metaKey)&&e.key==='s'){e.preventDefault();save()}
-  if(e.key==='Escape'){clearSideSearch();clearMainSearch();selected=new Set();syncSelectAll();render()}
-  if(e.key==='/'){const ae=document.activeElement;if(ae.tagName!=='INPUT'&&ae.tagName!=='SELECT'&&ae.tagName!=='TEXTAREA'){e.preventDefault();document.getElementById('mainSearch').focus()}}
+// ====== REORDER ======
+async function reorderChannel(lid, direction, idx) {
+  try {
+    await api("POST", "/admin/api/channels/reorder", { lid, direction });
+    await loadChannels();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+// ====== DRAG & DROP ======
+let dragLid = null;
+function onDragStart(e) {
+  dragLid = parseInt(e.currentTarget.dataset.lid);
+  e.currentTarget.classList.add("dragging");
+  e.dataTransfer.effectAllowed = "move";
+}
+function onDragOver(e) {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "move";
+  const tr = e.currentTarget;
+  if (tr.dataset.lid != dragLid) tr.classList.add("drag-over");
+}
+function onDragLeave(e) { e.currentTarget.classList.remove("drag-over"); }
+async function onDrop(e) {
+  e.preventDefault();
+  e.currentTarget.classList.remove("drag-over");
+  const targetLid = parseInt(e.currentTarget.dataset.lid);
+  if (dragLid !== null && dragLid !== targetLid) {
+    showLoading();
+    try {
+      await api("POST", "/admin/api/channels/move", { lid: dragLid, target_lid: targetLid });
+      toast("Channel moved", "success");
+      await loadChannels();
+    } catch (err) { toast(err.message, "error"); }
+    finally { hideLoading(); }
+  }
+}
+function onDragEnd(e) {
+  e.currentTarget.classList.remove("dragging");
+  document.querySelectorAll(".drag-over").forEach(el => el.classList.remove("drag-over"));
+  dragLid = null;
+}
+
+// ====== SEARCH ======
+function debounceSearch() {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => loadChannels(), 300);
+}
+
+// ====== UTILS ======
+function escHtml(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+function escAttr(s) { return s.replace(/"/g, "&quot;").replace(/'/g, "&#39;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+
+// ====== KEYBOARD SHORTCUTS ======
+document.addEventListener("keydown", e => {
+  // Ctrl+A to select all channels when not focused on input
+  if ((e.ctrlKey || e.metaKey) && e.key === "a" && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "SELECT") {
+    e.preventDefault();
+    document.getElementById("selectAll").checked = true;
+    toggleSelectAll(document.getElementById("selectAll"));
+  }
 });
 
-load();
+// Enter key on new group input
+document.getElementById("newGroupName").addEventListener("keydown", e => {
+  if (e.key === "Enter") createGroup();
+});
 
-/* Attach table-level drag events (delegation, only once) */
-const listTbody=document.getElementById('list');
-listTbody.addEventListener('dragover',onTableDragOver);
-listTbody.addEventListener('dragleave',onTableDragLeave);
-listTbody.addEventListener('drop',onTableDrop);
+// ====== INIT ======
+async function init() {
+  try {
+    await loadGroups();
+    await loadChannels();
+  } catch (e) {
+    toast("Failed to load data: " + e.message, "error");
+  }
+}
+init();
 </script>
 </body>
-</html>
-"""
+</html>'''
+
+
+# ============================================================
+# ADMIN API ENDPOINTS
+# ============================================================
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page(auth: Optional[str] = Depends(admin_auth)):
+    return HTMLResponse(ADMIN_HTML)
+
+
+@app.get("/admin/api/groups")
+async def api_get_groups(auth: Optional[str] = Depends(admin_auth)):
+    """List all groups with channel counts."""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT cid, name, sort_order FROM categories ORDER BY sort_order, name")
+    groups = []
+    for r in c.fetchall():
+        cid = r["cid"]
+        c2 = conn.cursor()
+        c2.execute("SELECT COUNT(*) as cnt FROM channels WHERE cid=?", (cid,))
+        cnt = c2.fetchone()["cnt"]
+        groups.append({"cid": cid, "name": r["name"], "sort_order": r["sort_order"], "count": cnt})
+    # Count ungrouped
+    c.execute("SELECT COUNT(*) as cnt FROM channels WHERE cid=0")
+    ungrouped = c.fetchone()["cnt"]
+    if ungrouped > 0:
+        groups.append({"cid": 0, "name": "Ungrouped", "sort_order": 99999, "count": ungrouped})
+    conn.close()
+    return groups
+
+
+@app.post("/admin/api/groups/create")
+async def api_create_group(request: Request, auth: Optional[str] = Depends(admin_auth)):
+    """Create a new group."""
+    body = await request.json()
+    name = body.get("name", "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Group name required")
+    if len(name) > 100:
+        raise HTTPException(status_code=400, detail="Name too long")
+
+    conn = get_db()
+    c = conn.cursor()
+    # Check duplicate
+    c.execute("SELECT cid FROM categories WHERE name=?", (name,))
+    if c.fetchone():
+        conn.close()
+        raise HTTPException(status_code=409, detail="Group already exists")
+
+    # Get max sort_order
+    c.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 as nxt FROM categories")
+    nxt = c.fetchone()["nxt"]
+    c.execute("INSERT INTO categories(name, sort_order) VALUES(?, ?)", (name, nxt))
+    cid = c.lastrowid
+    conn.commit()
+    conn.close()
+    return {"success": True, "cid": cid, "name": name}
+
+
+@app.post("/admin/api/groups/rename")
+async def api_rename_group(request: Request, auth: Optional[str] = Depends(admin_auth)):
+    """Rename a group."""
+    body = await request.json()
+    cid = body.get("cid")
+    name = body.get("name", "").strip()
+    if not cid or not name:
+        raise HTTPException(status_code=400, detail="cid and name required")
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT cid FROM categories WHERE cid=?", (cid,))
+    if not c.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Group not found")
+
+    c.execute("UPDATE categories SET name=? WHERE cid=?", (name, cid))
+    # Also update the grp field on all channels in this group
+    c.execute("UPDATE channels SET grp=? WHERE cid=?", (name, cid))
+    conn.commit()
+    conn.close()
+    return {"success": True}
+
+
+@app.post("/admin/api/groups/delete")
+async def api_delete_group(request: Request, auth: Optional[str] = Depends(admin_auth)):
+    """Delete a group. Channels become ungrouped."""
+    body = await request.json()
+    cid = body.get("cid")
+    if not cid:
+        raise HTTPException(status_code=400, detail="cid required")
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT cid FROM categories WHERE cid=?", (cid,))
+    if not c.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Group not found")
+
+    # Move channels to ungrouped
+    c.execute("UPDATE channels SET cid=0, grp='' WHERE cid=?", (cid,))
+    # Delete category
+    c.execute("DELETE FROM categories WHERE cid=?", (cid,))
+    conn.commit()
+    conn.close()
+    return {"success": True}
+
+
+@app.post("/admin/api/groups/reorder")
+async def api_reorder_groups(request: Request, auth: Optional[str] = Depends(admin_auth)):
+    """Reorder groups."""
+    body = await request.json()
+    items = body.get("groups", [])
+    if not items:
+        raise HTTPException(status_code=400, detail="groups array required")
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("BEGIN")
+    for item in items:
+        cid = item.get("cid")
+        sort_order = item.get("sort_order")
+        if cid is not None and sort_order is not None:
+            c.execute("UPDATE categories SET sort_order=? WHERE cid=?", (sort_order, cid))
+    conn.commit()
+    conn.close()
+    return {"success": True}
+
+
+@app.get("/admin/api/channels")
+async def api_get_channels(
+    request: Request,
+    group_id: Optional[int] = Query(None),
+    search: Optional[str] = Query(None),
+    auth: Optional[str] = Depends(admin_auth)
+):
+    """List channels with optional group filter and search."""
+    conn = get_db()
+    c = conn.cursor()
+
+    if group_id is not None and group_id > 0:
+        # Filter by group
+        if search:
+            c.execute("""
+                SELECT lid, name, grp, cid, logo, url, hls, sort_order
+                FROM channels
+                WHERE cid=? AND (name LIKE ? OR grp LIKE ?)
+                ORDER BY sort_order, name
+            """, (group_id, f"%{search}%", f"%{search}%"))
+        else:
+            c.execute("""
+                SELECT lid, name, grp, cid, logo, url, hls, sort_order
+                FROM channels
+                WHERE cid=?
+                ORDER BY sort_order, name
+            """, (group_id,))
+    elif group_id == 0:
+        # Ungrouped only
+        if search:
+            c.execute("""
+                SELECT lid, name, grp, cid, logo, url, hls, sort_order
+                FROM channels
+                WHERE cid=0 AND (name LIKE ? OR grp LIKE ?)
+                ORDER BY sort_order, name
+            """, (f"%{search}%", f"%{search}%"))
+        else:
+            c.execute("""
+                SELECT lid, name, grp, cid, logo, url, hls, sort_order
+                FROM channels
+                WHERE cid=0
+                ORDER BY sort_order, name
+            """)
+    else:
+        # All channels
+        if search:
+            c.execute("""
+                SELECT ch.lid, ch.name, ch.grp, ch.cid, ch.logo, ch.url, ch.hls, ch.sort_order
+                FROM channels ch
+                LEFT JOIN categories cat ON ch.cid = cat.cid
+                WHERE (ch.name LIKE ? OR ch.grp LIKE ?)
+                ORDER BY COALESCE(cat.sort_order, 9999), ch.sort_order, ch.name
+            """, (f"%{search}%", f"%{search}%"))
+        else:
+            c.execute("""
+                SELECT ch.lid, ch.name, ch.grp, ch.cid, ch.logo, ch.url, ch.hls, ch.sort_order
+                FROM channels ch
+                LEFT JOIN categories cat ON ch.cid = cat.cid
+                ORDER BY COALESCE(cat.sort_order, 9999), ch.sort_order, ch.name
+            """)
+
+    result = []
+    for r in c.fetchall():
+        result.append({
+            "lid": r["lid"],
+            "name": r["name"],
+            "grp": r["grp"] or "",
+            "cid": r["cid"] or 0,
+            "logo": r["logo"] or "",
+            "url": r["url"] or "",
+            "hls": r["hls"] or "",
+            "sort_order": r["sort_order"],
+        })
+    conn.close()
+    return result
+
+
+@app.post("/admin/api/channels/assign")
+async def api_assign_channels(request: Request, auth: Optional[str] = Depends(admin_auth)):
+    """
+    Batch assign channels to a group.
+    CRITICAL: Uses a single transaction to update ALL channels.
+    This fixes the bug where only 1 channel would save.
+    """
+    body = await request.json()
+    lids = body.get("lids", [])
+    cid = body.get("cid")
+
+    if not lids or not isinstance(lids, list) or len(lids) == 0:
+        raise HTTPException(status_code=400, detail="lids array required with at least 1 ID")
+    if cid is None:
+        raise HTTPException(status_code=400, detail="cid required")
+
+    if cid == 0:
+        # Ungroup
+        target_grp = ""
+    else:
+        # Look up group name
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT name FROM categories WHERE cid=?", (cid,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            raise HTTPException(status_code=404, detail="Group not found")
+        target_grp = row["name"]
+
+    conn = get_db()
+    c = conn.cursor()
+
+    # CRITICAL FIX: Single transaction for ALL updates
+    try:
+        c.execute("BEGIN")
+        for lid in lids:
+            c.execute("UPDATE channels SET cid=?, grp=? WHERE lid=?", (cid, target_grp, lid))
+        # Commit ALL at once
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+    # Verify the updates actually landed
+    c.execute("SELECT COUNT(*) as cnt FROM channels WHERE cid=? AND lid IN ({})".format(
+        ",".join("?" * len(lids))), [cid] + list(lids))
+    saved_count = c.fetchone()["cnt"]
+    conn.close()
+
+    if saved_count != len(lids):
+        raise HTTPException(status_code=500, detail=f"Only {saved_count}/{len(lids)} channels updated")
+
+    return {"success": True, "updated": saved_count}
+
+
+@app.post("/admin/api/channels/reorder")
+async def api_reorder_channel(request: Request, auth: Optional[str] = Depends(admin_auth)):
+    """Reorder a channel within its group (swap with neighbor)."""
+    body = await request.json()
+    lid = body.get("lid")
+    direction = body.get("direction", "up")
+
+    if not lid or direction not in ("up", "down"):
+        raise HTTPException(status_code=400, detail="lid and direction required")
+
+    conn = get_db()
+    c = conn.cursor()
+
+    # Get the channel
+    c.execute("SELECT lid, cid, sort_order FROM channels WHERE lid=?", (lid,))
+    ch = c.fetchone()
+    if not ch:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Channel not found")
+
+    ch_cid = ch["cid"]
+    ch_sort = ch["sort_order"]
+
+    if direction == "up":
+        # Find the channel just above in the same group
+        c.execute("""
+            SELECT lid, sort_order FROM channels
+            WHERE cid=? AND sort_order < ?
+            ORDER BY sort_order DESC LIMIT 1
+        """, (ch_cid, ch_sort))
+    else:
+        # Find the channel just below
+        c.execute("""
+            SELECT lid, sort_order FROM channels
+            WHERE cid=? AND sort_order > ?
+            ORDER BY sort_order ASC LIMIT 1
+        """, (ch_cid, ch_sort))
+
+    neighbor = c.fetchone()
+    if not neighbor:
+        conn.close()
+        return {"success": True, "swapped": False}
+
+    # Swap sort_orders
+    try:
+        c.execute("BEGIN")
+        c.execute("UPDATE channels SET sort_order=? WHERE lid=?", (neighbor["sort_order"], lid))
+        c.execute("UPDATE channels SET sort_order=? WHERE lid=?", (ch_sort, neighbor["lid"]))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+    conn.close()
+    return {"success": True, "swapped": True, "with_lid": neighbor["lid"]}
+
+
+@app.post("/admin/api/channels/move")
+async def api_move_channel(request: Request, auth: Optional[str] = Depends(admin_auth)):
+    """Move a channel to a specific position (drag & drop target)."""
+    body = await request.json()
+    lid = body.get("lid")
+    target_lid = body.get("target_lid")
+
+    if not lid or not target_lid:
+        raise HTTPException(status_code=400, detail="lid and target_lid required")
+
+    conn = get_db()
+    c = conn.cursor()
+
+    # Get source channel
+    c.execute("SELECT lid, cid, sort_order FROM channels WHERE lid=?", (lid,))
+    src = c.fetchone()
+    if not src:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Source channel not found")
+
+    # Get target channel
+    c.execute("SELECT lid, cid, sort_order FROM channels WHERE lid=?", (target_lid,))
+    tgt = c.fetchone()
+    if not tgt:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Target channel not found")
+
+    src_cid = src["cid"]
+    tgt_cid = tgt["cid"]
+
+    # If different groups, just reassign (assign handles grp name)
+    if src_cid != tgt_cid:
+        try:
+            c.execute("BEGIN")
+            # Look up target group name
+            c.execute("SELECT name FROM categories WHERE cid=?", (tgt_cid,))
+            cat_row = c.fetchone()
+            target_grp = cat_row["name"] if cat_row else ""
+
+            # Get all sort_orders in target group, find insert position
+            c.execute("SELECT sort_order FROM channels WHERE cid=? ORDER BY sort_order", (tgt_cid,))
+            orders = [r["sort_order"] for r in c.fetchall()]
+            target_order = tgt["sort_order"]
+
+            # Shift everything at or after target position down by 1
+            c.execute("UPDATE channels SET sort_order=sort_order+1 WHERE cid=? AND sort_order>=?", (tgt_cid, target_order))
+
+            # Set the moved channel's position
+            c.execute("UPDATE channels SET cid=?, grp=?, sort_order=? WHERE lid=?", (tgt_cid, target_grp, target_order, lid))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            conn.close()
+            raise HTTPException(status_code=500, detail=f"DB error: {e}")
+        conn.close()
+        return {"success": True, "new_group": tgt_cid}
+    else:
+        # Same group: reorder by swapping sort_orders
+        try:
+            c.execute("BEGIN")
+            c.execute("UPDATE channels SET sort_order=? WHERE lid=?", (tgt["sort_order"], lid))
+            c.execute("UPDATE channels SET sort_order=? WHERE lid=?", (src["sort_order"], target_lid))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            conn.close()
+            raise HTTPException(status_code=500, detail=f"DB error: {e}")
+        conn.close()
+        return {"success": True, "swapped": True}
+
+
+@app.post("/admin/api/channels/ungroup")
+async def api_ungroup_channels(request: Request, auth: Optional[str] = Depends(admin_auth)):
+    """Remove channels from their group (set to ungrouped)."""
+    body = await request.json()
+    lids = body.get("lids", [])
+
+    if not lids or not isinstance(lids, list) or len(lids) == 0:
+        raise HTTPException(status_code=400, detail="lids array required")
+
+    conn = get_db()
+    c = conn.cursor()
+
+    try:
+        c.execute("BEGIN")
+        for lid in lids:
+            c.execute("UPDATE channels SET cid=0, grp='' WHERE lid=?", (lid,))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+    # Verify
+    c.execute("SELECT COUNT(*) as cnt FROM channels WHERE cid=0 AND lid IN ({})".format(
+        ",".join("?" * len(lids))), list(lids))
+    saved_count = c.fetchone()["cnt"]
+    conn.close()
+
+    return {"success": True, "ungrouped": saved_count}
