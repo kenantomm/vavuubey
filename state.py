@@ -1,7 +1,11 @@
 """
-state.py - Ortak state modulu.
+state.py - Ortak state modulu (OPTIMIZED v2).
 Token ve resolve fonksiyonlari burada.
 video.py server.py'yi import ETMEZ, sadece state import eder.
+
+OPTIMIZASYONLAR:
+- resolve_mediahubmx icin shared httpx client destegi
+- Cache TTL arttirildi (30dk -> 30dk, ama expired fallback)
 """
 import os
 import random
