@@ -1,1208 +1,760 @@
-from fastapi import FastAPI, Request, Depends, HTTPException
-from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse, Response, HTMLResponse
-from fastapi.routing import APIRoute
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-import state
-import httpx
-import time
+"""
+video.py - FastAPI uygulama.
+server.py'yi IMPORT ETMEZ - circular import onlemek icin.
+Hem resolve hem token fonksiyonlari state.py'den gelir.
+"""
 import os
-import secrets
+import sqlite3
+import threading
+import re
 
-app = FastAPI(title="Omer")
+from fastapi import FastAPI, Request, Query, HTTPException
+from fastapi.responses import PlainTextResponse, RedirectResponse, Response
 
-# Admin protection via HTTP Basic Auth (set via env vars ADMIN_USER + ADMIN_PASS)
-ADMIN_USER = os.environ.get("ADMIN_USER", "")
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "")
+import state
 
-security = HTTPBasic()
+app = FastAPI(title="VxParser IPTV Proxy", version="7.2.0")
 
-def verify_admin(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
-    """Verify admin credentials via HTTP Basic Auth. If no ADMIN_USER/ADMIN_PASS set, allow all."""
-    if not ADMIN_USER and not ADMIN_PASS:
-        return True
-    correct_user = secrets.compare_digest(credentials.username or "", ADMIN_USER)
-    correct_pass = secrets.compare_digest(credentials.password or "", ADMIN_PASS)
-    if not (correct_user and correct_pass):
-        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
-    return True
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASS", "admin123")
 
-VAVOO_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Referer": "https://vavoo.to/",
-    "Origin": "https://vavoo.to",
-    "Accept": "*/*",
-}
 
-def detect_host(request: Request) -> str:
-    forwarded = request.headers.get("X-Forwarded-Proto", "https")
-    host = request.headers.get("Host", request.url.hostname or "localhost")
-    return f"{forwarded}://{host}"
+def get_db():
+    conn = sqlite3.connect(state.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def build_m3u(host: str) -> str:
-    """Build M3U playlist with tvg-id, tvg-logo, tvg-name"""
-    lines = ['#EXTM3U url-tvg="" deinterlace="1"']
-    channels = state.get_all_channels(ordered=True)
-    for ch in channels:
-        ch_id = ch["id"]
-        ch_name = ch["name"]
-        ch_grp = ch["grp"]
-        ch_logo = ch.get("picon", "") or ch.get("logo", "")
-        ch_tvg_id = ch.get("tvg_id", "")
-        
-        attrs = []
-        if ch_tvg_id:
-            attrs.append(f'tvg-id="{ch_tvg_id}"')
-        if ch_logo:
-            attrs.append(f'tvg-logo="{ch_logo}"')
-        attrs.append(f'group-title="{ch_grp}"')
-        
-        attr_str = " ".join(attrs)
-        lines.append(f'#EXTINF:-1 {attr_str},{ch_name}')
-        lines.append(f'{host}/channel/{ch_id}')
-    return "\n".join(lines)
 
-@app.get("/get.php")
-async def get_m3u(request: Request, username: str = "", password: str = "", type: str = "m3u_plus"):
-    host = detect_host(request)
-    return PlainTextResponse(build_m3u(host), media_type="audio/x-mpegurl")
+def get_base_host(request: Request) -> str:
+    proto = request.headers.get("x-forwarded-proto", "https")
+    host = request.headers.get("host", "localhost:10000")
+    return f"{proto}://{host}"
 
-@app.get("/player_api.php")
-async def player_api(request: Request, username: str = "", password: str = "", action: str = ""):
-    host = detect_host(request)
-    if action == "get_live_categories":
-        groups = {}
-        for ch in state.get_all_channels(ordered=True):
-            groups[ch["grp"]] = groups.get(ch["grp"], 0) + 1
-        return JSONResponse([{"category_id": str(i+1), "category_name": g, "parent_id": 0} for i, g in enumerate(groups.keys())])
-    elif action == "get_live_streams":
-        return JSONResponse([{
-            "num": i+1,
-            "name": ch["name"],
-            "stream_type": "live",
-            "stream_id": ch["id"],
-            "stream_icon": ch.get("picon", "") or ch.get("logo", ""),
-            "epg_channel_id": ch.get("tvg_id", ""),
-            "added": "",
-            "category_id": "",
-            "custom_sid": "",
-            "tv_archive": 0,
-            "direct_source": "",
-            "tv_archive_duration": 0
-        } for i, ch in enumerate(state.get_all_channels(ordered=True))])
-    return PlainTextResponse(build_m3u(host), media_type="audio/x-mpegurl")
 
-# ===== EPG Endpoints =====
-
-@app.get("/epg.xml")
-async def get_epg_xml():
-    """Serve EPG XML file"""
-    try:
-        import epg
-        xml_str = epg.get_cached_epg_xml()
-        if xml_str:
-            return PlainTextResponse(xml_str, media_type="application/xml; charset=utf-8")
-    except Exception as e:
-        state.add_log(f"EPG XML serve error: {e}")
-    return PlainTextResponse('<?xml version="1.0" encoding="utf-8"?><tv></tv>', media_type="application/xml; charset=utf-8")
-
-@app.get("/epg.xml.gz")
-async def get_epg_gz():
-    """Serve gzipped EPG XML"""
-    try:
-        import epg
-        gz_data = epg.get_cached_epg_gz()
-        if gz_data:
-            return Response(content=gz_data, media_type="application/x-gzip",
-                          headers={"Content-Disposition": "attachment; filename=epg.xml.gz"})
-    except Exception as e:
-        state.add_log(f"EPG GZ serve error: {e}")
-    import gzip
-    empty = gzip.compress(b'<?xml version="1.0" encoding="utf-8"?><tv></tv>')
-    return Response(content=empty, media_type="application/x-gzip")
-
-@app.get("/xmltv.xml")
-async def get_xmltv():
-    """Serve XMLTV format EPG (alias for epg.xml)"""
-    return await get_epg_xml()
-
-# ===== Picon Proxy Endpoint =====
-
-@app.get("/picon/{ch_name:path}")
-async def get_picon(ch_name: str):
-    """Proxy picon images to avoid CORS and mixed content issues"""
-    try:
-        channels = state.get_all_channels(ordered=False)
-        for ch in channels:
-            ch_norm = ch["name"].upper().strip()
-            req_norm = ch_name.upper().strip().replace("_", " ").replace("-", " ")
-            if ch_norm == req_norm or ch_norm in req_norm or req_norm in ch_norm:
-                picon_url = ch.get("picon", "") or ch.get("logo", "")
-                if picon_url:
-                    async with httpx.AsyncClient(timeout=10, verify=False) as client:
-                        r = await client.get(picon_url, follow_redirects=True)
-                        if r.status_code == 200:
-                            ct = r.headers.get("content-type", "image/png")
-                            return Response(content=r.content, media_type=ct)
-                break
-    except Exception:
-        pass
-    import base64
-    tiny_png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPj/HwADBwIAMCbHYQAAAABJRU5ErkJggg==")
-    return Response(content=tiny_png, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
-
-# ===== Channel Stream Endpoints =====
-
-@app.get("/channel/{ch_id}")
-async def channel_stream(ch_id: int):
-    """Resolve channel stream and proxy it"""
-    ch = state.get_channel(ch_id)
-    if not ch:
-        return JSONResponse({"error": "Not found"}, status_code=404)
-
-    cache_key = str(ch_id)
-    if cache_key in state.RESOLVE_CACHE:
-        cached = state.RESOLVE_CACHE[cache_key]
-        if cached.get("expires", 0) > time.time():
-            return await proxy_stream(cached["url"], ch_id)
-
-    hls = ch.get("hls", "")
-    if hls:
-        state.add_log(f"[{ch_id}] Catalog HLS resolve: {hls[:80]}")
-        resolved = await state.resolve_mediahubmx(hls)
-        if resolved:
-            state.RESOLVE_CACHE[cache_key] = {"url": resolved, "expires": time.time() + 300}
-            return await proxy_stream(resolved, ch_id)
-
-    url = ch.get("url", "")
-    if url:
-        resolved = await state.resolve_mediahubmx(url)
-        if resolved:
-            state.RESOLVE_CACHE[cache_key] = {"url": resolved, "expires": time.time() + 300}
-            return await proxy_stream(resolved, ch_id)
-
-    if url:
-        return await proxy_stream(url, ch_id)
-
-    return JSONResponse({"error": "Could not resolve stream"}, status_code=502)
-
-async def proxy_stream(url, ch_id):
-    """Fetch and proxy a stream URL with rewriting for HLS"""
-    try:
-        async with httpx.AsyncClient(timeout=20, verify=False, follow_redirects=True) as client:
-            r = await client.get(url, headers=VAVOO_HEADERS)
-            if r.status_code != 200:
-                return JSONResponse({"error": f"upstream {r.status_code}", "url": url, "body": r.text[:200]}, status_code=502)
-            
-            content_type = r.headers.get("content-type", "")
-            text = r.text
-            base = url.rsplit("/", 1)[0] + "/"
-
-            def rewrite(line):
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    return line
-                if line.startswith("http"):
-                    return f"/channel/{ch_id}/stream?url={line}"
-                else:
-                    abs_url = base + line if not line.startswith("/") else f"https://vavoo.to{line}"
-                    return f"/channel/{ch_id}/stream?url={abs_url}"
-
-            lines = text.split("\n")
-            rewritten = "\n".join(rewrite(l) for l in lines)
-            return PlainTextResponse(rewritten, media_type="application/vnd.apple.mpegurl")
-    except httpx.TimeoutException:
-        return JSONResponse({"error": "timeout"}, status_code=504)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-@app.get("/channel/{ch_id}/stream")
-async def channel_substream(ch_id: int, url: str):
-    if not url:
-        return JSONResponse({"error": "no url"}, status_code=400)
-    try:
-        async with httpx.AsyncClient(timeout=20, verify=False, follow_redirects=True) as client:
-            r = await client.get(url, headers=VAVOO_HEADERS)
-            if r.status_code != 200:
-                return JSONResponse({"error": f"upstream {r.status_code}"}, status_code=502)
-            content_type = r.headers.get("content-type", "")
-            if "mpegurl" in content_type or ".m3u8" in url:
-                text = r.text
-                base = url.rsplit("/", 1)[0] + "/"
-                def rewrite(line):
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        return line
-                    if line.startswith("http"):
-                        return f"/channel/{ch_id}/stream?url={line}"
-                    else:
-                        abs_url = base + line if not line.startswith("/") else f"https://vavoo.to{line}"
-                        return f"/channel/{ch_id}/stream?url={abs_url}"
-                lines = text.split("\n")
-                rewritten = "\n".join(rewrite(l) for l in lines)
-                return PlainTextResponse(rewritten, media_type="application/vnd.apple.mpegurl")
-            return StreamingResponse(iter([r.content]), media_type=content_type or "video/MP2T", headers={"Content-Length": str(len(r.content))})
-    except httpx.TimeoutException:
-        return JSONResponse({"error": "timeout"}, status_code=504)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-# ===== Utility Endpoints =====
-
-def add_log(msg):
-    state.add_log(msg)
-
-@app.get("/ping")
-@app.head("/ping")
-async def ping():
-    """Lightweight health check for UptimeRobot/cron-job - returns 200 OK"""
-    return PlainTextResponse("pong", status_code=200, media_type="text/plain")
+# ============================================================
+# DURUM
+# ============================================================
 
 @app.get("/")
-async def root(request: Request):
-    host = detect_host(request)
-    return PlainTextResponse(
-        f"Omer Online\n"
+async def root():
+    return {
+        "status": "ready" if state.DATA_READY else "loading",
+        "error": state.STARTUP_ERROR,
+        "load_time": round(state.LOAD_TIME, 1) if state.DATA_READY else None,
+        "message": "Hazir!" if state.DATA_READY else "Kanallar yukleniyor, 30-60sn bekle...",
+        "logs_count": len(state.STARTUP_LOGS),
+    }
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+# ============================================================
+# API STATUS (Xtream uyumlu)
+# ============================================================
+
+@app.get("/api/status")
+async def api_status():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM channels")
+    total = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM categories")
+    cats = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM channels WHERE hls != '' AND hls IS NOT NULL")
+    hls_count = c.fetchone()[0]
+    conn.close()
+    return {
+        "status": "ready" if state.DATA_READY else "loading",
+        "data_ready": state.DATA_READY,
+        "error": state.STARTUP_ERROR,
+        "load_time": round(state.LOAD_TIME, 1) if state.DATA_READY else None,
+        "available_channels": total,
+        "available_categories": cats,
+        "hls_channels": hls_count,
+        "vavoo_token": bool(state._vavoo_sig),
+        "lokke_token": bool(state._watched_sig),
+        "startup_logs": state.STARTUP_LOGS,
+    }
+
+
+# ============================================================
+# DEBUG
+# ============================================================
+
+@app.get("/debug")
+async def debug():
+    return {
+        "data_ready": state.DATA_READY,
+        "error": state.STARTUP_ERROR,
+        "vavoo_token": bool(state._vavoo_sig),
+        "lokke_token": bool(state._watched_sig),
+        "startup_logs": state.STARTUP_LOGS,
+        "db_path": state.DB_PATH,
+    }
+
+
+# ============================================================
+# CHANNEL TEST (debug - redirect yapmaz)
+# ============================================================
+
+@app.get("/test/{sid}")
+async def test_channel(sid: str):
+    """Kanal bilgisi ve resolve sonucunu goster (redirect yapmaz)"""
+    conn = get_db()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT lid, name, url, hls, grp FROM channels WHERE lid=?", (sid,))
+    ch = c.fetchone()
+    conn.close()
+
+    if not ch:
+        return {"error": f"Kanal {sid} bulunamadi"}
+
+    # Resolve test
+    resolved_url, method = state.resolve_channel(sid)
+
+    return {
+        "lid": ch["lid"],
+        "name": ch["name"],
+        "url": ch["url"],
+        "hls": ch["hls"],
+        "grp": ch["grp"],
+        "resolve_method": method,
+        "resolved_url": resolved_url,
+    }
+
+
+# ============================================================
+# CHANNEL RESOLVE - state.resolve_channel kullanir
+# ============================================================
+
+@app.get("/channel/{sid}")
+async def play_channel(sid: str):
+    """
+    Kanal resolve ve redirect.
+    state.resolve_channel() kullanir - server.py'ye gerek YOK.
+    """
+    url, method = state.resolve_channel(sid)
+    if url:
+        return RedirectResponse(url=url, status_code=302)
+    raise HTTPException(status_code=503, detail=method)
+
+
+# ============================================================
+# M3U PLAYLIST
+# ============================================================
+
+@app.get("/get.php")
+async def get_playlist(
+    request: Request,
+    username: str = Query("admin"),
+    password: str = Query("admin"),
+    type: str = Query("m3u_plus"),
+    output: str = Query("m3u_plus"),
+):
+    host = get_base_host(request)
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        "SELECT c.lid, c.name, c.url, c.hls, c.logo, "
+        "COALESCE(cat.name, 'Sonstige') as group_name "
+        "FROM channels c LEFT JOIN categories cat ON c.cid = cat.cid "
+        "ORDER BY COALESCE(cat.sort_order, 9999), c.name"
     )
+    channels = c.fetchall()
+    conn.close()
 
-# ===== robots.txt =====
+    lines = [f'#EXTM3U url-tvg="{host}/epg.xml" deinterlace="1"']
+    for ch in channels:
+        lid = ch["lid"]
+        logo = ch["logo"] or ""
+        group = ch["group_name"]
+        name = ch["name"]
+        stream_url = f"{host}/channel/{lid}"
+        lines.append(f'#EXTINF:-1 tvg-id="{lid}" tvg-logo="{logo}" group-title="{group}",{name}')
+        lines.append(stream_url)
 
-@app.get("/robots.txt")
-async def robots_txt():
-    return PlainTextResponse("User-agent: *\nDisallow: /\n", media_type="text/plain")
+    return PlainTextResponse(content="\n".join(lines), media_type="audio/x-mpegurl")
 
-# ===== Admin Panel =====
 
-ALL_GROUPS = [
-    "TR ULUSAL", "TR SPOR", "TR SINEMA", "TR SINEMA VOD", "TR DIZI", "TR 7/24 DIZI",
-    "TR BELGESEL", "TR COCUK", "TR MUZIK", "TR HABER", "TR DINI", "TR YEREL",
-    "TR RADYO", "TR 4K", "TR 8K", "TR RAW",
-    "DE VOLLPROGRAMM", "DE NACHRICHTEN", "DE DOKU", "DE KINDER", "DE FILM",
-    "DE MUSIK", "DE SPORT", "DE SONSTIGE",
-]
+# ============================================================
+# EPG (XMLTV)
+# ============================================================
 
-@app.get("/admin")
-async def admin_page(request: Request, auth: bool = Depends(verify_admin)):
-    return HTMLResponse(ADMIN_HTML)
+@app.get("/epg.xml")
+async def epg_xml():
+    xml_content = state.get_epg_data()
+    if xml_content:
+        return Response(content=xml_content, media_type="application/xml")
+    return Response(content="<?xml version='1.0'?><tv><error>EPG not ready</error></tv>", media_type="application/xml")
 
-@app.get("/api/admin/channels")
-async def admin_get_channels(request: Request, auth: bool = Depends(verify_admin)):
-    channels = state.get_all_channels(ordered=True)
-    overrides = state.get_all_overrides()
-    return JSONResponse([{
-        "name": c["name"], "grp": c["grp"], "country": c["country"],
-        "id": c["id"], "logo": c.get("picon", "") or c.get("logo", ""),
-        "has_override": c["name"].upper().strip() in overrides
-    } for c in channels])
 
-@app.get("/api/admin/overrides")
-async def admin_get_overrides(request: Request, auth: bool = Depends(verify_admin)):
-    return JSONResponse(state.get_all_overrides())
+# ============================================================
+# XTREAM CODES JSON API
+# ============================================================
 
-@app.post("/api/admin/overrides")
-async def admin_save_overrides(request: Request, auth: bool = Depends(verify_admin)):
-    data = await request.json()
-    if not isinstance(data, dict):
-        return JSONResponse({"error": "dict expected"}, status_code=400)
-    count = state.batch_set_overrides(data)
-    return JSONResponse({"ok": True, "count": count})
+@app.get("/player_api.php")
+async def player_api(
+    request: Request,
+    username: str = Query("admin"),
+    password: str = Query("admin"),
+    action: str = Query(None),
+):
+    host = get_base_host(request)
+    conn = get_db()
 
-@app.delete("/api/admin/overrides")
-async def admin_clear_overrides(request: Request, auth: bool = Depends(verify_admin)):
-    state.delete_all_overrides()
-    return JSONResponse({"ok": True})
+    if action == "get_live_categories":
+        c = conn.cursor()
+        c.execute("SELECT cid as category_id, name as category_name FROM categories ORDER BY sort_order")
+        cats = [dict(r) for r in c.fetchall()]
+        conn.close()
+        return cats
 
-@app.get("/api/admin/overrides/export")
-async def admin_export_overrides(request: Request, auth: bool = Depends(verify_admin)):
-    overrides = state.get_all_overrides()
-    import json
-    text = json.dumps(overrides, indent=2, ensure_ascii=False)
-    return PlainTextResponse(text, media_type="application/json",
-                             headers={"Content-Disposition": "attachment; filename=omer-overrides.json"})
+    elif action == "get_live_streams":
+        c = conn.cursor()
+        c.execute(
+            "SELECT c.lid as stream_id, c.name as name, c.logo as stream_icon, "
+            "c.cid as category_id, COALESCE(cat.name, 'Sonstige') as category_name "
+            "FROM channels c LEFT JOIN categories cat ON c.cid = cat.cid "
+            "ORDER BY COALESCE(cat.sort_order, 9999), c.name"
+        )
+        streams = []
+        for r in c.fetchall():
+            row = dict(r)
+            row["stream_url"] = f"{host}/channel/{row['stream_id']}"
+            streams.append(row)
+        conn.close()
+        return streams
 
-@app.post("/api/admin/overrides/import")
-async def admin_import_overrides(request: Request, auth: bool = Depends(verify_admin)):
-    data = await request.json()
-    if not isinstance(data, dict):
-        return JSONResponse({"error": "dict expected"}, status_code=400)
-    count = state.import_overrides(data)
-    return JSONResponse({"ok": True, "imported": count})
+    else:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM channels")
+        total = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM categories")
+        cats = c.fetchone()[0]
+        conn.close()
+        return {
+            "user_info": {"username": username, "status": "Active", "exp_date": "2099-01-01", "max_connections": 1},
+            "server_info": {"port": str(state.PORT), "url": f"{host}/epg.xml"},
+            "available_channels": total,
+            "available_categories": cats,
+        }
 
-@app.post("/api/admin/reorder")
-async def admin_reorder(request: Request, auth: bool = Depends(verify_admin)):
-    data = await request.json()
-    channel_name = data.get("channel", "")
-    direction = data.get("direction", "")
-    if not channel_name or direction not in ("up", "down"):
-        return JSONResponse({"error": "channel and direction required"}, status_code=400)
-    success, msg = state.reorder_channel(channel_name, direction)
-    if success:
-        return JSONResponse({"ok": True, "message": msg})
-    return JSONResponse({"ok": False, "message": msg}, status_code=400)
 
-@app.post("/api/admin/reorder-to")
-async def admin_reorder_to(request: Request, auth: bool = Depends(verify_admin)):
-    """Move a channel to a specific position index within its group (for drag-to-reorder)"""
-    data = await request.json()
-    channel_name = data.get("channel", "")
-    target_index = data.get("target_index", -1)
-    if not channel_name or target_index < 0:
-        return JSONResponse({"error": "channel and target_index required"}, status_code=400)
-    success, msg = state.reorder_channel_to_position(channel_name, target_index)
-    if success:
-        return JSONResponse({"ok": True, "message": msg})
-    return JSONResponse({"ok": False, "message": msg}, status_code=400)
+# ============================================================
+# RELOAD
+# ============================================================
 
-ADMIN_HTML = r"""<!DOCTYPE html>
+@app.get("/reload")
+async def reload_channels():
+    state.DATA_READY = False
+    state.STARTUP_ERROR = None
+    state.STARTUP_LOGS.clear()
+
+    def do_reload():
+        import server
+        try:
+            server.init_db()
+            server.fetch_vavoo_channels()
+            server.fetch_hls_links()
+            server.remap_groups()
+            state.DATA_READY = True
+        except Exception as e:
+            state.STARTUP_ERROR = str(e)
+
+    threading.Thread(target=do_reload, daemon=True).start()
+    return {"status": "reloading", "message": "Yukleniyor... 30-60sn bekle"}
+
+
+# ============================================================
+# STATS
+# ============================================================
+
+# ============================================================
+# ADMIN PANEL (Tek sayfa HTML)
+# ============================================================
+
+ADMIN_HTML = """<!DOCTYPE html>
 <html lang="tr">
 <head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex, nofollow, noarchive">
-<title>Omer Admin</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VxParser Admin</title>
 <style>
-:root{
-  --bg:#0a0e17;--bg2:#111827;--bg3:#1a2236;--bg4:#232d42;
-  --border:#2a3550;--border2:#3a4a6b;
-  --text:#e2e8f0;--text2:#94a3b8;--text3:#64748b;
-  --blue:#3b82f6;--blue2:#2563eb;--blue-bg:rgba(59,130,246,.1);
-  --green:#22c55e;--green-bg:rgba(34,197,94,.1);
-  --red:#ef4444;--red-bg:rgba(239,68,68,.1);
-  --yellow:#f59e0b;--yellow-bg:rgba(245,158,11,.1);
-  --purple:#a855f7;--purple-bg:rgba(168,85,247,.1);
-  --sidebar-w:280px;
-}
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow:hidden}
-.app{display:flex;height:100vh}
-.sidebar{width:var(--sidebar-w);min-width:var(--sidebar-w);background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;height:100vh;overflow:hidden;transition:transform .3s}
-.main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f1117; color: #e0e0e0; min-height: 100vh; }
 
-/* SIDEBAR */
-.sb-hdr{padding:20px;border-bottom:1px solid var(--border);background:linear-gradient(135deg,var(--bg2),var(--bg3))}
-.sb-hdr h1{font-size:18px;font-weight:700;display:flex;align-items:center;gap:10px}
-.sb-hdr h1 .icon{width:32px;height:32px;background:linear-gradient(135deg,var(--blue),var(--purple));border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;color:#fff}
-.sb-hdr p{font-size:11px;color:var(--text3);margin-top:4px;letter-spacing:.3px}
+/* NAVBAR */
+.navbar { background: linear-gradient(135deg, #1a1d2e 0%, #252840 100%); padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #2a2d45; position: sticky; top: 0; z-index: 100; }
+.navbar h1 { font-size: 20px; font-weight: 700; color: #8b5cf6; }
+.navbar .nav-links { display: flex; gap: 8px; }
+.nav-btn { padding: 8px 16px; border-radius: 8px; border: 1px solid #2a2d45; background: transparent; color: #a0a0b0; cursor: pointer; font-size: 13px; font-weight: 500; transition: all 0.2s; }
+.nav-btn:hover, .nav-btn.active { background: #8b5cf6; color: white; border-color: #8b5cf6; }
 
-.sb-search{padding:12px}
-.sb-search .search-box{position:relative}
-.sb-search input{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:9px 12px 9px 36px;border-radius:8px;font-size:13px;outline:none;transition:.2s}
-.sb-search input:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(59,130,246,.15)}
-.sb-search .s-icon{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--text3);font-size:14px;pointer-events:none}
-.sb-search .s-clear{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text3);cursor:pointer;font-size:16px;display:none;padding:2px 4px;border-radius:4px}
-.sb-search .s-clear:hover{color:var(--text);background:var(--bg3)}
-.sb-search input:not(:placeholder-shown)~.s-clear{display:block}
+/* LOGIN */
+.login-wrap { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+.login-box { background: #1a1d2e; padding: 40px; border-radius: 16px; border: 1px solid #2a2d45; width: 360px; text-align: center; }
+.login-box h2 { color: #8b5cf6; margin-bottom: 24px; font-size: 24px; }
+.login-box input { width: 100%; padding: 12px 16px; border-radius: 8px; border: 1px solid #2a2d45; background: #0f1117; color: #e0e0e0; font-size: 14px; margin-bottom: 16px; }
+.login-box button { width: 100%; padding: 12px; border-radius: 8px; border: none; background: #8b5cf6; color: white; font-size: 14px; font-weight: 600; cursor: pointer; }
+.login-box button:hover { background: #7c3aed; }
+.login-error { color: #ef4444; font-size: 13px; margin-top: 12px; }
 
-.sb-groups{flex:1;overflow-y:auto;padding:4px 8px 16px}
-.sb-groups::-webkit-scrollbar{width:4px}
-.sb-groups::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
-.sb-section{margin-top:8px}
-.sb-section-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;color:var(--text3);padding:8px 10px 4px;display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none}
-.sb-section-title:hover{color:var(--text2)}
-.sb-section-title .arrow{font-size:8px;transition:transform .2s}
-.sb-section-title.collapsed .arrow{transform:rotate(-90deg)}
-.sb-section-body.collapsed{display:none}
-.grp-item{display:flex;align-items:center;padding:7px 10px;border-radius:6px;cursor:pointer;transition:.15s;gap:8px;font-size:13px;margin:1px 0;position:relative}
-.grp-item:hover{background:var(--bg3)}
-.grp-item.active{background:var(--blue-bg);color:var(--blue);font-weight:600}
-.grp-item .g-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
-.grp-item .g-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.grp-item .g-cnt{font-size:11px;color:var(--text3);background:var(--bg);padding:1px 7px;border-radius:10px;font-weight:600}
-.grp-item.active .g-cnt{background:rgba(59,130,246,.2);color:var(--blue)}
+/* TABS */
+.tab-content { display: none; padding: 24px; max-width: 1400px; margin: 0 auto; }
+.tab-content.active { display: block; }
 
-/* DROP TARGET styles */
-.grp-item.drop-target{background:rgba(34,197,94,.15)!important;border:2px dashed var(--green);border-radius:6px;padding:5px 8px}
-.grp-item.drop-target .g-dot{background:var(--green)!important;box-shadow:0 0 8px var(--green)}
-.grp-item.drop-reject{border:2px dashed var(--red)!important;background:rgba(239,68,68,.1)!important}
+/* CARDS */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+.card { background: #1a1d2e; border: 1px solid #2a2d45; border-radius: 12px; padding: 20px; }
+.card-label { font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+.card-value { font-size: 28px; font-weight: 700; }
+.card-value.green { color: #10b981; }
+.card-value.red { color: #ef4444; }
+.card-value.yellow { color: #f59e0b; }
+.card-value.blue { color: #3b82f6; }
+.card-value.purple { color: #8b5cf6; }
 
-/* DRAG styles on table rows */
-.ch-dragging{opacity:.4}
-.ch-drag-clone{position:fixed;pointer-events:none;z-index:9999;background:var(--bg3);border:1px solid var(--blue);border-radius:8px;padding:8px 14px;font-size:13px;color:var(--text);box-shadow:0 8px 24px rgba(0,0,0,.5);display:flex;align-items:center;gap:8px;max-width:300px}
-.ch-drag-clone .dc-icon{font-size:16px}
+/* STATUS BAR */
+.status-bar { background: #1a1d2e; border: 1px solid #2a2d45; border-radius: 12px; padding: 16px 20px; margin-bottom: 24px; display: flex; align-items: center; gap: 12px; }
+.status-dot { width: 12px; height: 12px; border-radius: 50%; }
+.status-dot.ok { background: #10b981; box-shadow: 0 0 8px #10b981; }
+.status-dot.loading { background: #f59e0b; animation: pulse 1.5s infinite; }
+.status-dot.error { background: #ef4444; box-shadow: 0 0 8px #ef4444; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
-/* ROW DROP INDICATOR - blue line between rows */
-.drop-indicator{height:3px;background:var(--blue);border-radius:2px;margin:-1px 0;box-shadow:0 0 8px var(--blue);pointer-events:none;z-index:5;transition:opacity .1s;animation:dropPulse .8s infinite}
-.drop-indicator::before{content:'';position:absolute;left:0;top:-4px;width:10px;height:10px;background:var(--blue);border-radius:50%}
-.drop-indicator::after{content:'';position:absolute;right:0;top:-4px;width:10px;height:10px;background:var(--blue);border-radius:50%}
-.drop-indicator{position:relative;overflow:visible}
-@keyframes dropPulse{0%,100%{opacity:.6}50%{opacity:1}}
-
-/* ROW hover drop target */
-.tbl tr.row-drop-above td{border-top:2px solid var(--blue)!important}
-.tbl tr.row-drop-below td{border-bottom:2px solid var(--blue)!important}
-
-/* DROP HINT banner */
-.drop-hint{position:fixed;top:0;left:var(--sidebar-w);right:0;height:4px;background:linear-gradient(90deg,var(--blue),var(--green),var(--blue));z-index:100;opacity:0;transition:opacity .2s;pointer-events:none}
-.drop-hint.active{opacity:1;animation:hintPulse 1s infinite}
-@keyframes hintPulse{0%,100%{opacity:.7}50%{opacity:1}}
-
-.sb-footer{padding:12px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:4px}
-.sb-footer .sbtn{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:6px;border:none;background:none;color:var(--text2);font-size:12px;cursor:pointer;transition:.15s;width:100%;text-align:left}
-.sb-footer .sbtn:hover{background:var(--bg3);color:var(--text)}
-.sb-footer .sbtn svg{width:16px;height:16px;flex-shrink:0}
-
-/* TOP BAR */
-.topbar{padding:16px 24px;border-bottom:1px solid var(--border);background:var(--bg2);display:flex;align-items:center;gap:16px;flex-shrink:0}
-.topbar .mob-toggle{display:none;background:none;border:none;color:var(--text);font-size:20px;cursor:pointer;padding:4px}
-.stats-row{display:flex;gap:12px;flex:1;flex-wrap:wrap}
-.stat-card{display:flex;align-items:center;gap:10px;padding:8px 16px;background:var(--bg);border:1px solid var(--border);border-radius:10px;min-width:120px}
-.stat-card .sc-icon{width:36px;height:36px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
-.stat-card .sc-icon.blue{background:var(--blue-bg);color:var(--blue)}
-.stat-card .sc-icon.green{background:var(--green-bg);color:var(--green)}
-.stat-card .sc-icon.yellow{background:var(--yellow-bg);color:var(--yellow)}
-.stat-card .sc-icon.purple{background:var(--purple-bg);color:var(--purple)}
-.stat-card .sc-info b{display:block;font-size:18px;font-weight:700;line-height:1.2}
-.stat-card .sc-info small{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px}
-.topbar-actions{display:flex;gap:8px;flex-shrink:0}
-
-/* TOOLBAR */
-.toolbar{padding:12px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;background:var(--bg2);flex-shrink:0;flex-wrap:wrap}
-.toolbar .bulk-sel{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2)}
-.toolbar .bulk-sel label{cursor:pointer;display:flex;align-items:center;gap:4px}
-.toolbar .search-main{position:relative;flex:1;max-width:400px}
-.toolbar .search-main input{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px 36px 8px 36px;border-radius:8px;font-size:13px;outline:none;transition:.2s}
-.toolbar .search-main input:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(59,130,246,.15)}
-.toolbar .search-main .si{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--text3);font-size:13px;pointer-events:none}
-.toolbar .search-main .sc{position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text3);cursor:pointer;font-size:14px;padding:2px;display:none;border-radius:4px}
-.toolbar .search-main input:not(:placeholder-shown)~.sc{display:block}
-.toolbar .search-main .sc:hover{color:var(--text)}
-.toolbar .result-count{font-size:12px;color:var(--text3);white-space:nowrap}
-.drag-hint-bar{font-size:11px;color:var(--blue);display:flex;align-items:center;gap:4px;white-space:nowrap;padding:4px 10px;background:var(--blue-bg);border-radius:6px;border:1px solid rgba(59,130,246,.2)}
-.drag-hint-bar svg{width:14px;height:14px}
-
-/* BUTTONS */
-.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 14px;border-radius:8px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-size:12px;font-weight:500;cursor:pointer;transition:.15s;white-space:nowrap}
-.btn:hover{background:var(--bg4);border-color:var(--border2)}
-.btn:disabled{opacity:.4;cursor:not-allowed}
-.btn svg{width:14px;height:14px}
-.btn-blue{background:var(--blue);border-color:var(--blue2);color:#fff}
-.btn-blue:hover{background:var(--blue2)}
-.btn-green{background:var(--green);border-color:#16a34a;color:#fff}
-.btn-green:hover{background:#16a34a}
-.btn-green:disabled{background:var(--green);opacity:.5}
-.btn-red{background:var(--red);border-color:#dc2626;color:#fff}
-.btn-red:hover{background:#dc2626}
-.btn-ghost{background:transparent;border-color:transparent}
-.btn-ghost:hover{background:var(--bg3)}
-.btn-ghost:active{background:var(--blue-bg);color:var(--blue)}
-
-/* REORDER buttons */
-.reorder-btn{width:26px;height:26px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--text2);font-size:11px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:.15s;padding:0}
-.reorder-btn:hover{background:var(--blue-bg);color:var(--blue);border-color:var(--blue)}
-.reorder-btn:active{transform:scale(.92)}
+/* LOG BOX */
+.log-box { background: #0f1117; border: 1px solid #2a2d45; border-radius: 12px; padding: 16px; max-height: 350px; overflow-y: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.8; }
+.log-box .log-line { color: #9ca3af; }
+.log-box .log-line.ok { color: #10b981; }
+.log-box .log-line.err { color: #ef4444; }
+.log-box .log-line.warn { color: #f59e0b; }
 
 /* TABLE */
-.table-wrap{flex:1;overflow-y:auto;padding:0 24px 24px}
-.table-wrap::-webkit-scrollbar{width:6px}
-.table-wrap::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
-.tbl{background:var(--bg2);border:1px solid var(--border);border-radius:12px;overflow:hidden}
-.tbl table{width:100%;border-collapse:collapse}
-.tbl thead{position:sticky;top:0;z-index:3}
-.tbl th{background:var(--bg3);padding:10px 14px;text-align:left;font-size:11px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--border)}
-.tbl td{padding:8px 14px;border-bottom:1px solid var(--border);font-size:13px;vertical-align:middle}
-.tbl tr:last-child td{border-bottom:none}
-.tbl tr:hover td{background:rgba(59,130,246,.03)}
-.tbl tr.changed td{background:var(--green-bg);border-bottom-color:rgba(34,197,94,.2)}
-.tbl tr.changed:hover td{background:rgba(34,197,94,.15)}
-.tbl tr[draggable=true]{cursor:grab}
-.tbl tr[draggable=true]:active{cursor:grabbing}
+.table-wrap { background: #1a1d2e; border: 1px solid #2a2d45; border-radius: 12px; overflow: hidden; }
+.table-toolbar { padding: 16px 20px; display: flex; gap: 12px; align-items: center; border-bottom: 1px solid #2a2d45; flex-wrap: wrap; }
+.table-toolbar input, .table-toolbar select { padding: 8px 12px; border-radius: 8px; border: 1px solid #2a2d45; background: #0f1117; color: #e0e0e0; font-size: 13px; }
+.table-toolbar input { flex: 1; min-width: 200px; }
+.ch-table { width: 100%; border-collapse: collapse; }
+.ch-table th { background: #252840; padding: 12px 16px; text-align: left; font-size: 12px; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.5px; position: sticky; top: 0; }
+.ch-table td { padding: 10px 16px; border-bottom: 1px solid #1e2133; font-size: 13px; }
+.ch-table tr:hover td { background: #252840; }
+.ch-table .badge { display: inline-block; padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; }
+.badge.hls { background: #10b98120; color: #10b981; }
+.badge.auth { background: #3b82f620; color: #3b82f6; }
+.badge.direct { background: #f59e0b20; color: #f59e0b; }
+.badge.none { background: #ef444420; color: #ef4444; }
+.btn-sm { padding: 5px 10px; border-radius: 6px; border: 1px solid #2a2d45; background: transparent; color: #a0a0b0; cursor: pointer; font-size: 12px; transition: all 0.2s; }
+.btn-sm:hover { background: #8b5cf6; color: white; border-color: #8b5cf6; }
+.btn-sm.test-ok { background: #10b98120; color: #10b981; border-color: #10b981; }
+.btn-sm.test-fail { background: #ef444420; color: #ef4444; border-color: #ef4444; }
+.logo-img { width: 32px; height: 32px; border-radius: 6px; object-fit: contain; background: #0f1117; }
 
-.ch-row{display:flex;align-items:center;gap:10px}
-.ch-logo{width:32px;height:32px;border-radius:6px;background:var(--bg);flex-shrink:0;display:flex;align-items:center;justify-content:center;overflow:hidden;border:1px solid var(--border)}
-.ch-logo img{width:100%;height:100%;object-fit:contain}
-.ch-logo .placeholder{font-size:14px;color:var(--text3)}
-.ch-info .ch-name{font-weight:500;font-size:13px}
-.ch-info .ch-meta{font-size:10px;color:var(--text3);margin-top:1px}
-.badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:6px;font-size:10px;font-weight:700;letter-spacing:.3px}
-.b-tr{background:var(--blue-bg);color:var(--blue)}
-.b-de{background:var(--red-bg);color:var(--red)}
-.gsel{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:6px;font-size:12px;width:200px;outline:none;cursor:pointer;transition:.2s}
-.gsel:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(59,130,246,.15)}
-.tag{display:inline-flex;align-items:center;gap:3px;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600}
-.tag-ovr{background:var(--yellow-bg);color:var(--yellow)}
-.tag-chg{background:var(--green-bg);color:var(--green)}
-.tag-cur{background:var(--bg3);color:var(--text2)}
-.cb{width:16px;height:16px;accent-color:var(--blue);cursor:pointer}
+/* GROUPS */
+.groups-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+.group-card { background: #1a1d2e; border: 1px solid #2a2d45; border-radius: 10px; padding: 16px; display: flex; justify-content: space-between; align-items: center; }
+.group-name { font-weight: 600; font-size: 14px; }
+.group-count { font-size: 24px; font-weight: 700; color: #8b5cf6; }
 
-/* TOAST */
-.toast{position:fixed;bottom:24px;right:24px;background:var(--bg3);border:1px solid var(--border);border-radius:10px;padding:12px 20px;transform:translateY(100px);opacity:0;transition:.3s cubic-bezier(.4,0,.2,1);z-index:999;font-size:13px;display:flex;align-items:center;gap:8px;box-shadow:0 8px 32px rgba(0,0,0,.4)}
-.toast.show{transform:translateY(0);opacity:1}
-.toast.ok{border-color:var(--green)}.toast.ok .t-dot{background:var(--green)}
-.toast.err{border-color:var(--red)}.toast.err .t-dot{background:var(--red)}
-.toast .t-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+/* TEST MODAL */
+.modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 200; align-items: center; justify-content: center; }
+.modal-overlay.show { display: flex; }
+.modal { background: #1a1d2e; border: 1px solid #2a2d45; border-radius: 16px; padding: 24px; width: 600px; max-width: 90vw; max-height: 80vh; overflow-y: auto; }
+.modal h3 { color: #8b5cf6; margin-bottom: 16px; }
+.modal pre { background: #0f1117; padding: 12px; border-radius: 8px; font-size: 12px; overflow-x: auto; color: #9ca3af; word-break: break-all; }
+.modal .close-btn { float: right; background: none; border: none; color: #6b7280; font-size: 20px; cursor: pointer; }
+.modal .close-btn:hover { color: white; }
+.modal .test-btn { padding: 8px 20px; border-radius: 8px; border: none; background: #8b5cf6; color: white; cursor: pointer; font-weight: 600; margin-top: 12px; }
+.modal .test-btn:hover { background: #7c3aed; }
 
-#fileIn{display:none}
-.empty{text-align:center;padding:60px 20px;color:var(--text3)}
-.empty .em-icon{font-size:40px;margin-bottom:12px;opacity:.5}
-.empty p{font-size:14px}
+/* LINKS */
+.link-section { margin-top: 24px; }
+.link-box { background: #1a1d2e; border: 1px solid #2a2d45; border-radius: 12px; padding: 20px; margin-bottom: 12px; }
+.link-box label { font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; }
+.link-box .link-row { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
+.link-box input { flex: 1; padding: 10px 14px; border-radius: 8px; border: 1px solid #2a2d45; background: #0f1117; color: #e0e0e0; font-size: 13px; font-family: 'JetBrains Mono', monospace; }
+.copy-btn { padding: 10px 16px; border-radius: 8px; border: none; background: #8b5cf6; color: white; cursor: pointer; font-weight: 600; white-space: nowrap; }
+.copy-btn:hover { background: #7c3aed; }
 
-.overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:90}
-@media(max-width:768px){
-  .sidebar{position:fixed;left:0;top:0;z-index:95;transform:translateX(-100%)}
-  .sidebar.open{transform:translateX(0)}
-  .overlay.show{display:block}
-  .topbar .mob-toggle{display:block}
-  .stats-row{gap:8px}
-  .stat-card{min-width:80px;padding:6px 10px}
-  .stat-card .sc-info b{font-size:15px}
-  .gsel{width:140px;font-size:11px}
-  .table-wrap{padding:0 12px 12px}
-  .toolbar{padding:10px 12px}
-  .tbl td,.tbl th{padding:6px 8px;font-size:11px}
-  .ch-logo{width:28px;height:28px}
+/* SCROLLBAR */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #0f1117; }
+::-webkit-scrollbar-thumb { background: #2a2d45; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #8b5cf6; }
+
+@media (max-width: 768px) {
+  .cards { grid-template-columns: repeat(2, 1fr); }
+  .navbar { flex-direction: column; gap: 12px; }
+  .table-toolbar { flex-direction: column; }
+  .table-toolbar input { min-width: 100%; }
 }
-
-::-webkit-scrollbar{width:6px;height:6px}
-::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
-::-webkit-scrollbar-thumb:hover{background:var(--border2)}
-
-@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
-.tbl tr{animation:fadeIn .15s ease-out}
-
-/* PAGINATION */
-.pager{display:flex;align-items:center;justify-content:center;gap:4px;padding:12px 0;flex-wrap:wrap}
-.pbtn{background:var(--bg3);border:1px solid var(--border);color:var(--text2);padding:5px 10px;border-radius:6px;font-size:12px;cursor:pointer;transition:.15s;min-width:32px;text-align:center}
-.pbtn:hover{background:var(--bg4);color:var(--text);border-color:var(--border2)}
-.pbtn.active{background:var(--blue);border-color:var(--blue2);color:#fff;font-weight:600}
-.pdots{color:var(--text3);padding:0 4px;font-size:14px}
-.psel{background:var(--bg);border:1px solid var(--border);color:var(--text2);padding:5px 8px;border-radius:6px;font-size:11px;outline:none;cursor:pointer;margin-left:8px}
-.psel:focus{border-color:var(--blue)}
 </style>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
 <body>
-<div class="overlay" id="overlay" onclick="toggleSidebar()"></div>
-<div class="drop-hint" id="dropHint"></div>
-<div class="app">
 
-<!-- SIDEBAR -->
-<aside class="sidebar" id="sidebar">
-  <div class="sb-hdr">
-    <h1><div class="icon">&#9656;</div> Omer <span style="color:var(--blue)">Admin</span></h1>
-    <p>Kanal Grup Yonetimi &bull; Drag &amp; Drop</p>
-  </div>
-  <div class="sb-search">
-    <div class="search-box">
-      <span class="s-icon">&#128269;</span>
-      <input type="text" id="sideSearch" placeholder="Kanal ara..." oninput="onSideSearch(this.value)">
-      <button class="s-clear" onclick="clearSideSearch()">&#10005;</button>
-    </div>
-  </div>
-  <div class="sb-groups" id="sbGroups"></div>
-  <div class="sb-footer">
-    <button class="sbtn" onclick="doExport()">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
-      Disa Aktar JSON
-    </button>
-    <button class="sbtn" onclick="document.getElementById('fileIn').click()">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/></svg>
-      Ice Aktar JSON
-    </button>
-    <button class="sbtn" onclick="copyJson()">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-      Kopyala
-    </button>
-    <button class="sbtn" style="color:var(--red)" onclick="doReset()">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-      Sifirla
-    </button>
-  </div>
-</aside>
-
-<!-- MAIN -->
-<div class="main">
-  <div class="topbar">
-    <button class="mob-toggle" onclick="toggleSidebar()">&#9776;</button>
-    <div class="stats-row">
-      <div class="stat-card"><div class="sc-icon blue">&#128250;</div><div class="sc-info"><b id="sTotal">-</b><small>Toplam</small></div></div>
-      <div class="stat-card"><div class="sc-icon green">&#128193;</div><div class="sc-info"><b id="sGroups">-</b><small>Grup</small></div></div>
-      <div class="stat-card"><div class="sc-icon yellow">&#9998;</div><div class="sc-info"><b id="sOverride">0</b><small>Override</small></div></div>
-      <div class="stat-card"><div class="sc-icon purple">&#9999;</div><div class="sc-info"><b id="sChanged">0</b><small>Bekleyen</small></div></div>
-    </div>
-    <div class="topbar-actions">
-      <button class="btn btn-green" id="saveBtn" onclick="save()">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
-        Kaydet
-      </button>
-    </div>
-  </div>
-
-  <div class="toolbar">
-    <div class="bulk-sel">
-      <label><input type="checkbox" class="cb" id="selectAll" onchange="toggleSelectAll()"> Tumunu Sec</label>
-      <select class="gsel" id="bulkGroup" style="width:180px"><option value="">Toplu Tasi...</option></select>
-      <button class="btn btn-blue" onclick="bulkMove()" id="bulkBtn" disabled>Uygula</button>
-    </div>
-    <div class="search-main">
-      <span class="si">&#128269;</span>
-      <input type="text" id="mainSearch" placeholder="Kanal adi ile ara..." oninput="onMainSearch(this.value)">
-      <button class="sc" onclick="clearMainSearch()">&#10005;</button>
-    </div>
-    <div class="drag-hint-bar" id="dragHintBar">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 9l7-7 7 7M5 15l7 7 7-7"/></svg>
-      Kanallari surukleyerek siralayin veya gruplara tasimayin
-    </div>
-    <span class="result-count" id="resultCount"></span>
-  </div>
-
-  <div class="table-wrap">
-    <div class="tbl">
-      <table>
-        <thead>
-          <tr>
-            <th style="width:36px"><input type="checkbox" class="cb" id="selectAll2" onchange="toggleSelectAll()"></th>
-            <th style="width:44px"></th>
-            <th>Kanal</th>
-            <th style="width:70px">Ulke</th>
-            <th style="width:160px">Grup</th>
-            <th style="width:200px">Yeni Grup</th>
-            <th style="width:90px">Sira</th>
-            <th style="width:80px">Durum</th>
-          </tr>
-        </thead>
-        <tbody id="list"></tbody>
-      </table>
-    </div>
-    <div id="pager"></div>
+<!-- LOGIN -->
+<div id="loginPage" class="login-wrap">
+  <div class="login-box">
+    <h2>VxParser</h2>
+    <p style="color:#6b7280; margin-bottom:20px;">Admin Panel</p>
+    <input type="password" id="passInput" placeholder="Sifre" onkeydown="if(event.key==='Enter')doLogin()">
+    <button onclick="doLogin()">Giris</button>
+    <div id="loginErr" class="login-error"></div>
   </div>
 </div>
 
-<input type="file" id="fileIn" accept=".json" onchange="doImport(event)">
+<!-- APP -->
+<div id="appPage" style="display:none">
+  <nav class="navbar">
+    <h1>VxParser Admin</h1>
+    <div class="nav-links">
+      <button class="nav-btn active" onclick="switchTab('dashboard')">Dashboard</button>
+      <button class="nav-btn" onclick="switchTab('channels')">Kanallar</button>
+      <button class="nav-btn" onclick="switchTab('groups')">Gruplar</button>
+      <button class="nav-btn" onclick="switchTab('links')">Linkler</button>
+      <button class="nav-btn" onclick="switchTab('logs')">Loglar</button>
+      <button class="nav-btn" onclick="doReload()">Reload</button>
+      <button class="nav-btn" onclick="doLogout()" style="border-color:#ef4444;color:#ef4444">Cikis</button>
+    </div>
+  </nav>
+
+  <!-- DASHBOARD -->
+  <div id="tab-dashboard" class="tab-content active">
+    <div class="status-bar">
+      <div id="statusDot" class="status-dot loading"></div>
+      <span id="statusText">Yukleniyor...</span>
+    </div>
+    <div class="cards">
+      <div class="card"><div class="card-label">Toplam Kanal</div><div class="card-value blue" id="statTotal">-</div></div>
+      <div class="card"><div class="card-label">Kategoriler</div><div class="card-value purple" id="statCats">-</div></div>
+      <div class="card"><div class="card-label">HLS Kanal</div><div class="card-value green" id="statHLS">-</div></div>
+      <div class="card"><div class="card-label">Vavoo Token</div><div class="card-value" id="statVavoo">-</div></div>
+      <div class="card"><div class="card-label">Lokke Token</div><div class="card-value" id="statLokke">-</div></div>
+      <div class="card"><div class="card-label">Yukleme Suresi</div><div class="card-value yellow" id="statTime">-</div></div>
+    </div>
+  </div>
+
+  <!-- CHANNELS -->
+  <div id="tab-channels" class="tab-content">
+    <div class="table-wrap">
+      <div class="table-toolbar">
+        <input type="text" id="chSearch" placeholder="Kanal ara..." oninput="filterChannels()">
+        <select id="chGroup" onchange="filterChannels()"><option value="">Tum Gruplar</option></select>
+        <select id="chType" onchange="filterChannels()">
+          <option value="">Tum Tipler</option>
+          <option value="hls">HLS Var</option>
+          <option value="url">URL Var</option>
+          <option value="nohls">HLS Yok</option>
+        </select>
+        <span id="chCount" style="color:#6b7280;font-size:13px"></span>
+      </div>
+      <div style="max-height:60vh;overflow-y:auto">
+        <table class="ch-table">
+          <thead><tr><th>#</th><th></th><th>Kanal</th><th>Grup</th><th>Tip</th><th>Islem</th></tr></thead>
+          <tbody id="chBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- GROUPS -->
+  <div id="tab-groups" class="tab-content">
+    <div class="groups-grid" id="groupsGrid"></div>
+  </div>
+
+  <!-- LINKS -->
+  <div id="tab-links" class="tab-content">
+    <div class="link-section">
+      <div class="link-box">
+        <label>M3U Playlist</label>
+        <div class="link-row">
+          <input type="text" id="linkM3U" readonly>
+          <button class="copy-btn" onclick="copyLink('linkM3U')">Kopyala</button>
+        </div>
+      </div>
+      <div class="link-box">
+        <label>Xtream Codes API</label>
+        <div class="link-row">
+          <input type="text" id="linkXtream" readonly>
+          <button class="copy-btn" onclick="copyLink('linkXtream')">Kopyala</button>
+        </div>
+      </div>
+      <div class="link-box">
+        <label>EPG (XMLTV)</label>
+        <div class="link-row">
+          <input type="text" id="linkEPG" readonly>
+          <button class="copy-btn" onclick="copyLink('linkEPG')">Kopyala</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- LOGS -->
+  <div id="tab-logs" class="tab-content">
+    <div style="margin-bottom:12px;display:flex;gap:8px">
+      <button class="btn-sm" onclick="loadLogs()">Yenile</button>
+      <button class="btn-sm" onclick="clearLogs()">Temizle</button>
+    </div>
+    <div class="log-box" id="logBox"></div>
+  </div>
 </div>
-<div class="toast" id="toast"><span class="t-dot"></span><span id="toastMsg"></span></div>
+
+<!-- TEST MODAL -->
+<div id="testModal" class="modal-overlay">
+  <div class="modal">
+    <button class="close-btn" onclick="closeModal()">&times;</button>
+    <h3 id="modalTitle">Kanal Test</h3>
+    <div id="modalBody"></div>
+    <button class="test-btn" id="modalTestBtn" onclick="runResolveTest()">Resolve Test</button>
+    <pre id="modalResult" style="display:none"></pre>
+  </div>
+</div>
 
 <script>
-const TR_GRPS=["TR ULUSAL","TR SPOR","TR SINEMA","TR SINEMA VOD","TR DIZI","TR 7/24 DIZI","TR BELGESEL","TR COCUK","TR MUZIK","TR HABER","TR DINI","TR YEREL","TR RADYO","TR 4K","TR 8K","TR RAW"];
-const DE_GRPS=["DE VOLLPROGRAMM","DE NACHRICHTEN","DE DOKU","DE KINDER","DE FILM","DE MUSIK","DE SPORT","DE SONSTIGE"];
-const GRPS=[...TR_GRPS,...DE_GRPS];
-const GRP_COLORS={"TR ULUSAL":"#3b82f6","TR SPOR":"#ef4444","TR SINEMA":"#a855f7","TR SINEMA VOD":"#8b5cf6","TR DIZI":"#ec4899","TR 7/24 DIZI":"#f472b6","TR BELGESEL":"#f59e0b","TR COCUK":"#22c55e","TR MUZIK":"#06b6d4","TR HABER":"#eab308","TR DINI":"#10b981","TR YEREL":"#6b7280","TR RADYO":"#14b8a6","TR 4K":"#f97316","TR 8K":"#fb923c","TR RAW":"#ef4444","DE VOLLPROGRAMM":"#3b82f6","DE NACHRICHTEN":"#ef4444","DE DOKU":"#f59e0b","DE KINDER":"#22c55e","DE FILM":"#a855f7","DE MUSIK":"#06b6d4","DE SPORT":"#ef4444","DE SONSTIGE":"#6b7280"};
+let allChannels = [];
+let currentTestLid = null;
+const H = window.location.origin;
 
-let channels=[],overrides={},changes={},selected=new Set(),activeGroup='',searchQ='';
-let dragChanName=null,dragClone=null,dragStarted=false;
-let curPage=1,pageSize=100;
+// AUTH
+function doLogin() {
+  const p = document.getElementById('passInput').value;
+  fetch('/api/admin/login', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({password:p})})
+  .then(r=>r.json()).then(d=>{
+    if(d.ok){document.getElementById('loginPage').style.display='none';document.getElementById('appPage').style.display='block';loadAll();}
+    else{document.getElementById('loginErr').textContent='Yanlis sifre!';}
+  });
+}
+function doLogout(){document.getElementById('appPage').style.display='none';document.getElementById('loginPage').style.display='flex';document.getElementById('passInput').value='';}
 
-/* Safe HTML escaping for text content */
-function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
-/* Safe JS string literal escaping for inline handlers inside single-quoted attrs */
-function escJS(s){return String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\n/g,'\\n').replace(/\r/g,'\\r')}
-
-async function load(){
-  try{
-    const r=await fetch('/api/admin/channels');channels=await r.json();
-    const r2=await fetch('/api/admin/overrides');overrides=await r2.json();
-    changes={};selected=new Set();
-    buildSidebar();fillBulkGroup();render();
-  }catch(e){toast('Veri yuklenemedi: '+e,'err')}
+// TABS
+function switchTab(name){
+  document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById('tab-'+name).classList.add('active');
+  event.target.classList.add('active');
+  if(name==='channels') loadChannels();
+  if(name==='groups') loadGroups();
+  if(name==='links') loadLinks();
+  if(name==='logs') loadLogs();
 }
 
-function buildSidebar(){
-  const el=document.getElementById('sbGroups');
-  const grpCounts={};channels.forEach(c=>{grpCounts[c.grp]=(grpCounts[c.grp]||0)+1});
-  let h='';
-  h+='<div class="grp-item '+(activeGroup===''?'active':'')+'" onclick="selectGroup(\'\')"><div class="g-dot" style="background:var(--text2)"></div><div class="g-name">Tumunu Goster</div><div class="g-cnt">'+channels.length+'</div></div>';
-
-  h+='<div class="sb-section"><div class="sb-section-title" onclick="toggleSection(this)"><span class="arrow">&#9660;</span> Turk Kanallari ('+TR_GRPS.filter(g=>grpCounts[g]).length+')</div><div class="sb-section-body">';
-  TR_GRPS.forEach(g=>{
-    const cnt=grpCounts[g]||0;if(!cnt)return;
-    const ovr=Object.keys(overrides).filter(k=>overrides[k]===g).length;
-    h+='<div class="grp-item '+(activeGroup===g?'active':'')+'" data-grp="'+esc(g)+'" onclick="selectGroup(\''+escJS(g)+'\')"><div class="g-dot" style="background:'+(GRP_COLORS[g]||'var(--text3)')+'"></div><div class="g-name" title="'+esc(g)+'">'+esc(g.replace('TR ',''))+'</div><div class="g-cnt">'+cnt+(ovr?'<span style="color:var(--yellow);margin-left:3px">+'+ovr+'</span>':'')+'</div></div>';
-  });
-  h+='</div></div>';
-
-  h+='<div class="sb-section"><div class="sb-section-title" onclick="toggleSection(this)"><span class="arrow">&#9660;</span> Alman Kanallari ('+DE_GRPS.filter(g=>grpCounts[g]).length+')</div><div class="sb-section-body">';
-  DE_GRPS.forEach(g=>{
-    const cnt=grpCounts[g]||0;if(!cnt)return;
-    const ovr=Object.keys(overrides).filter(k=>overrides[k]===g).length;
-    h+='<div class="grp-item '+(activeGroup===g?'active':'')+'" data-grp="'+esc(g)+'" onclick="selectGroup(\''+escJS(g)+'\')"><div class="g-dot" style="background:'+(GRP_COLORS[g]||'var(--text3)')+'"></div><div class="g-name" title="'+esc(g)+'">'+esc(g.replace('DE ',''))+'</div><div class="g-cnt">'+cnt+(ovr?'<span style="color:var(--yellow);margin-left:3px">+'+ovr+'</span>':'')+'</div></div>';
-  });
-  h+='</div></div>';
-  el.innerHTML=h;
-
-  /* Attach drag events to all group items */
-  el.querySelectorAll('.grp-item[data-grp]').forEach(gi=>{
-    gi.addEventListener('dragover',onGrpDragOver);
-    gi.addEventListener('dragenter',onGrpDragEnter);
-    gi.addEventListener('dragleave',onGrpDragLeave);
-    gi.addEventListener('drop',onGrpDrop);
+// LOAD ALL
+function loadAll(){
+  fetch('/api/status').then(r=>r.json()).then(d=>{
+    document.getElementById('statTotal').textContent=d.available_channels||0;
+    document.getElementById('statCats').textContent=d.available_categories||0;
+    document.getElementById('statHLS').textContent=d.hls_channels||0;
+    document.getElementById('statVavoo').textContent=d.vavoo_token?'OK':'YOK';
+    document.getElementById('statVavoo').className='card-value '+(d.vavoo_token?'green':'red');
+    document.getElementById('statLokke').textContent=d.lokke_token?'OK':'YOK';
+    document.getElementById('statLokke').className='card-value '+(d.lokke_token?'green':'red');
+    document.getElementById('statTime').textContent=(d.load_time||0)+'s';
+    const dot=document.getElementById('statusDot');
+    const txt=document.getElementById('statusText');
+    if(d.data_ready){dot.className='status-dot ok';txt.textContent='Hazir! '+d.available_channels+' kanal yuklu';}
+    else if(d.error){dot.className='status-dot error';txt.textContent='HATA: '+d.error;}
+    else{dot.className='status-dot loading';txt.textContent='Kanallar yukleniyor...';}
   });
 }
 
-function toggleSection(el){el.classList.toggle('collapsed');el.nextElementSibling.classList.toggle('collapsed')}
-function selectGroup(g){activeGroup=g;searchQ='';curPage=1;document.getElementById('sideSearch').value='';document.getElementById('mainSearch').value='';selected=new Set();buildSidebar();render()}
-function onSideSearch(v){searchQ=v.toUpperCase();activeGroup='';curPage=1;document.getElementById('mainSearch').value='';selected=new Set();buildSidebar();render()}
-function onMainSearch(v){searchQ=v.toUpperCase();activeGroup='';curPage=1;selected=new Set();document.getElementById('sideSearch').value='';buildSidebar();render()}
-function clearSideSearch(){document.getElementById('sideSearch').value='';searchQ='';curPage=1;buildSidebar();render()}
-function clearMainSearch(){document.getElementById('mainSearch').value='';searchQ='';curPage=1;buildSidebar();render()}
-function toggleSidebar(){document.getElementById('sidebar').classList.toggle('open');document.getElementById('overlay').classList.toggle('show')}
-
-function fillBulkGroup(){
-  const sel=document.getElementById('bulkGroup');
-  sel.innerHTML='<option value="">Toplu Tasi...</option>';
-  GRPS.forEach(g=>{sel.innerHTML+='<option value="'+g+'">'+g+'</option>'});
+// CHANNELS
+function loadChannels(){
+  fetch('/api/admin/channels').then(r=>r.json()).then(d=>{
+    allChannels=d.channels||[];
+    // group filter
+    const sel=document.getElementById('chGroup');
+    const groups=[...new Set(allChannels.map(c=>c.grp).filter(Boolean))].sort();
+    sel.innerHTML='<option value="">Tum Gruplar</option>'+groups.map(g=>'<option>'+g+'</option>').join('');
+    filterChannels();
+  });
+}
+function filterChannels(){
+  const q=document.getElementById('chSearch').value.toLowerCase();
+  const g=document.getElementById('chGroup').value;
+  const t=document.getElementById('chType').value;
+  let list=allChannels;
+  if(q) list=list.filter(c=>c.name.toLowerCase().includes(q));
+  if(g) list=list.filter(c=>c.grp===g);
+  if(t==='hls') list=list.filter(c=>c.has_hls);
+  else if(t==='url') list=list.filter(c=>c.url);
+  else if(t==='nohls') list=list.filter(c=>!c.has_hls);
+  document.getElementById('chCount').textContent=list.length+' kanal';
+  const tb=document.getElementById('chBody');
+  tb.innerHTML=list.slice(0,500).map(c=>{
+    const badge=c.has_hls?'<span class="badge hls">HLS</span>':(c.url?'<span class="badge auth">URL</span>':'<span class="badge none">YOK</span>');
+    const logo=c.logo?'<img class="logo-img" src="'+c.logo+'" onerror="this.style.display=\'none\'">':'<div class="logo-img"></div>';
+    return '<tr><td>'+c.lid+'</td><td>'+logo+'</td><td>'+c.name+'</td><td>'+c.grp+'</td><td>'+badge+'</td><td><button class="btn-sm" onclick="openTest('+c.lid+',\''+c.name.replace(/'/g,"")+'\')">Test</button></td></tr>';
+  }).join('');
 }
 
-function getFiltered(){
-  return channels.filter(c=>{
-    if(activeGroup&&c.grp!==activeGroup)return false;
-    if(searchQ&&!c.name.toUpperCase().includes(searchQ))return false;
-    return true;
+// GROUPS
+function loadGroups(){
+  fetch('/stats').then(r=>r.json()).then(d=>{
+    document.getElementById('groupsGrid').innerHTML=(d.groups||[]).map(g=>
+      '<div class="group-card"><div><div class="group-name">'+g.group+'</div></div><div class="group-count">'+g.count+'</div></div>'
+    ).join('');
   });
 }
 
-function render(){
-  const fl=getFiltered();
-  const tb=document.getElementById('list');
-  const totalPages=Math.max(1,Math.ceil(fl.length/pageSize));
-  if(curPage>totalPages)curPage=totalPages;
-  const start=(curPage-1)*pageSize;
-  const pageItems=fl.slice(start,start+pageSize);
-
-  document.getElementById('resultCount').textContent=fl.length+' kanal (Sayfa '+curPage+'/'+totalPages+')';
-
-  if(!fl.length){tb.innerHTML='<tr><td colspan="8"><div class="empty"><div class="em-icon">&#128250;</div><p>Kanal bulunamadi</p></div></td></tr>';updStats();renderPagination(0);return}
-
-  /* Build rows using DocumentFragment for speed */
-  const frag=document.createDocumentFragment();
-  const tmp=document.createElement('tbody');
-  let h='';
-  pageItems.forEach(c=>{
-    const k=c.name,orig=c.grp;
-    const isOvr=overrides.hasOwnProperty(k.toUpperCase());
-    const isChg=changes.hasOwnProperty(k);
-    const cur=isChg?changes[k]:orig;
-    const rowCls=isChg?'changed':'';
-    const isSel=selected.has(k);
-    const logo=c.logo||'';
-    const logoHtml=logo?'<img src="'+esc(logo)+'" onerror="this.parentElement.innerHTML=\'<span class=placeholder>&#9656;</span>\'" loading="lazy">':'<span class="placeholder">&#9656;</span>';
-
-    let statusTag='';
-    if(isOvr&&!isChg)statusTag='<span class="tag tag-ovr">&#9998; OVR</span>';
-    else if(isChg)statusTag='<span class="tag tag-chg">&#10003; DEGISTI</span>';
-    else statusTag='<span class="tag tag-cur">OTO</span>';
-
-    h+='<tr class="'+rowCls+'" draggable="true" data-chname="'+esc(k)+'">';
-    h+='<td><input type="checkbox" class="cb ch-cb" data-name="'+esc(k)+'" '+(isSel?'checked':'')+' onchange="toggleSel(this)"></td>';
-    h+='<td><div class="ch-logo">'+logoHtml+'</div></td>';
-    h+='<td><div class="ch-info"><div class="ch-name">'+esc(k)+'</div><div class="ch-meta">ID: '+c.id+'</div></div></td>';
-    h+='<td><span class="badge '+(c.country==='TR'?'b-tr':'b-de')+'">'+c.country+'</span></td>';
-    h+='<td style="color:var(--text2);font-size:12px">'+esc(orig)+'</td>';
-    h+='<td><select class="gsel" data-chname="'+esc(k)+'">';
-    GRPS.forEach(g=>{h+='<option value="'+g+'"'+(cur===g?' selected':'')+'>'+g+'</option>'});
-    h+='</select></td>';
-    h+='<td><div style="display:flex;gap:3px"><button class="reorder-btn" onclick="moveChannel(\''+escJS(k)+'\',\'up\')" title="Yukari tas">&#9650;</button><button class="reorder-btn" onclick="moveChannel(\''+escJS(k)+'\',\'down\')" title="Asagi tas">&#9660;</button></div></td>';
-    h+='<td>'+statusTag+'</td>';
-    h+='</tr>';
-  });
-  tmp.innerHTML=h;
-  while(tmp.firstChild)frag.appendChild(tmp.firstChild);
-  tb.innerHTML='';
-  tb.appendChild(frag);
-  updStats();
-  renderPagination(totalPages);
-
-  /* Attach event listeners via delegation */
-  tb.querySelectorAll('.gsel').forEach(sel=>{
-    sel.addEventListener('change',function(){chgGrp(this.dataset.chname,this.value)});
-  });
-  tb.querySelectorAll('tr[draggable]').forEach(tr=>{
-    tr.addEventListener('dragstart',onRowDragStart);
-    tr.addEventListener('dragend',onRowDragEnd);
+// LINKS
+function loadLinks(){
+  document.getElementById('linkM3U').value=H+'/get.php?username=admin&password=admin&type=m3u_plus';
+  document.getElementById('linkXtream').value=H+'/player_api.php?username=admin&password=admin';
+  document.getElementById('linkEPG').value=H+'/epg.xml';
+}
+function copyLink(id){
+  navigator.clipboard.writeText(document.getElementById(id).value).then(()=>{
+    const b=event.target;b.textContent='Kopyalandi!';setTimeout(()=>b.textContent='Kopyala',1500);
   });
 }
 
-function renderPagination(totalPages){
-  let el=document.getElementById('pager');
-  if(!el)return;
-  if(totalPages<=1){el.innerHTML='';return}
-  let h='<div class="pager">';
-  if(curPage>1)h+='<button class="pbtn" onclick="goPage('+(curPage-1)+')">&#9664;</button>';
-  /* Show max 7 page buttons around current */
-  let startP=Math.max(1,curPage-3),endP=Math.min(totalPages,curPage+3);
-  if(startP>1)h+='<button class="pbtn" onclick="goPage(1)">1</button>';
-  if(startP>2)h+='<span class="pdots">...</span>';
-  for(let i=startP;i<=endP;i++){
-    h+='<button class="pbtn '+(i===curPage?'active':'')+'" onclick="goPage('+i+')">'+i+'</button>';
-  }
-  if(endP<totalPages-1)h+='<span class="pdots">...</span>';
-  if(endP<totalPages)h+='<button class="pbtn" onclick="goPage('+totalPages+')">'+totalPages+'</button>';
-  if(curPage<totalPages)h+='<button class="pbtn" onclick="goPage('+(curPage+1)+')">&#9654;</button>';
-  h+='<select class="psel" onchange="pageSize=parseInt(this.value);curPage=1;render()">';
-  [100,200,500,1000].forEach(n=>{h+='<option value="'+n+'"'+(pageSize===n?' selected':'')+'">'+n+' / sayfa</option>'});
-  h+='</select></div>';
-  el.innerHTML=h;
-}
-
-function goPage(p){curPage=p;render();document.querySelector('.table-wrap').scrollTop=0}
-
-function toggleSel(cb){
-  const name=cb.dataset.name;
-  if(cb.checked)selected.add(name);else selected.delete(name);
-  syncSelectAll();
-}
-function toggleSelectAll(){
-  const fl=getFiltered();
-  const checked=document.getElementById('selectAll').checked;
-  selected.clear();
-  if(checked)fl.forEach(c=>selected.add(c.name));
-  document.getElementById('selectAll2').checked=checked;
-  document.querySelectorAll('.ch-cb').forEach(cb=>{cb.checked=checked});
-  updBulkBtn();
-}
-function syncSelectAll(){
-  const fl=getFiltered();
-  const allSel=fl.length>0&&fl.every(c=>selected.has(c.name));
-  document.getElementById('selectAll').checked=allSel;
-  document.getElementById('selectAll2').checked=allSel;
-  updBulkBtn();
-}
-function updBulkBtn(){document.getElementById('bulkBtn').disabled=selected.size===0}
-
-/* Fixed: change handler using data attributes + addEventListener instead of broken inline escJ */
-function chgGrp(name,val){
-  const c=channels.find(x=>x.name===name);if(!c)return;
-  if(val===c.grp&&!overrides[name.toUpperCase()])delete changes[name];
-  else changes[name]=val;
-  render();
-}
-
-function bulkMove(){
-  const grp=document.getElementById('bulkGroup').value;
-  if(!grp||selected.size===0)return;
-  selected.forEach(name=>{
-    const c=channels.find(x=>x.name===name);
-    if(c){
-      if(grp===c.grp&&!overrides[name.toUpperCase()])delete changes[name];
-      else changes[name]=grp;
-    }
+// LOGS
+function loadLogs(){
+  fetch('/api/status').then(r=>r.json()).then(d=>{
+    const box=document.getElementById('logBox');
+    box.innerHTML=(d.startup_logs||[]).map(l=>{
+      let cls='log-line';
+      if(l.includes('OK')||l.includes('TAMAM')||l.includes('alindi'))cls+=' ok';
+      else if(l.includes('HATA')||l.includes('BASARISIZ'))cls+=' err';
+      else if(l.includes('cekiliyor')||l.includes('aliniyor'))cls+=' warn';
+      return '<div class="'+cls+'">'+l+'</div>';
+    }).join('');
   });
-  selected=new Set();
-  document.getElementById('bulkGroup').value='';
-  buildSidebar();render();
-  toast(Object.keys(changes).length+' bekleyen degisiklik','ok');
 }
+function clearLogs(){document.getElementById('logBox').innerHTML='';}
 
-function revert(name){delete changes[name];render()}
-
-async function save(){
-  const n=Object.keys(changes).length;
-  if(!n){toast('Kaydedilecek degisiklik yok');return}
-  try{
-    const r=await fetch('/api/admin/overrides',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)});
-    if(r.ok){
-      Object.entries(changes).forEach(([k,v])=>{overrides[k.toUpperCase()]=v});
-      /* Update local channel list grp so sidebar counts reflect reality */
-      Object.entries(changes).forEach(([k,v])=>{
-        const c=channels.find(x=>x.name===k);
-        if(c)c.grp=v;
-      });
-      changes={};selected=new Set();
-      buildSidebar();render();
-      toast(n+' kanal basariyla kaydedildi!','ok');
-    }else toast('Sunucu hatasi!','err');
-  }catch(e){toast('Hata: '+e,'err')}
-}
-
-async function doExport(){
-  try{
-    const r=await fetch('/api/admin/overrides/export');
-    const blob=await r.blob();const a=document.createElement('a');
-    a.href=URL.createObjectURL(blob);a.download='omer-overrides.json';a.click();
-    toast('JSON dosyasi indirildi','ok');
-  }catch(e){toast('Export hatasi','err')}
-}
-
-function doImport(ev){
-  const f=ev.target.files[0];if(!f)return;
-  const rd=new FileReader();
-  rd.onload=async(e)=>{
-    try{
-      const d=JSON.parse(e.target.result);
-      const r=await fetch('/api/admin/overrides/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
-      if(r.ok){const j=await r.json();toast(j.imported+' override yuklendi','ok');load()}
-      else toast('Import hatasi','err');
-    }catch(ex){toast('JSON parse hatasi','err')}
-  };rd.readAsText(f);ev.target.value='';
-}
-
-function copyJson(){
-  const t=JSON.stringify(overrides,null,2);
-  navigator.clipboard.writeText(t).then(()=>toast('Panoya kopyalandi!','ok')).catch(()=>toast('Kopyalama hatasi','err'));
-}
-
-async function doReset(){
-  if(!confirm('Tum Manuel Atamalari Silmek Istedi\u011finize Emin Misiniz?'))return;
-  try{
-    await fetch('/api/admin/overrides',{method:'DELETE'});
-    overrides={};changes={};selected=new Set();
-    buildSidebar();render();
-    toast('Tum atamalar sifirlandi','ok');
-  }catch(e){toast('Hata','err')}
-}
-
-function updStats(){
-  document.getElementById('sTotal').textContent=channels.length;
-  const g=new Set(channels.map(c=>c.grp));
-  document.getElementById('sGroups').textContent=g.size;
-  document.getElementById('sOverride').textContent=Object.keys(overrides).length;
-  const nc=Object.keys(changes).length;
-  document.getElementById('sChanged').textContent=nc;
-  const btn=document.getElementById('saveBtn');
-  if(nc===0){btn.disabled=true;btn.style.opacity='.5'}
-  else{btn.disabled=false;btn.style.opacity='1'}
-}
-
-function toast(msg,type){
-  document.getElementById('toastMsg').textContent=msg;
-  const t=document.getElementById('toast');
-  t.className='toast show '+(type||'');
-  setTimeout(()=>t.className='toast',3000);
-}
-
-/* ===== DRAG & DROP ===== */
-let dragDropTarget=null; /* 'table' or 'sidebar' */
-let dropIndicatorEl=null;
-let lastDropRow=null;
-
-function onRowDragStart(e){
-  dragChanName=e.currentTarget.dataset.chname;
-  dragDropTarget=null;
-  e.dataTransfer.effectAllowed='move';
-  e.dataTransfer.setData('text/plain',dragChanName);
-  /* Custom drag image */
-  const ch=channels.find(x=>x.name===dragChanName);
-  if(ch){
-    dragClone=document.createElement('div');
-    dragClone.className='ch-drag-clone';
-    dragClone.innerHTML='<span class="dc-icon">&#128250;</span><strong>'+esc(ch.name)+'</strong>';
-    document.body.appendChild(dragClone);
-    e.dataTransfer.setDragImage(dragClone,10,20);
-  }
-  e.currentTarget.classList.add('ch-dragging');
-  document.getElementById('dropHint').classList.add('active');
-}
-
-function onRowDragEnd(e){
-  e.currentTarget.classList.remove('ch-dragging');
-  document.getElementById('dropHint').classList.remove('active');
-  if(dragClone){dragClone.remove();dragClone=null}
-  /* Clean up */
-  document.querySelectorAll('.grp-item.drop-target,.grp-item.drop-reject').forEach(el=>{
-    el.classList.remove('drop-target','drop-reject');
+// RELOAD
+function doReload(){
+  if(!confirm('Kanallari yeniden yuklemek istiyor musun?'))return;
+  fetch('/reload').then(r=>r.json()).then(d=>{
+    alert(d.message||'Reload basladi');
+    setTimeout(loadAll, 5000);
+    setTimeout(loadAll, 15000);
+    setTimeout(loadAll, 30000);
   });
-  document.querySelectorAll('.row-drop-above,.row-drop-below').forEach(el=>{
-    el.classList.remove('row-drop-above','row-drop-below');
+}
+
+// TEST MODAL
+function openTest(lid,name){
+  currentTestLid=lid;
+  document.getElementById('modalTitle').textContent='Test: '+name+' (#'+lid+')';
+  document.getElementById('modalBody').innerHTML='<p style="color:#6b7280">Kanal bilgisi yukleniyor...</p>';
+  document.getElementById('modalResult').style.display='none';
+  document.getElementById('modalTestBtn').style.display='inline-block';
+  document.getElementById('testModal').classList.add('show');
+  fetch('/test/'+lid).then(r=>r.json()).then(d=>{
+    if(d.error){document.getElementById('modalBody').innerHTML='<p style="color:#ef4444">'+d.error+'</p>';return;}
+    document.getElementById('modalBody').innerHTML=
+      '<p><b>ID:</b> '+d.lid+'</p>'+
+      '<p><b>URL:</b> '+(d.url?'Var':'YOK')+'</p>'+
+      '<p><b>HLS:</b> '+(d.hls?'Var':'YOK')+'</p>'+
+      '<p><b>Grup:</b> '+d.grp+'</p>';
   });
-  if(dropIndicatorEl&&dropIndicatorEl.parentNode){dropIndicatorEl.remove()}
-  dropIndicatorEl=null;lastDropRow=null;
-  dragChanName=null;dragDropTarget=null;
 }
-
-/* ===== TABLE ROW DRAG (intra-group reorder) ===== */
-
-function onTableDragOver(e){
-  e.preventDefault();
-  e.dataTransfer.dropEffect='move';
-  dragDropTarget='table';
-  /* Find the row we're hovering over */
-  const tbody=document.getElementById('list');
-  const rows=Array.from(tbody.querySelectorAll('tr[data-chname]'));
-  const mouseY=e.clientY;
-  let closestRow=null;
-  let closestDist=Infinity;
-  let insertBefore=true;
-
-  for(let i=0;i<rows.length;i++){
-    const rect=rows[i].getBoundingClientRect();
-    const midY=rect.top+rect.height/2;
-    const dist=Math.abs(mouseY-midY);
-    if(dist<closestDist){
-      closestDist=dist;
-      closestRow=rows[i];
-      insertBefore=mouseY<midY;
-    }
-  }
-
-  /* Clean previous highlights */
-  if(lastDropRow&&lastDropRow!==closestRow){
-    lastDropRow.classList.remove('row-drop-above','row-drop-below');
-  }
-
-  if(closestRow){
-    closestRow.classList.remove('row-drop-above','row-drop-below');
-    if(insertBefore){
-      closestRow.classList.add('row-drop-above');
-    }else{
-      closestRow.classList.add('row-drop-below');
-    }
-    lastDropRow=closestRow;
-  }
+function runResolveTest(){
+  const lid=currentTestLid;
+  const btn=document.getElementById('modalTestBtn');
+  btn.textContent='Test ediliyor...';btn.disabled=true;
+  fetch('/api/admin/resolve/'+lid).then(r=>r.json()).then(d=>{
+    btn.textContent='Resolve Test';btn.disabled=false;
+    const pre=document.getElementById('modalResult');
+    pre.style.display='block';
+    pre.textContent=JSON.stringify(d,null,2);
+    if(d.resolved_url){btn.textContent='Basarili!';btn.style.background='#10b981';}
+    else{btn.textContent='Basarisiz';btn.style.background='#ef4444';}
+    setTimeout(()=>{btn.style.background='';},3000);
+  }).catch(()=>{btn.textContent='Hata';btn.disabled=false;});
 }
+function closeModal(){document.getElementById('testModal').classList.remove('show');}
 
-function onTableDragLeave(e){
-  const tbody=document.getElementById('list');
-  if(!tbody.contains(e.relatedTarget)){
-    if(lastDropRow){
-      lastDropRow.classList.remove('row-drop-above','row-drop-below');
-      lastDropRow=null;
-    }
-  }
-}
-
-async function onTableDrop(e){
-  e.preventDefault();
-  e.stopPropagation();
-  const tbody=document.getElementById('list');
-  if(lastDropRow){lastDropRow.classList.remove('row-drop-above','row-drop-below');lastDropRow=null}
-  if(dropIndicatorEl&&dropIndicatorEl.parentNode){dropIndicatorEl.remove()}
-  dropIndicatorEl=null;
-  document.getElementById('dropHint').classList.remove('active');
-  if(!dragChanName)return;
-
-  /* Find target row and insert position from mouse Y */
-  const rows=Array.from(tbody.querySelectorAll('tr[data-chname]'));
-  let targetChName=null,placeBefore=true;
-  for(let i=0;i<rows.length;i++){
-    const rect=rows[i].getBoundingClientRect();
-    const midY=rect.top+rect.height/2;
-    if(e.clientY<midY){targetChName=rows[i].dataset.chname;placeBefore=true;break}
-    if(i===rows.length-1){targetChName=rows[i].dataset.chname;placeBefore=false}
-  }
-  if(!targetChName||targetChName===dragChanName)return;
-
-  /* Find the group and calculate correct target index within the group */
-  const dragCh=channels.find(c=>c.name===dragChanName);
-  if(!dragCh)return;
-  const grp=dragCh.grp;
-  const groupList=channels.filter(c=>c.grp===grp);
-  const targetIdx=groupList.findIndex(c=>c.name===targetChName);
-  const dragIdx=groupList.findIndex(c=>c.name===dragChanName);
-  if(targetIdx<0||dragIdx<0)return;
-
-  /* Calculate final position: API removes dragged item first, then inserts at target_index */
-  let finalIdx;
-  if(placeBefore){
-    finalIdx=dragIdx<targetIdx?targetIdx-1:targetIdx;
-  }else{
-    finalIdx=dragIdx<targetIdx?targetIdx:targetIdx+1;
-  }
-  finalIdx=Math.max(0,Math.min(finalIdx,groupList.length-1));
-
-  try{
-    const r=await fetch('/api/admin/reorder-to',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({channel:dragChanName,target_index:finalIdx})
-    });
-    const j=await r.json();
-    if(j.ok){
-      toast(j.message,'ok');
-      const r2=await fetch('/api/admin/channels');channels=await r2.json();
-      buildSidebar();render();
-    }else{toast(j.message||'Hata','err')}
-  }catch(ex){toast('Hata: '+ex,'err')}
-}
-
-function onGrpDragOver(e){
-  e.preventDefault();
-  e.dataTransfer.dropEffect='move';
-}
-
-function onGrpDragEnter(e){
-  e.preventDefault();
-  const gi=e.currentTarget;
-  if(!gi.dataset.grp)return;
-  gi.classList.add('drop-target');
-  gi.classList.remove('drop-reject');
-}
-
-function onGrpDragLeave(e){
-  const gi=e.currentTarget;
-  /* Only remove if actually leaving the element (not entering a child) */
-  if(!gi.contains(e.relatedTarget)){
-    gi.classList.remove('drop-target','drop-reject');
-  }
-}
-
-function onGrpDrop(e){
-  e.preventDefault();
-  e.stopPropagation();
-  const gi=e.currentTarget;
-  const targetGroup=gi.dataset.grp;
-  gi.classList.remove('drop-target','drop-reject');
-  document.getElementById('dropHint').classList.remove('active');
-
-  if(!targetGroup)return;
-
-  /* Collect all channels to move: dragged + all selected (if multi-select) */
-  let namesToMove=[];
-  if(dragChanName)namesToMove.push(dragChanName);
-  /* If there are other selected channels (checkbox), include them too */
-  if(selected.size>0){
-    selected.forEach(name=>{if(!namesToMove.includes(name))namesToMove.push(name)});
-  }
-
-  if(!namesToMove.length)return;
-
-  let movedCount=0,skippedCount=0;
-  namesToMove.forEach(name=>{
-    const c=channels.find(x=>x.name===name);
-    if(!c)return;
-    const curGrp=c.grp;
-    if(targetGroup===curGrp&&!overrides[name.toUpperCase()]){
-      skippedCount++;
-      return;
-    }
-    changes[name]=targetGroup;
-    movedCount++;
-  });
-
-  /* Clear selection after drop */
-  selected=new Set();
-
-  buildSidebar();
-  render();
-
-  if(movedCount===1){
-    toast(namesToMove[0]+' → '+targetGroup+' (Kaydet basin)','ok');
-  }else if(movedCount>1){
-    toast(movedCount+' kanal '+targetGroup+' grubuna tasindi (Kaydet basin)','ok');
-  }else if(skippedCount>0){
-    toast(skippedCount+' kanal zaten '+targetGroup+' grubunda','ok');
-  }
-}
-
-/* ===== CHANNEL REORDER (up/down within group) ===== */
-
-async function moveChannel(name,dir){
-  try{
-    const r=await fetch('/api/admin/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:name,direction:dir})});
-    const j=await r.json();
-    if(j.ok){
-      toast(j.message,'ok');
-      /* Reload channel data to reflect new order */
-      const r2=await fetch('/api/admin/channels');channels=await r2.json();
-      buildSidebar();render();
-    }else{
-      toast(j.message||'Hata','err');
-    }
-  }catch(e){toast('Hata: '+e,'err')}
-}
-
-/* ===== KEYBOARD SHORTCUTS ===== */
-
-document.addEventListener('keydown',e=>{
-  if((e.ctrlKey||e.metaKey)&&e.key==='s'){e.preventDefault();save()}
-  if(e.key==='Escape'){clearSideSearch();clearMainSearch();selected=new Set();syncSelectAll();render()}
-  if(e.key==='/'){const ae=document.activeElement;if(ae.tagName!=='INPUT'&&ae.tagName!=='SELECT'&&ae.tagName!=='TEXTAREA'){e.preventDefault();document.getElementById('mainSearch').focus()}}
-});
-
-load();
-
-/* Attach table-level drag events (delegation, only once) */
-const listTbody=document.getElementById('list');
-listTbody.addEventListener('dragover',onTableDragOver);
-listTbody.addEventListener('dragleave',onTableDragLeave);
-listTbody.addEventListener('drop',onTableDrop);
+// AUTO REFRESH
+setInterval(loadAll, 30000);
 </script>
 </body>
-</html>
-"""
+</html>"""
+
+
+@app.get("/admin")
+async def admin_page():
+    return Response(content=ADMIN_HTML, media_type="text/html")
+
+
+@app.post("/api/admin/login")
+async def admin_login(request: Request):
+    body = await request.json()
+    if body.get("password") == ADMIN_PASSWORD:
+        return {"ok": True}
+    return {"ok": False, "error": "Wrong password"}
+
+
+@app.get("/api/admin/channels")
+async def admin_channels():
+    conn = get_db()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(
+        "SELECT c.lid, c.name, c.url, c.hls, c.logo, "
+        "COALESCE(cat.name, 'Sonstige') as grp "
+        "FROM channels c LEFT JOIN categories cat ON c.cid = cat.cid "
+        "ORDER BY COALESCE(cat.sort_order, 9999), c.name"
+    )
+    channels = []
+    for r in c.fetchall():
+        channels.append({
+            "lid": r["lid"],
+            "name": r["name"],
+            "grp": r["grp"],
+            "logo": r["logo"] or "",
+            "url": r["url"] or "",
+            "has_hls": bool(r["hls"]),
+        })
+    conn.close()
+    return {"channels": channels, "total": len(channels)}
+
+
+@app.get("/api/admin/resolve/{sid}")
+async def admin_resolve(sid: str):
+    url, method = state.resolve_channel(sid)
+    return {
+        "channel_id": sid,
+        "resolve_method": method,
+        "resolved_url": url,
+        "success": bool(url),
+    }
+
+
+# ============================================================
+# STATS
+# ============================================================
+
+@app.get("/stats")
+async def stats():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM channels")
+    total = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM categories")
+    cats = c.fetchone()[0]
+    c.execute(
+        "SELECT COALESCE(cat.name, 'Eslesmeyen') as g, COUNT(*) as cnt "
+        "FROM channels c LEFT JOIN categories cat ON c.cid = cat.cid "
+        "GROUP BY c.cid ORDER BY MIN(cat.sort_order)"
+    )
+    groups = [{"group": r[0], "count": r[1]} for r in c.fetchall()]
+    c.execute("SELECT COUNT(*) FROM channels WHERE hls != '' AND hls IS NOT NULL")
+    hls_count = c.fetchone()[0]
+    conn.close()
+
+    return {
+        "total_channels": total,
+        "total_categories": cats,
+        "hls_channels": hls_count,
+        "vavoo_token": bool(state._vavoo_sig),
+        "lokke_token": bool(state._watched_sig),
+        "error": state.STARTUP_ERROR,
+        "groups": groups,
+        "data_ready": state.DATA_READY,
+    }
