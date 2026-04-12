@@ -4,17 +4,11 @@ Streaming endpoints + Admin Panel
 """
 import os
 import re
-import io
-import csv
 import sqlite3
-import secrets
-from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, Request, Response, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse, PlainTextResponse, HTMLResponse, RedirectResponse
-from starlette.middleware.base import BaseHTTPMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse, PlainTextResponse, HTMLResponse
 
 import state
 
@@ -90,6 +84,11 @@ async def index():
     if not state.DATA_READY:
         return PlainTextResponse("VxParser is starting up...", status_code=503)
     return PlainTextResponse("VxParser is running. /admin for management.")
+
+
+@app.get("/robots.txt")
+async def robots_txt():
+    return PlainTextResponse("User-agent: *\nDisallow: /\n", media_type="text/plain")
 
 
 @app.get("/get.php")
@@ -264,10 +263,12 @@ html,body{height:100%;font-family:system-ui,-apple-system,sans-serif;background:
 
 /* Sidebar */
 .sidebar{width:280px;min-width:280px;background:var(--sidebar);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
-.sidebar-header{padding:20px 16px 12px;border-bottom:1px solid var(--border)}
+.sidebar-header{padding:20px 16px 12px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
 .sidebar-header h1{font-size:18px;font-weight:700;display:flex;align-items:center;gap:8px}
 .sidebar-header h1 .dot{width:8px;height:8px;border-radius:50%;background:var(--success);display:inline-block}
 .sidebar-header .subtitle{font-size:11px;color:var(--muted);margin-top:4px}
+.logout-btn{background:transparent;border:1px solid var(--border);color:var(--muted);padding:4px 10px;border-radius:6px;font-size:11px;cursor:pointer;transition:all .15s}
+.logout-btn:hover{color:var(--danger);border-color:var(--danger)}
 .group-list{flex:1;overflow-y:auto;padding:8px}
 .group-list::-webkit-scrollbar{width:4px}
 .group-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
@@ -376,8 +377,11 @@ tbody td:first-child{text-align:center}
   <!-- Sidebar -->
   <aside class="sidebar">
     <div class="sidebar-header">
-      <h1><span class="dot" id="statusDot"></span> VxParser</h1>
-      <div class="subtitle">IPTV Channel Manager</div>
+      <div>
+        <h1><span class="dot" id="statusDot"></span> VxParser</h1>
+        <div class="subtitle">IPTV Channel Manager</div>
+      </div>
+      <button class="logout-btn" onclick="logout()">Logout</button>
     </div>
     <div class="group-list" id="groupList"></div>
     <div class="sidebar-footer">
@@ -780,6 +784,16 @@ function onDragEnd(e) {
 function debounceSearch() {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => loadChannels(), 300);
+}
+
+// ====== LOGOUT ======
+function logout() {
+  // Basic auth logout: send request with wrong credentials to clear the session
+  fetch('/admin', {
+    headers: { 'Authorization': 'Basic ' + btoa('logout:logout') }
+  }).catch(() => {
+    window.location.href = '/admin';
+  });
 }
 
 // ====== UTILS ======

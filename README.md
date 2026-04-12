@@ -1,9 +1,5 @@
 ---
-title: Omer
-emoji: 🔧
-colorFrom: gray
-colorTo: gray
+title: VxParser
 sdk: docker
 app_port: 7860
-pinned: false
 ---

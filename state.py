@@ -223,41 +223,126 @@ def resolve_channel(lid):
 # GRUP SIRALAMASI
 # ============================================================
 GROUP_ORDER = [
-    "TR ULUSAL", "TR HABER", "TR BEIN SPORTS", "TR SPOR", "TR BELGESEL",
+    # Turkish - sports processed LAST to avoid catching German channels
+    "TR ULUSAL", "TR HABER", "TR BEIN SPORTS", "TR BELGESEL",
     "TR SINEMA UHD", "TR SINEMA", "TR MUZIK", "TR COCUK", "TR YEREL",
     "TR DINI", "TR RADYO",
+    # German - sport groups MUST come before TR SPOR to catch "Eurosport","Sport1" etc
     "DE DEUTSCHLAND", "DE VIP SPORTS", "DE VIP SPORTS 2", "DE SPORT",
     "DE AUSTRIA", "DE SCHWEIZ", "DE FILM", "DE SERIEN", "DE KINO",
     "DE DOKU", "DE KIDS", "DE MUSIK", "DE INFOTAINMENT", "DE NEWS",
     "DE THEMEN", "DE SONSTIGE",
+    # TR SPOR last - only catches remaining Turkish sport channels with specific keywords
+    "TR SPOR",
 ]
 
 GROUP_RULES = {
-    "TR ULUSAL": ["TRT 1","Show TV","Star TV","ATV","Kanal D","FOX TV","TV8","Tele1","Beyaz TV","TV 8.5","A2","TRT 4K","Tabii","Gain","TV 100","Flash TV","Kanal 7","TGRT","TLC","D MAX","ERT"],
-    "TR HABER": ["Haber","CNN Turk","HABER","NTV","TRT Haber","Bloomberg","TVNET","A Haber","Benguturk","Haber Global","Ulusal Kanal","Sky Turk","TGRT Haber"],
-    "TR BEIN SPORTS": ["beIN Sports","beIN SPORT","beIN","beIN 4K","beIN MAX"],
-    "TR SPOR": ["Spor","A Spor","TRT Spor","TJK","S Sport","GS TV","FB TV","BJK TV","Fenerbahce","Galatasaray"],
-    "TR BELGESEL": ["Belgesel","Nat Geo","Discovery","Animal","History","Yaban TV","BBC Earth"],
-    "TR SINEMA UHD": ["4K","UHD"],
-    "TR SINEMA": ["Film","Sinema","Cinema","Movie","Movies","DigiMAX","FilmBox","Magic Box","Yesilcam","Dream TV"],
-    "TR MUZIK": ["Muzik","Kral TV","Kral Pop","Power TV","Power Turk","Number One","NR1"],
-    "TR COCUK": ["Cocuk","Cartoon","Disney","Nick","Minika","Baby TV","Pepee"],
-    "TR YEREL": ["Yerel"],
-    "TR DINI": ["Dini","Din","Diyanet","Semerkand","Hilal","Lalegul"],
-    "TR RADYO": ["Radyo","Radio","FM"],
-    "DE DEUTSCHLAND": ["ARD","ZDF","Das Erste","WDR","NDR","BR ","SWR","HR ","MDR","RBB","Phoenix","3sat","KiKA","ONE","Arte","tagesschau24","zdfinfo","zdfneo"],
-    "DE VIP SPORTS": ["Sky Sport","Sky Bundesliga","Eurosport","DAZN","Sport1"],
-    "DE VIP SPORTS 2": ["Sky Sport Austria","Telekom Sport","Magenta Sport"],
-    "DE SPORT": ["Sport ","Eurosport","Sportdigital","Motorvision"],
-    "DE AUSTRIA": ["ORF","Puls 4","Servus"],
-    "DE SCHWEIZ": ["SRF","Swiss"],
-    "DE FILM": ["Sky Cinema","RTL+","13th Street","AXN","TNT Serie","TNT Film","Sky Hits","Sky Action"],
-    "DE SERIEN": ["Serie","RTL","Sat.1","ProSieben","VOX","kabel eins","RTL2","Super RTL","Sixx","TELE 5"],
-    "DE KINO": ["Kino"],
-    "DE DOKU": ["Doku","Docu","D-MAX","N24 Doku","Spiegel TV"],
-    "DE KIDS": ["Kind","Kids","Toggo"],
-    "DE MUSIK": ["Musik","VIVA","Deluxe Music"],
-    "DE INFOTAINMENT": ["Info","N24","WELT","n-tv","BBC World","France 24"],
-    "DE NEWS": ["News","Tagesschau"],
-    "DE THEMEN": ["Shop","QVC","HSE","Bibel TV","Sonstig","Regional"],
+    # Turkish groups - VERY specific keywords to avoid matching German channels
+    "TR ULUSAL": [
+        "TRT 1","Show TV","Star TV","Kanal D","ATV","FOX TV","TV8",
+        "Tele1","Beyaz TV","TV 8.5","A2","TRT 4K","Tabii","Gain",
+        "TV 100","Flash TV","Kanal 7","TGRT","TLC","D MAX","ERT",
+        "A2 TV","Teve2","TV100","Bloomberg HT",
+    ],
+    "TR HABER": [
+        "Haber Turk","CNN Turk","TRT Haber","A Haber","Benguturk",
+        "Haber Global","TGRT Haber","Bloomberg HT","TVNET","Ulusal Kanal",
+        "NTV","HABER","Bloomberg","Sky Turk","360 TV",
+    ],
+    "TR BEIN SPORTS": [
+        "beIN Sports","beIN SPORT","beIN MAX","beIN 4K",
+        "beIN 1","beIN 2","beIN 3","beIN 4",
+    ],
+    "TR BELGESEL": [
+        "TRT Belgesel","Nat Geo","Discovery","Animal Planet","History",
+        "Yaban TV","BBC Earth","Da Vinci","Viasat Explore","Viasat History",
+    ],
+    "TR SINEMA UHD": [
+        "4K TR","UHD TR","4K Film","UHD Film",
+        "TR 4K","FHD TR","HD TR",
+    ],
+    "TR SINEMA": [
+        "FilmBox","DigiMAX","Magic Box","Yesilcam","Dream TV",
+        "Sinema TV","Sinematv","Movie Smart","Film TV",
+        "D Smart","D-Smart",
+    ],
+    "TR MUZIK": [
+        "Kral TV","Kral Pop","Power TV","Power Turk","Power Turk TV",
+        "Number One TV","NR1 TV","Dream Turk","MTV TR",
+    ],
+    "TR COCUK": [
+        "Cartoon","Minika","Baby TV","Pepee","TRT Cocuk",
+        "Disney TR","Nick TR","Nickelodeon TR",
+    ],
+    "TR YEREL": [
+        "Yerel","TV 36","Kanal 3","Kanal 26",
+    ],
+    "TR DINI": [
+        "Diyanet","Semerkand","Hilal","Lalegul","Dini TV",
+        "Mekke TV","Medine TV",
+    ],
+    "TR RADYO": [
+        "Radyo","Radio","FM","Power FM","Kral FM","Super FM","Radyo Eksen",
+    ],
+    # German groups - German channels match HERE, not in TR groups
+    "DE DEUTSCHLAND": [
+        "ARD","ZDF","Das Erste","WDR","NDR","BR ","SWR","HR ","MDR",
+        "RBB","Phoenix","3sat","KiKA","ONE","Arte","tagesschau24",
+        "zdfinfo","zdfneo","tagesschau",
+    ],
+    "DE VIP SPORTS": [
+        "Sky Sport","Sky Bundesliga","Eurosport","DAZN","Sport1",
+        "beIN DE","beIN Sport DE",
+    ],
+    "DE VIP SPORTS 2": [
+        "Sky Sport Austria","Telekom Sport","Magenta Sport",
+    ],
+    "DE SPORT": [
+        "Sportdigital","Motorvision","Sport +","SPORT1",
+        "Eurosport 2","Eurosport 3",
+    ],
+    "DE AUSTRIA": [
+        "ORF","Puls 4","Servus","AT ","Austria",
+    ],
+    "DE SCHWEIZ": [
+        "SRF","Swiss","CH ","Schweiz",
+    ],
+    "DE FILM": [
+        "Sky Cinema","13th Street","AXN","TNT Serie","TNT Film",
+        "Sky Hits","Sky Action","Sky Crime","Sky Comedy","Sky Family",
+        "RTL+","RTL Plus",
+    ],
+    "DE SERIEN": [
+        "RTL","Sat.1","ProSieben","VOX","kabel eins","RTL2",
+        "Super RTL","Sixx","TELE 5","ProSieben Maxx","Sat.1 Gold",
+        "kabel eins Doku",
+    ],
+    "DE KINO": [
+        "Kino",
+    ],
+    "DE DOKU": [
+        "Doku","Docu","D-MAX","N24 Doku","Spiegel TV",
+    ],
+    "DE KIDS": [
+        "Toggo","KiKA",
+    ],
+    "DE MUSIK": [
+        "VIVA","Deluxe Music","MTV",
+    ],
+    "DE INFOTAINMENT": [
+        "N24","WELT","n-tv","BBC World","France 24","ZDF Info",
+    ],
+    "DE NEWS": [
+        "Tagesschau","Tagesspiegel",
+    ],
+    "DE THEMEN": [
+        "Shop","QVC","HSE","Bibel TV","Sonstig","Regional",
+    ],
+    # TR SPOR - ONLY very specific Turkish sport keywords (processed LAST in GROUP_ORDER)
+    "TR SPOR": [
+        "A Spor","TRT Spor","TJK TV","TJK","S Sport",
+        "GS TV","FB TV","BJK TV",
+        "Fenerbahce TV","Galatasaray TV","Trabzonspor TV",
+        "S Sport 1","S Sport 2",
+    ],
 }
