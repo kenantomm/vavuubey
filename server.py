@@ -138,12 +138,14 @@ def remap_groups():
 
     c.execute("SELECT lid, name FROM channels")
     updated = 0
+    group_counts = {}  # gn -> count (for unique sort_order)
     for lid, name in c.fetchall():
         assigned = False
         for gi, gn in enumerate(state.GROUP_ORDER):
             for kw in state.GROUP_RULES.get(gn, []):
                 if kw.lower() in name.lower():
-                    c.execute("UPDATE channels SET cid=?,grp=?,sort_order=? WHERE lid=?", (gi+1, gn, gi+1, lid))
+                    group_counts[gn] = group_counts.get(gn, 0) + 1
+                    c.execute("UPDATE channels SET cid=?,grp=?,sort_order=? WHERE lid=?", (gi+1, gn, group_counts[gn], lid))
                     updated += 1
                     assigned = True
                     break
@@ -152,7 +154,8 @@ def remap_groups():
             c.execute("SELECT cid FROM categories WHERE name='DE SONSTIGE'")
             row = c.fetchone()
             if row:
-                c.execute("UPDATE channels SET cid=?,grp='DE SONSTIGE',sort_order=9998 WHERE lid=?", (row[0], lid))
+                group_counts["DE SONSTIGE"] = group_counts.get("DE SONSTIGE", 0) + 1
+                c.execute("UPDATE channels SET cid=?,grp='DE SONSTIGE',sort_order=? WHERE lid=?", (row[0], group_counts["DE SONSTIGE"], lid))
     conn.commit()
     conn.close()
     state.slog(f"Grup remap: {updated} kanal")

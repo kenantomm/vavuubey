@@ -438,6 +438,7 @@ let selectedGroup = null; // null = all
 let selectedLids = new Set();
 let searchTimer = null;
 let allGroupsCache = [];
+let isRendering = false; // prevents onchange from firing during render
 
 // ====== API HELPERS ======
 async function api(method, url, body) {
@@ -596,6 +597,7 @@ async function loadChannels() {
 }
 
 function renderChannels() {
+  isRendering = true;
   const body = document.getElementById("channelBody");
   const empty = document.getElementById("emptyState");
   const countEl = document.getElementById("channelCount");
@@ -604,6 +606,7 @@ function renderChannels() {
   if (channels.length === 0) {
     body.innerHTML = "";
     empty.style.display = "flex";
+    isRendering = false;
     return;
   }
   empty.style.display = "none";
@@ -630,6 +633,8 @@ function renderChannels() {
     </tr>`;
   });
   body.innerHTML = html;
+  // Use setTimeout to ensure DOM is ready before unblocking onchange handlers
+  setTimeout(() => { isRendering = false; }, 50);
 }
 
 // ====== SELECTION ======
@@ -674,6 +679,7 @@ function clearSelection() {
 
 // ====== GROUP CHANGE (individual) ======
 async function changeGroup(lid, newCid, selectEl) {
+  if (isRendering) return; // Skip during render to prevent auto-trigger
   const oldCid = selectEl.getAttribute("data-original") ?? selectEl.value;
   const spinner = document.createElement("span");
   spinner.className = "saving-indicator";
@@ -699,11 +705,13 @@ async function bulkAssign() {
   if (selectedLids.size === 0) return;
   showLoading();
   try {
-    await api("POST", "/admin/api/channels/assign", { lids: Array.from(selectedLids), cid: targetCid });
-    toast(`${selectedLids.size} channels reassigned`, "success");
+    const result = await api("POST", "/admin/api/channels/assign", { lids: Array.from(selectedLids), cid: targetCid });
+    toast(`${result.updated} channels reassigned`, "success");
     selectedLids.clear();
     document.getElementById("selectAll").checked = false;
     updateBulkBar();
+    // Normalize sort_orders and reload
+    await api("POST", "/admin/api/channels/normalize");
     await loadGroups();
     await loadChannels();
   } catch (e) { toast(e.message, "error"); }
@@ -796,6 +804,8 @@ document.getElementById("newGroupName").addEventListener("keydown", e => {
 // ====== INIT ======
 async function init() {
   try {
+    // Normalize sort_orders first to fix any duplicate sort_order issues
+    await api("POST", "/admin/api/channels/normalize");
     await loadGroups();
     await loadChannels();
   } catch (e) {
@@ -1017,7 +1027,7 @@ async def api_assign_channels(request: Request, auth: Optional[str] = Depends(ad
     """
     Batch assign channels to a group.
     CRITICAL: Uses a single transaction to update ALL channels.
-    This fixes the bug where only 1 channel would save.
+    Also normalizes sort_orders so channels get unique sequential order.
     """
     body = await request.json()
     lids = body.get("lids", [])
@@ -1050,7 +1060,7 @@ async def api_assign_channels(request: Request, auth: Optional[str] = Depends(ad
         c.execute("BEGIN")
         for lid in lids:
             c.execute("UPDATE channels SET cid=?, grp=? WHERE lid=?", (cid, target_grp, lid))
-        # Commit ALL at once
+        # Commit the group assignment first
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -1061,17 +1071,28 @@ async def api_assign_channels(request: Request, auth: Optional[str] = Depends(ad
     c.execute("SELECT COUNT(*) as cnt FROM channels WHERE cid=? AND lid IN ({})".format(
         ",".join("?" * len(lids))), [cid] + list(lids))
     saved_count = c.fetchone()["cnt"]
-    conn.close()
 
     if saved_count != len(lids):
+        conn.close()
         raise HTTPException(status_code=500, detail=f"Only {saved_count}/{len(lids)} channels updated")
+
+    # Normalize sort_orders for the target group:
+    # Give each channel a unique sequential sort_order
+    c.execute("SELECT lid FROM channels WHERE cid=? ORDER BY sort_order, name", (cid,))
+    group_lids = [r["lid"] for r in c.fetchall()]
+    c.execute("BEGIN")
+    for idx, glid in enumerate(group_lids):
+        c.execute("UPDATE channels SET sort_order=? WHERE lid=?", (idx + 1, glid))
+    conn.commit()
+    conn.close()
 
     return {"success": True, "updated": saved_count}
 
 
 @app.post("/admin/api/channels/reorder")
 async def api_reorder_channel(request: Request, auth: Optional[str] = Depends(admin_auth)):
-    """Reorder a channel within its group (swap with neighbor)."""
+    """Reorder a channel within its group (swap with neighbor).
+    Uses name as tiebreaker when sort_orders are equal."""
     body = await request.json()
     lid = body.get("lid")
     direction = body.get("direction", "up")
@@ -1082,8 +1103,8 @@ async def api_reorder_channel(request: Request, auth: Optional[str] = Depends(ad
     conn = get_db()
     c = conn.cursor()
 
-    # Get the channel
-    c.execute("SELECT lid, cid, sort_order FROM channels WHERE lid=?", (lid,))
+    # Get the channel (include name for tiebreaker)
+    c.execute("SELECT lid, cid, sort_order, name FROM channels WHERE lid=?", (lid,))
     ch = c.fetchone()
     if not ch:
         conn.close()
@@ -1091,21 +1112,29 @@ async def api_reorder_channel(request: Request, auth: Optional[str] = Depends(ad
 
     ch_cid = ch["cid"]
     ch_sort = ch["sort_order"]
+    ch_name = ch["name"]
 
     if direction == "up":
         # Find the channel just above in the same group
+        # Use name as tiebreaker when sort_orders are equal
         c.execute("""
             SELECT lid, sort_order FROM channels
-            WHERE cid=? AND sort_order < ?
-            ORDER BY sort_order DESC LIMIT 1
-        """, (ch_cid, ch_sort))
+            WHERE cid=? AND lid != ? AND (
+                sort_order < ? OR
+                (sort_order = ? AND name < ?)
+            )
+            ORDER BY sort_order DESC, name DESC LIMIT 1
+        """, (ch_cid, lid, ch_sort, ch_sort, ch_name))
     else:
         # Find the channel just below
         c.execute("""
             SELECT lid, sort_order FROM channels
-            WHERE cid=? AND sort_order > ?
-            ORDER BY sort_order ASC LIMIT 1
-        """, (ch_cid, ch_sort))
+            WHERE cid=? AND lid != ? AND (
+                sort_order > ? OR
+                (sort_order = ? AND name > ?)
+            )
+            ORDER BY sort_order ASC, name ASC LIMIT 1
+        """, (ch_cid, lid, ch_sort, ch_sort, ch_name))
 
     neighbor = c.fetchone()
     if not neighbor:
@@ -1227,3 +1256,31 @@ async def api_ungroup_channels(request: Request, auth: Optional[str] = Depends(a
     conn.close()
 
     return {"success": True, "ungrouped": saved_count}
+
+
+@app.post("/admin/api/channels/normalize")
+async def api_normalize_sort(auth: Optional[str] = Depends(admin_auth)):
+    """Normalize sort_orders so every channel has a unique sequential order within its group.
+    Fixes the root cause where all channels in a group had identical sort_order values."""
+    conn = get_db()
+    c = conn.cursor()
+
+    # Get all channels grouped by cid, ordered by name for stable ordering
+    c.execute("SELECT lid, cid FROM channels ORDER BY cid, sort_order, name")
+    rows = c.fetchall()
+
+    current_cid = None
+    order = 0
+    updated = 0
+    c.execute("BEGIN")
+    for row in rows:
+        if row["cid"] != current_cid:
+            current_cid = row["cid"]
+            order = 1
+        c.execute("UPDATE channels SET sort_order=? WHERE lid=?", (order, row["lid"]))
+        order += 1
+        updated += 1
+    conn.commit()
+    conn.close()
+
+    return {"success": True, "normalized": updated}
