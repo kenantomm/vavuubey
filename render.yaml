@@ -2,8 +2,13 @@ services:
   - type: web
     name: vxparser
     runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python server.py
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.6"
+      - key: PORT
+        value: "10000"
+      - key: DB_PATH
+        value: "/tmp/vxparser.db"
