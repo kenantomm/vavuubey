@@ -1,678 +1,506 @@
 """
-state.py - VxParser State Management
-v3.2 - Sort order, cache cleanup, logo from catalog, speed optimization
+state.py - Ortak state modulu.
+Token fonksiyonlari ve resolve fonksiyonlari burada.
+server.py ve video.py sadece state import eder, BIRBIRINI IMPORT ETMEZ.
+
+v3.3.0 - Resolve cache TTL fix (1 saat sonrasi stream olumu bug fix)
 """
-import sqlite3
-import httpx
-import time
-import logging
-import json
-import re
-import asyncio
 import os
+import random
+import time
+import json
+import sqlite3
+import requests
+import urllib3
+import threading
 
-log = logging.getLogger("vxparser")
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ===== CONFIG =====
+# ============================================================
+# CONFIG - Tum URL'ler ve ayarlar
+# ============================================================
 CONFIG = {
+    # addonSig (MediaHubMX imzasi) almak icin ping endpointleri
     "PING_URLS": [
         "https://www.vavoo.tv/api/app/ping",
-        "https://www.lokke.app/api/app/ping"
+        "https://www.lokke.app/api/app/ping",
     ],
+    # API cagrilari icin base URL'ler (fallback sirasiyla)
     "BASE_URLS": [
         "https://vavoo.to",
         "https://kool.to",
-        "https://oha.to"
+        "https://oha.to",
     ],
-    "APP_VERSION": "3.2.0",
-    "CATALOG_GROUPS": ["Turkey", "Germany"],
-    "RESOLVE_CACHE_TTL": 180,       # 3 min cache
-    "RESOLVE_CACHE_MAX": 500,       # max cached channels
-    "CACHE_CLEANUP_INTERVAL": 300,  # cleanup every 5 min
+    # vavoo_auth token almak icin ping2 endpointleri
+    "PING2_URLS": [
+        "https://www.vavoo.to/api/box/ping2",
+        "https://www.vavoo.tv/api/box/ping2",
+        "https://kool.to/api/box/ping2",
+        "https://oha.to/api/box/ping2",
+    ],
+    # live2 kanal listesi icin URL'ler
+    "LIVE2_URLS": [
+        "https://www.vavoo.to/live2/index?output=json",
+        "https://kool.to/live2/index?output=json",
+        "https://oha.to/live2/index?output=json",
+    ],
+    # Cache suresi (sn)
+    "SIG_CACHE_TTL": 8 * 60,         # 8 dakika (basarili)
+    "SIG_FAIL_TTL": 3 * 60,          # 3 dakika (basarisiz - HIZLI retry!)
+    "RESOLVE_CACHE_TTL": 45 * 60,    # 45 dakika - CDN URL suresinden once yenile
+    "RESOLVE_TIMEOUT": 15,           # 15 saniye
+    "CDN_USER_AGENT": "VAVOO/2.6",
+    "API_USER_AGENT": "MediaHubMX/2",
+    "APP_VERSION": "3.3.0",
 }
 
-# ===== GLOBALS =====
+# ============================================================
+# PAYLASILAN STATE
+# ============================================================
 DATA_READY = False
+STARTUP_ERROR = None
+LOAD_TIME = 0
 STARTUP_LOGS = []
-VAVOO_TOKEN = ""
-VAVOO_TOKEN_EXPIRES = 0
-VAVOO_TOKEN_COOLDOWN = 0
-WATCHED_SIG = ""
+
 DB_PATH = "/tmp/vxparser.db"
-RESOLVE_CACHE = {}
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin")
-ADMIN_SESSIONS = {}
-CATALOG_DOMAIN = CONFIG["BASE_URLS"][0]
-RESOLVE_DOMAIN = CONFIG["BASE_URLS"][0]
-LIVE2_DOMAIN = CONFIG["BASE_URLS"][0]
-_last_cache_cleanup = 0
+M3U_PATH = "/tmp/playlist.m3u"
+PORT = 10000
 
-def add_log(msg):
-    log.info(msg)
-    ts = time.strftime('%H:%M:%S')
-    STARTUP_LOGS.append(f"[{ts}] {msg}")
-    if len(STARTUP_LOGS) > 200:
-        STARTUP_LOGS.pop(0)
+# Token cache
+_vavoo_sig = None
+_vavoo_sig_time = 0
+_vavoo_sig_failed = False     # HATA durumunda cache
+_watched_sig = None
+_watched_sig_time = 0
+_watched_sig_failed = False   # HATA durumunda cache
 
-# ===== DATABASE =====
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS channels (
-        id INTEGER PRIMARY KEY,
-        name TEXT,
-        url TEXT,
-        hls TEXT DEFAULT '',
-        grp TEXT DEFAULT '',
-        country TEXT DEFAULT '',
-        logo TEXT DEFAULT ''
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS overrides (
-        ch_id INTEGER PRIMARY KEY,
-        url TEXT,
-        enabled INTEGER DEFAULT 1
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT,
-        msg TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS sort_order (
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS hidden_channels (
-        ch_id INTEGER PRIMARY KEY
-    )""")
-    conn.commit()
-    conn.close()
+# ============================================================
+# RESOLVE CACHE (TTL destekli) - 1 saat bug fix
+# ============================================================
+_resolve_cache = {}            # {lid: {"url": str, "time": float, "method": str}}
+_resolve_cache_lock = threading.Lock()
+_resolve_stats = {"hits": 0, "misses": 0, "expired": 0, "errors": 0}
 
-def get_channel(ch_id):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM channels WHERE id = ?", (ch_id,))
-    row = c.fetchone()
-    conn.close()
-    return dict(row) if row else None
 
-def get_all_channels(ordered=True):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-
-    if ordered:
-        # Check if there's a custom sort order
-        c.execute("SELECT value FROM sort_order WHERE key = 'channel'")
-        sort_row = c.fetchone()
-        if sort_row:
-            try:
-                sort_items = json.loads(sort_row[0])
-                sort_map = {}
-                for i, item in enumerate(sort_items):
-                    sort_map[str(item.get("id", ""))] = i
-                # Build custom ORDER BY using CASE
-                channels = c.execute("SELECT * FROM channels").fetchall()
-                channels = [dict(r) for r in channels]
-                channels.sort(key=lambda ch: sort_map.get(str(ch["id"]), 99999))
-                conn.close()
-                return channels
-            except Exception:
-                pass
-
-        # Default sort: group priority + name
-        c.execute("""SELECT * FROM channels ORDER BY CASE grp
-            WHEN 'TR ULUSAL' THEN 1 WHEN 'TR HABER' THEN 2
-            WHEN 'TR BELGESEL' THEN 3 WHEN 'TR COCUK' THEN 4
-            WHEN 'TR FILM' THEN 5 WHEN 'TR MUZIK' THEN 6
-            WHEN 'TR SPOR' THEN 7 WHEN 'TR DINI' THEN 8
-            WHEN 'TR YEREL' THEN 9 WHEN 'TR RADYO' THEN 10
-            WHEN 'DE VOLLPROGRAMM' THEN 11 WHEN 'DE NACHRICHTEN' THEN 12
-            WHEN 'DE DOKU' THEN 13 WHEN 'DE KINDER' THEN 14
-            WHEN 'DE FILM' THEN 15 WHEN 'DE MUSIK' THEN 16
-            WHEN 'DE SPORT' THEN 17 WHEN 'DE SONSTIGE' THEN 18
-            ELSE 99 END, name""")
-    else:
-        c.execute("SELECT * FROM channels")
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return rows
-
-def update_channel_hls(ch_id, hls_url):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE channels SET hls = ? WHERE id = ?", (hls_url, ch_id))
-    conn.commit()
-    conn.close()
-
-def update_channel_logo(ch_id, logo_url):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE channels SET logo = ? WHERE id = ?", (logo_url, ch_id))
-    conn.commit()
-    conn.close()
-
-def set_override(ch_id, url, enabled=1):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO overrides (ch_id, url, enabled) VALUES (?,?,?)", (ch_id, url, enabled))
-    conn.commit()
-    conn.close()
-
-def get_override(ch_id):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM overrides WHERE ch_id = ?", (ch_id,))
-    row = c.fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-def get_all_overrides():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT o.*, c.name as ch_name FROM overrides o LEFT JOIN channels c ON o.ch_id = c.id ORDER BY o.ch_id")
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return rows
-
-def get_hidden_channels():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT ch_id FROM hidden_channels")
-    ids = [r[0] for r in c.fetchall()]
-    conn.close()
-    return ids
-
-# ===== CACHE MANAGEMENT =====
-def cleanup_resolve_cache():
-    """Remove expired entries and limit cache size"""
-    global _last_cache_cleanup
+def get_resolve_cache_info():
+    """Cache durumu hakkinda bilgi dondur."""
     now = time.time()
-    if now - _last_cache_cleanup < CONFIG["CACHE_CLEANUP_INTERVAL"]:
-        return
-    _last_cache_cleanup = now
+    active = 0
+    expired = 0
+    with _resolve_cache_lock:
+        for lid, entry in _resolve_cache.items():
+            if (now - entry["time"]) < CONFIG["RESOLVE_CACHE_TTL"]:
+                active += 1
+            else:
+                expired += 1
+    return {
+        "total_cached": len(_resolve_cache),
+        "active": active,
+        "expired": expired,
+        "ttl_seconds": CONFIG["RESOLVE_CACHE_TTL"],
+        "hits": _resolve_stats["hits"],
+        "misses": _resolve_stats["misses"],
+        "expired_count": _resolve_stats["expired"],
+        "errors": _resolve_stats["errors"],
+    }
 
-    # Remove expired
-    expired = [k for k, v in RESOLVE_CACHE.items() if v.get("expires", 0) <= now]
-    for k in expired:
-        del RESOLVE_CACHE[k]
-
-    # If still too large, remove oldest
-    if len(RESOLVE_CACHE) > CONFIG["RESOLVE_CACHE_MAX"]:
-        sorted_keys = sorted(RESOLVE_CACHE.keys(), key=lambda k: RESOLVE_CACHE[k].get("created", 0))
-        while len(RESOLVE_CACHE) > CONFIG["RESOLVE_CACHE_MAX"]:
-            del RESOLVE_CACHE[sorted_keys.pop(0)]
-
-    if expired:
-        add_log(f"Cache temizlendi: {len(expired)} son kullanilmis, toplam: {len(RESOLVE_CACHE)}")
 
 def clear_resolve_cache():
-    """Clear entire resolve cache"""
-    RESOLVE_CACHE.clear()
-    add_log("Tum resolve cache temizlendi")
+    """Tum resolve cache'i temizle."""
+    with _resolve_cache_lock:
+        _resolve_cache.clear()
+        _resolve_stats["hits"] = 0
+        _resolve_stats["misses"] = 0
+        _resolve_stats["expired"] = 0
+        _resolve_stats["errors"] = 0
 
-# ===== LOKKE SIGNATURE =====
-async def get_watched_sig():
-    global WATCHED_SIG
-    if WATCHED_SIG:
-        return WATCHED_SIG
-    try:
-        now_ms = int(time.time()) * 1000
-        headers = {
-            "user-agent": "okhttp/4.11.0",
-            "accept": "application/json",
-            "content-type": "application/json; charset=utf-8",
-        }
-        data = {
-            "token": "",
-            "reason": "boot",
-            "locale": "de",
-            "theme": "dark",
-            "metadata": {
-                "device": {"type": "desktop", "uniqueId": ""},
-                "os": {"name": "win32", "version": "Windows 10", "abis": ["x64"], "host": "DESKTOP-VX"},
-                "app": {"platform": "electron"},
-                "version": {"package": "app.lokke.main", "binary": "1.0.19", "js": "1.0.19"}
-            },
-            "appFocusTime": 173,
-            "playerActive": False,
-            "playDuration": 0,
-            "devMode": True,
-            "hasAddon": True,
-            "castConnected": False,
-            "package": "app.lokke.main",
-            "version": "1.0.19",
-            "process": "app",
-            "firstAppStart": now_ms,
-            "lastAppStart": now_ms,
-            "ipLocation": 0,
-            "adblockEnabled": True,
-            "proxy": {"supported": ["ss"], "engine": "cu", "enabled": False, "autoServer": True, "id": 0},
-            "iap": {"supported": False}
-        }
-        async with httpx.AsyncClient(timeout=15, verify=False) as client:
-            r = await client.post("https://www.lokke.app/api/app/ping", json=data, headers=headers)
-            result = r.json()
-            sig = result.get("addonSig")
-            if sig:
-                WATCHED_SIG = sig
-                add_log(f"Lokke addonSig alindi ({len(sig)} char)")
-                return sig
-            else:
-                add_log("Lokke: addonSig bulunamadi")
-    except Exception as e:
-        add_log(f"Lokke hata: {e}")
-    return ""
 
-# ===== VAVOO TOKEN =====
-async def get_vavoo_token():
-    global VAVOO_TOKEN, VAVOO_TOKEN_EXPIRES, VAVOO_TOKEN_COOLDOWN
-    if VAVOO_TOKEN and time.time() < VAVOO_TOKEN_EXPIRES:
-        return VAVOO_TOKEN
-    if time.time() < VAVOO_TOKEN_COOLDOWN:
-        return ""
-    for base_url in CONFIG["BASE_URLS"]:
-        try:
-            ping_url = base_url + "/api/app/ping2"
-            headers = {
-                "user-agent": f"Vavoo/{CONFIG['APP_VERSION']} (Linux; Android 14)",
-                "accept": "application/json",
-                "content-type": "application/json; charset=utf-8",
-                "origin": base_url,
-                "referer": base_url + "/",
-            }
-            data = {
-                "device": {
-                    "uniqueId": "vx-" + os.urandom(8).hex(),
-                    "model": "SM-S918B",
-                    "os": "android",
-                    "osVersion": "14",
-                    "appVersion": CONFIG["APP_VERSION"]
-                }
-            }
-            async with httpx.AsyncClient(timeout=10, verify=False) as client:
-                r = await client.post(ping_url, json=data, headers=headers)
-                if r.status_code == 200:
-                    result = r.json()
-                    token = result.get("token", "")
-                    if token:
-                        VAVOO_TOKEN = token
-                        VAVOO_TOKEN_EXPIRES = time.time() + 3600
-                        VAVOO_TOKEN_COOLDOWN = 0
-                        add_log(f"Vavoo token alindi ({base_url})")
-                        return token
-        except Exception as e:
-            add_log(f"Vavoo {base_url}: {e}")
-    VAVOO_TOKEN_COOLDOWN = time.time() + 1800
-    add_log("Vavoo token BASARISIZ - 30dk cooldown aktif")
-    return ""
+def slog(msg):
+    timestamp = time.strftime("%H:%M:%S")
+    entry = f"[{timestamp}] {msg}"
+    STARTUP_LOGS.append(entry)
+    print(entry)
 
-# ===== RESOLVE CHANNEL =====
-async def resolve_channel(ch_id):
-    ch = get_channel(ch_id)
-    if not ch:
-        return {"success": False, "error": "Kanal bulunamadi", "channel_id": ch_id}
 
-    # Cleanup cache periodically
-    cleanup_resolve_cache()
+# ============================================================
+# 1. VAVOO TOKEN (ping2) - vavoo_auth icin
+# ============================================================
+def get_auth_signature():
+    global _vavoo_sig, _vavoo_sig_time, _vavoo_sig_failed
 
-    # Check override first
-    ov = get_override(ch_id)
-    if ov and ov.get("enabled") and ov.get("url"):
-        add_log(f"[{ch_id}] Override: {ch.get('name','')}")
-        return {"success": True, "method": "Override", "url": ov["url"], "channel_id": ch_id}
+    # Basarili cache
+    if _vavoo_sig and (time.time() - _vavoo_sig_time) < CONFIG["SIG_CACHE_TTL"]:
+        return _vavoo_sig
 
-    ch_name = ch.get("name", "")
-    url = ch.get("url", "")
-    hls = ch.get("hls", "")
-
-    # Y1: Resolve HLS catalog URL through MediaHubMX (BEST)
-    if hls:
-        add_log(f"[{ch_id}] Y1-Resolve: {ch_name}")
-        resolved = await resolve_mediahubmx(hls)
-        if resolved:
-            add_log(f"[{ch_id}] Y1-Resolve BASARILI: {ch_name} -> {resolved[:80]}")
-            return {"success": True, "method": f"Y1-Resolve: {ch_name}", "url": resolved, "channel_id": ch_id}
-
-    # Y1.5: Resolve live2 URL through MediaHubMX
-    if url:
-        add_log(f"[{ch_id}] Y1.5-Resolve: {ch_name}")
-        resolved = await resolve_mediahubmx(url)
-        if resolved:
-            add_log(f"[{ch_id}] Y1.5-Resolve BASARILI: {ch_name} -> {resolved[:80]}")
-            return {"success": True, "method": f"Y1.5-Resolve: {ch_name}", "url": resolved, "channel_id": ch_id}
-
-    # Y2: Direct proxy (last resort)
-    if url:
-        return {"success": True, "method": f"Y2-Direct: {ch_name}", "url": url, "channel_id": ch_id}
-
-    return {"success": False, "error": "Resolve edilemedi", "method": "FAILED", "channel_id": ch_id}
-
-# ===== MEDIAHUBMX RESOLVE =====
-async def resolve_mediahubmx(url):
-    global WATCHED_SIG
-    if not WATCHED_SIG:
-        WATCHED_SIG = await get_watched_sig()
-    if not WATCHED_SIG:
+    # BASARISIZ cache - 3 dk boyunca tekrar deneme
+    if _vavoo_sig_failed and (time.time() - _vavoo_sig_time) < CONFIG["SIG_FAIL_TTL"]:
         return None
-    for domain in CONFIG["BASE_URLS"]:
-        try:
-            headers = {
-                "user-agent": "MediaHubMX/2",
-                "accept": "application/json",
-                "content-type": "application/json; charset=utf-8",
-                "mediahubmx-signature": WATCHED_SIG,
-            }
-            data = {
-                "language": "de",
-                "region": "AT",
-                "url": url,
-                "clientVersion": "3.0.2"
-            }
-            async with httpx.AsyncClient(timeout=10, verify=False) as client:
-                endpoint = f"{domain}/mediahubmx-resolve.json"
-                r = await client.post(endpoint, json=data, headers=headers)
-                if r.status_code == 200:
-                    result = r.json()
-                    if isinstance(result, list) and len(result) > 0:
-                        resolved_url = result[0].get("url", "")
-                        if resolved_url:
-                            return resolved_url
-        except Exception as e:
-            add_log(f"Resolve {domain}: {e}")
+
+    slog("Vavoo Token (ping2) aliniyor...")
+    headers = {"User-Agent": CONFIG["CDN_USER_AGENT"], "Accept": "application/json"}
+    try:
+        vec_req = requests.get("http://mastaaa1987.github.io/repo/veclist.json", headers=headers, timeout=10, verify=False)
+        veclist = vec_req.json()["value"]
+        slog(f"veclist: {len(veclist)} vec")
+
+        sig = None
+        for ping_url in CONFIG["PING2_URLS"]:
+            if sig:
+                break
+            for i in range(3):
+                vec = {"vec": random.choice(veclist)}
+                try:
+                    req = requests.post(ping_url, data=vec, headers=headers, timeout=10, verify=False).json()
+                    if req.get("signed"):
+                        sig = req["signed"]
+                        slog(f"  Token alindi: {ping_url}")
+                        break
+                except Exception:
+                    continue
+
+        # Cache sonucu
+        _vavoo_sig_time = time.time()
+        if sig:
+            _vavoo_sig = sig
+            _vavoo_sig_failed = False
+            slog("Vavoo Token alindi!")
+            return sig
+        else:
+            _vavoo_sig = None
+            _vavoo_sig_failed = True
+            slog(f"Vavoo Token ALINAMADI ({CONFIG['SIG_FAIL_TTL']}s bekleyecek)")
+    except Exception as e:
+        _vavoo_sig = None
+        _vavoo_sig_failed = True
+        _vavoo_sig_time = time.time()
+        slog(f"Vavoo Token HATASI: {e}")
     return None
 
-# ===== CATALOG FETCH =====
-async def fetch_catalog(group, cursor=0):
-    global WATCHED_SIG
-    if not WATCHED_SIG:
-        return {}
-    for domain in CONFIG["BASE_URLS"]:
-        try:
-            headers = {
-                "user-agent": "MediaHubMX/2",
-                "accept": "application/json",
-                "content-type": "application/json; charset=utf-8",
-                "mediahubmx-signature": WATCHED_SIG,
-            }
-            data = {
-                "language": "de",
-                "region": "AT",
-                "catalogId": "iptv",
-                "id": "iptv",
-                "adult": False,
-                "search": "",
-                "sort": "name",
-                "filter": {"group": group},
-                "cursor": cursor,
-                "clientVersion": "3.0.2"
-            }
-            async with httpx.AsyncClient(timeout=20, verify=False) as client:
-                endpoint = f"{domain}/mediahubmx-catalog.json"
-                r = await client.post(endpoint, json=data, headers=headers)
-                if r.status_code == 200:
-                    result = r.json()
-                    if isinstance(result, dict) and "items" in result:
-                        CATALOG_DOMAIN = domain
-                        return result
-        except Exception as e:
-            add_log(f"Catalog {domain}/{group}: {e}")
-    return {}
 
-async def fetch_all_catalog(group_name):
-    all_items = []
-    cursor = 0
-    for _ in range(50):
-        result = await fetch_catalog(group_name, cursor)
-        if not result or not isinstance(result, dict):
-            break
-        items = result.get("items", [])
-        if not items:
-            break
-        all_items.extend(items)
-        next_cursor = result.get("nextCursor")
-        if not next_cursor:
-            break
-        cursor = next_cursor
-    return all_items
+# ============================================================
+# 2. ADDONSIG (app/ping) - MediaHubMX imzasi icin
+# ============================================================
+def get_watchedsig(force=False):
+    """
+    addonSig al. force=True olursa cache'i atla ve her zaman yeni al.
+    """
+    global _watched_sig, _watched_sig_time, _watched_sig_failed
 
-# ===== CHANNEL FETCHING =====
-async def fetch_channels():
-    global LIVE2_DOMAIN
-    for domain in CONFIG["BASE_URLS"]:
+    # Basarili cache (force ile atla)
+    if not force and _watched_sig and (time.time() - _watched_sig_time) < CONFIG["SIG_CACHE_TTL"]:
+        return _watched_sig
+
+    # BASARISIZ cache (force ile atla)
+    if not force and _watched_sig_failed and (time.time() - _watched_sig_time) < CONFIG["SIG_FAIL_TTL"]:
+        return None
+
+    tag = " (FORCE)" if force else ""
+    slog(f"addonSig (app/ping) aliniyor{tag}...")
+    headers = {"user-agent": "okhttp/4.11.0", "accept": "application/json", "content-type": "application/json; charset=utf-8"}
+    data = {
+        "token": "", "reason": "boot", "locale": "de", "theme": "dark",
+        "metadata": {
+            "device": {"type": "desktop", "uniqueId": ""},
+            "os": {"name": "linux", "version": "Ubuntu 22.04", "abis": ["x64"], "host": "RENDER"},
+            "app": {"platform": "electron"},
+            "version": {"package": "app.lokke.main", "binary": "1.0.19", "js": "1.0.19"},
+        },
+        "appFocusTime": 173, "playerActive": False, "playDuration": 0,
+        "devMode": True, "hasAddon": True, "castConnected": False,
+        "package": "app.lokke.main", "version": "1.0.19", "process": "app",
+        "firstAppStart": int(time.time() * 1000) - 10000,
+        "lastAppStart": int(time.time() * 1000) - 10000,
+        "ipLocation": 0, "adblockEnabled": True,
+        "proxy": {"supported": ["ss"], "engine": "cu", "enabled": False, "autoServer": True, "id": 0},
+        "iap": {"supported": False},
+    }
+
+    for ping_url in CONFIG["PING_URLS"]:
         try:
-            url = f"{domain}/live2/index?output.json"
-            async with httpx.AsyncClient(timeout=30, verify=False) as client:
-                r = await client.get(url)
-                if r.status_code == 200:
-                    data = r.json()
-                    channels = []
-                    if isinstance(data, list):
-                        channels = data
-                    elif isinstance(data, dict):
-                        for key in ["channels", "data", "items", "list", "results"]:
-                            if key in data and isinstance(data[key], list):
-                                channels = data[key]
-                                break
-                    if channels:
-                        LIVE2_DOMAIN = domain
-                        add_log(f"live2: {len(channels)} kanal ({domain})")
-                        return channels
+            resp = requests.post(ping_url, json=data, headers=headers, timeout=15, verify=False)
+            result = resp.json()
+            sig = result.get("addonSig")
+            if sig:
+                _watched_sig = sig
+                _watched_sig_time = time.time()
+                _watched_sig_failed = False
+                slog(f"  addonSig alindi{tag}: {ping_url}")
+                return sig
+        except Exception:
+            continue
+
+    _watched_sig = None
+    _watched_sig_failed = True
+    _watched_sig_time = time.time()
+    slog(f"addonSig ALINAMADI ({CONFIG['SIG_FAIL_TTL']}s bekleyecek)")
+    return None
+
+
+# ============================================================
+# 3. HLS RESOLVE (mediahubmx) - Tum BASE_URL fallback
+# ============================================================
+def resolve_hls_link(link, force_sig=False):
+    """HLS linkini cozen fonksiyon. force_sig=True olursa addonSig'i yenile."""
+    sig = get_watchedsig(force=force_sig)
+    if not sig:
+        return None
+
+    headers = {
+        "user-agent": CONFIG["API_USER_AGENT"],
+        "accept": "application/json",
+        "content-type": "application/json; charset=utf-8",
+        "mediahubmx-signature": sig,
+    }
+    data = {
+        "language": "de", "region": "AT",
+        "url": link,
+        "clientVersion": CONFIG["APP_VERSION"],
+    }
+
+    for base in CONFIG["BASE_URLS"]:
+        try:
+            url = f"{base}/mediahubmx-resolve.json"
+            r = requests.post(url, json=data, headers=headers, timeout=CONFIG["RESOLVE_TIMEOUT"], verify=False)
+            result = r.json()
+            if result and isinstance(result, list) and len(result) > 0:
+                resolved = result[0].get("url")
+                if resolved:
+                    return resolved
+        except Exception:
+            continue
+
+    return None
+
+
+# ============================================================
+# 4. CHANNEL RESOLVE (Cache + TTL) - video.py'den cagrilir
+# ============================================================
+def resolve_channel(lid):
+    """
+    Kanal ID'sine gore stream URL'ini coz.
+    
+    RESOLVE CACHE MEKANIZMASI (v3.3.0):
+    - Basarili resolve'ler 45 dakika cache'lenir
+    - Cache suresi dolunca otomatik yeniden resolve
+    - Cache miss/expired durumunda Y1 -> Y1.5 -> Y2 -> Y3 sirasiyla denenir
+    - Y1/Y1.5 basarisiz olursa addonSig 1 kez force-refresh edilip tekrar denenir
+    - Basarisiz sonuclar cache'lenmez (her istekte tekrar denenir)
+    
+    Y1:   HLS field + Lokke resolve (catalog'tan gelen) - EN IYI
+    Y1.5: URL field + Lokke resolve
+    Y2:   URL + vavoo_auth token
+    Y3:   Direkt URL (son care - genelde calismaz)
+    """
+    # --- CACHE CHECK ---
+    now = time.time()
+    cached = None
+    with _resolve_cache_lock:
+        if lid in _resolve_cache:
+            entry = _resolve_cache[lid]
+            age = now - entry["time"]
+            if age < CONFIG["RESOLVE_CACHE_TTL"]:
+                _resolve_stats["hits"] += 1
+                return entry["url"], f"CACHE ({entry['method']}): {entry['name']} [{int(age)}s]"
+            else:
+                _resolve_stats["expired"] += 1
+                cached = entry  # Eski cache var ama suresi doldu
+
+    # --- DB'DEN KANAL BILGISI CEK ---
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM channels WHERE lid=?", (lid,))
+    ch = c.fetchone()
+    conn.close()
+    if not ch:
+        _resolve_stats["misses"] += 1
+        return None, "Kanal bulunamadi (DB'de yok)"
+
+    name = ch["name"]
+    url = ch["url"]
+    hls = ch["hls"]
+
+    # --- Y1: HLS field + Lokke resolve (catalog'tan gelen) ---
+    if hls:
+        resolved = resolve_hls_link(hls)
+        if not resolved:
+            # ILK DENEME BASARISIZ -> addonSig'i force-refresh et ve TEKRAR DENE
+            slog(f"  Y1 ilk deneme basarisiz, addonSig force-refresh... ({name})")
+            resolved = resolve_hls_link(hls, force_sig=True)
+        
+        if resolved:
+            _cache_resolve(lid, resolved, f"Y1-HLS", name)
+            return resolved, f"Y1-HLS: {name}"
+
+    # --- Y1.5: URL field + Lokke resolve ---
+    if url:
+        # live2/play3 gibi direkt URL'leri resolve etme (calismaz!)
+        if "/live2/" in url or "/play3/" in url or "/play/" in url:
+            slog(f"  Y1.5 atlandi (live2 direkt URL): {name}")
+
+        resolved = resolve_hls_link(url)
+        if not resolved:
+            slog(f"  Y1.5 ilk deneme basarisiz, addonSig force-refresh... ({name})")
+            resolved = resolve_hls_link(url, force_sig=True)
+        
+        if resolved:
+            _cache_resolve(lid, resolved, f"Y1.5-URL", name)
+            return resolved, f"Y1.5-URL-Resolve: {name}"
+
+    # --- Y2: Standart vavoo_auth Token ---
+    if url:
+        sig = get_auth_signature()
+        if sig:
+            sep = "&" if "?" in url else "?"
+            final = url + sep + "n=1&b=5&vavoo_auth=" + sig
+            _cache_resolve(lid, final, f"Y2-Auth", name)
+            return final, f"Y2-Auth: {name}"
+
+    # --- Y3: Direkt URL (son care) ---
+    if url:
+        _resolve_stats["errors"] += 1
+        return url, f"Y3-Direct: {name}"
+
+    _resolve_stats["misses"] += 1
+    return None, f"URL yok: {name}"
+
+
+def _cache_resolve(lid, url, method, name):
+    """Basarili resolve sonucunu cache'le."""
+    with _resolve_cache_lock:
+        _resolve_cache[lid] = {
+            "url": url,
+            "method": method,
+            "name": name,
+            "time": time.time(),
+        }
+        # Cache'i temiz tut (max 5000 kayit)
+        if len(_resolve_cache) > 5000:
+            oldest_lid = min(_resolve_cache, key=lambda k: _resolve_cache[k]["time"])
+            del _resolve_cache[oldest_lid]
+
+
+# ============================================================
+# 5. CATALOG FETCH - Tum BASE_URL fallback
+# ============================================================
+def fetch_catalog(sig, group_name):
+    headers = {
+        "user-agent": CONFIG["API_USER_AGENT"],
+        "accept": "application/json",
+        "mediahubmx-signature": sig,
+    }
+    data = {
+        "language": "de", "region": "AT",
+        "catalogId": "iptv", "id": "iptv",
+        "adult": False, "sort": "name",
+        "clientVersion": CONFIG["APP_VERSION"],
+        "filter": {"group": group_name},
+    }
+
+    for base in CONFIG["BASE_URLS"]:
+        try:
+            url = f"{base}/mediahubmx-catalog.json"
+            resp = requests.post(url, json=data, headers=headers, timeout=20, verify=False)
+            catalog_data = resp.json()
+            items = catalog_data.get("items", [])
+            if items:
+                slog(f"  Catalog OK: {base} ({len(items)} kayit)")
+                return items
+            else:
+                # HATA DETAYI: error mesajini logla
+                err_msg = catalog_data.get("error", "")
+                slog(f"  Catalog 400 ({base}): {err_msg}")
         except Exception as e:
-            add_log(f"live2 {domain}: {e}")
+            slog(f"  Catalog HATA ({base}): {str(e)[:80]}")
+
     return []
 
-# ===== GROUP/COUNTRY DETECTION =====
-def detect_country(ch):
-    name = ch.get("name", "")
-    group = ch.get("group", "")
-    tvg_id = ch.get("tvg_id", "")
-    n = name.upper()
-    g = group.upper()
-    t = tvg_id.lower() if tvg_id else ""
-    is_tr = False
-    is_de = False
-    if any(k in n for k in ["TR:", "TR ", "TURK", "4K TR", "FHD TR", "HD TR"]):
-        is_tr = True
-    if any(k in n for k in ["DE:", "DE ", "GERMAN", "4K DE", "FHD DE", "HD DE"]):
-        is_de = True
-    if any(k in g for k in ["TURKEY", "TURKIYE", "TR ", "TR:"]):
-        is_tr = True
-    if any(k in g for k in ["GERMANY", "DEUTSCH", "DE ", "DE:"]):
-        is_de = True
-    if t.endswith(".de"):
-        is_de = True
-    if t.endswith(".tr"):
-        is_tr = True
-    if is_tr and is_de:
-        return "BOTH"
-    if is_tr:
-        return "TR"
-    if is_de:
-        return "DE"
-    return ""
 
-def remap_group(name, original_group=""):
-    n = name.upper()
-    g = original_group.upper()
-    combined = n + " " + g
-    if any(k in combined for k in ["ULUSAL","SHOW TV","STAR TV","KANAL D","ATV","FOX TV","TV8","TRT 1","A2 TV","A2 HD","TEVE2","TV100","BLOOMBERG HT","TV A","TLC","BEYAZ TV","FLASH TV","KANAL 7","HALK TV","TELE1","ULKE TV"]):
-        return "TR ULUSAL"
-    if any(k in combined for k in ["HABER","NEWS","CNBC","NTV","BLOOMBERG","AHABER","CNN TURK","HABER TURK","TGRT HABER"]):
-        return "TR HABER"
-    if any(k in combined for k in ["BELGESEL","DOC","DISCOVERY","NAT GEO","NATIONAL GEO","HISTORY","ANIMAL","DA VINCI","YABAN","AV ","TRT BELGESEL","VIASAT EXPLORE","VIASAT HISTORY"]):
-        return "TR BELGESEL"
-    if any(k in combined for k in ["COCUK","CARTOON","MINIKA","TRT COCUK","BABY","DISNEY","NICKELODEON","KIDS","BOOMERANG","KINDER"]):
-        return "TR COCUK"
-    if any(k in combined for k in ["FILM","MOVIE","SINEMA","CINE","YESILCAM","DIZI","SERIES","FILMBOX","D-SMART","MOVIES","CINEMA"]):
-        return "TR FILM"
-    if any(k in combined for k in ["MUZIK","MUSIC","KRAL","POWER","NUMBER ONE","DREAM","NR1","TMB"]):
-        return "TR MUZIK"
-    if any(k in combined for k in ["SPOR","SPORT","BEIN","TIVIBU","DSMART","TRT SPOR","A SPOR","EUROSPORT","SPORTS"]):
-        return "TR SPOR"
-    if any(k in combined for k in ["DINI","DIN","LALE","SEMERKAND","HILAL","MEKKE","KURAN"]):
-        return "TR DINI"
-    if any(k in combined for k in ["RADYO","RADIO"]):
-        return "TR RADYO"
-    if any(k in combined for k in ["ARD","ZDF","ARTE","WDR","NDR","MDR","SWR","BR ","HR ","RB ","SR ","RBB","PHOENIX","TAGESSCHAU","3SAT","KIKA","ONE","ZDFNEO","ZDFINFO","PROSIEBEN","SAT.1","RTL","VOX","KABEL1","SUPER RTL"]):
-        return "DE VOLLPROGRAMM"
-    if any(k in combined for k in ["NACHRICHTEN","NTV DE","WELT","CNN DE","SPIEGEL","TAGESSPIEGEL"]):
-        return "DE NACHRICHTEN"
-    if any(k in combined for k in ["DOKU","DOKUMENTATION","DOCUMENTARY"]):
-        return "DE DOKU"
-    if any(k in combined for k in ["KINDER","CHILDREN"]):
-        return "DE KINDER"
-    if any(k in combined for k in ["DE: FILM","DE: MOVIE","DE: CINE","DE: SKY","DE: AXN","DE: TNT"]):
-        return "DE FILM"
-    if any(k in combined for k in ["DE: MUSIK","DE: MTV"]):
-        return "DE MUSIK"
-    if any(k in combined for k in ["DE: SPORT","DE: EUROSPORT","DE: SKY SPORT","DE: BEIN","DE: DAZN"]):
-        return "DE SPORT"
-    return "TR YEREL"
+# ============================================================
+# 6. EPG DATA (XMLTV)
+# ============================================================
+def get_epg_data():
+    import sqlite3
+    from datetime import datetime, timedelta
+    import xml.etree.ElementTree as ET
 
-def clean_name(name):
-    n = name.upper()
-    for remove in [" (1)", " (2)", " (3)", " (4)", " (5)", "(BACKUP)", "+", " HEVC", " RAW", " SD", " FHD", " UHD", " 4K", " H265", " HD", " FHD", " UHD", " 1080", " 720", " AUSTRIA", " AT"]:
-        n = n.replace(remove, "")
-    n = re.sub(r'\([^)]*\)', '', n)
-    n = re.sub(r'\[[^\]]*\]', '', n)
-    return n.strip()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT lid, name, grp FROM channels ORDER BY lid")
+        channels = c.fetchall()
+        conn.close()
 
-# ===== STARTUP SEQUENCE =====
-async def startup_sequence():
-    global DATA_READY
-    add_log("=== VxParser v3.2 Basliyor ===")
-    init_db()
-    add_log("Veritabani hazir")
+        tv = ET.Element("tv")
+        tv.set("generator-info-name", "VxParser")
+        tv.set("source-info-url", CONFIG["BASE_URLS"][0])
 
-    # 1. Lokke signature
-    add_log("Lokke signature aliniyor...")
-    sig = await get_watched_sig()
-    if sig:
-        add_log("Lokke signature: OK")
-    else:
-        add_log("Lokke signature: BASARISIZ")
+        now = datetime.utcnow()
 
-    # 2. Vavoo token
-    add_log("Vavoo token aliniyor...")
-    token = await get_vavoo_token()
-    if token:
-        add_log("Vavoo token: OK")
-    else:
-        add_log("Vavoo token: BASARISIZ (Y1-Resolve yine calisir)")
+        for ch in channels:
+            lid = ch["lid"]
+            name = ch["name"]
 
-    # 3. Fetch channels
-    add_log("Kanallar cekiliyor (live2)...")
-    channels = await fetch_channels()
-    if not channels:
-        add_log("HATA: 0 kanal cekildi!")
-        DATA_READY = True
-        return
+            ch_el = ET.SubElement(tv, "channel")
+            ch_el.set("id", str(lid))
+            display = ET.SubElement(ch_el, "display-name")
+            display.text = name
 
-    add_log(f"Toplam {len(channels)} kanal cekildi")
+            prog = ET.SubElement(tv, "programme")
+            prog.set("start", now.strftime("%Y%m%d%H%M%S") + " +0000")
+            prog.set("stop", (now + timedelta(hours=6)).strftime("%Y%m%d%H%M%S") + " +0000")
+            prog.set("channel", str(lid))
+            title = ET.SubElement(prog, "title")
+            title.text = name
+            desc = ET.SubElement(prog, "desc")
+            desc.text = f"{name} - Live"
 
-    # 4. Filter TR + DE
-    filtered = []
-    for ch in channels:
-        country = detect_country(ch)
-        if country in ("TR", "DE", "BOTH"):
-            name = ch.get("name", "Unknown")
-            url = ch.get("url", "")
-            logo = ch.get("logo", "")
-            group = ch.get("group", "")
-            grp = remap_group(name, group)
-            ch_id = 0
-            m = re.search(r'/play\d+/(\d+)\.m3u8', url)
-            if m:
-                ch_id = int(m.group(1))
-            if ch_id == 0:
-                ch_id = abs(hash(name)) % 9999999
-            filtered.append({
-                "id": ch_id,
-                "name": name,
-                "url": url,
-                "hls": "",
-                "grp": grp,
-                "country": country if country != "BOTH" else "TR",
-                "logo": logo,
-                "clean_name": clean_name(name)
-            })
+        return ET.tostring(tv, encoding="unicode", xml_declaration=True)
+    except Exception as e:
+        slog(f"EPG HATASI: {e}")
+        return None
 
-    tr_count = sum(1 for c in filtered if c["country"] == "TR")
-    de_count = sum(1 for c in filtered if c["country"] == "DE")
-    add_log(f"Filtrelenmis: {len(filtered)} (TR={tr_count}, DE={de_count})")
 
-    # 5. Save to DB
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM channels")
-    for ch in filtered:
-        c.execute("INSERT OR REPLACE INTO channels (id,name,url,hls,grp,country,logo) VALUES (?,?,?,?,?,?,?)",
-            (ch["id"], ch["name"], ch["url"], ch["hls"], ch["grp"], ch["country"], ch["logo"]))
-    conn.commit()
-    conn.close()
-    add_log(f"Veritabanina kaydedildi: {len(filtered)} kanal")
+# ============================================================
+# GRUP SIRALAMASI
+# ============================================================
+GROUP_ORDER = [
+    "TR ULUSAL", "TR HABER", "TR BEIN SPORTS", "TR SPOR", "TR BELGESEL",
+    "TR SINEMA UHD", "TR SINEMA", "TR MUZIK", "TR COCUK", "TR YEREL",
+    "TR DINI", "TR RADYO",
+    "DE DEUTSCHLAND", "DE VIP SPORTS", "DE VIP SPORTS 2", "DE SPORT",
+    "DE AUSTRIA", "DE SCHWEIZ", "DE FILM", "DE SERIEN", "DE KINO",
+    "DE DOKU", "DE KIDS", "DE MUSIK", "DE INFOTAINMENT", "DE NEWS",
+    "DE THEMEN", "DE SONSTIGE",
+]
 
-    # 6. Catalog for HLS links + logos
-    if sig:
-        add_log("MediaHubMX catalog deneniyor...")
-        try:
-            id_lookup = {}
-            for ch in filtered:
-                m = re.search(r'/play\d+/(\d+)\.m3u8', ch["url"])
-                if m:
-                    sid = m.group(1)
-                    id_lookup[sid] = ch["id"]
-                    for l in range(len(sid), max(4, len(sid)-8), -1):
-                        id_lookup[sid[:l]] = ch["id"]
-
-            total_hls = 0
-            total_logos = 0
-            for group_name in CONFIG["CATALOG_GROUPS"]:
-                add_log(f"Catalog: {group_name}...")
-                items = await fetch_all_catalog(group_name)
-                add_log(f"Catalog {group_name}: {len(items)} item")
-
-                for item in items:
-                    cat_url = item.get("url", "")
-                    cat_name = item.get("name", "")
-                    cat_logo = item.get("logo", "") or item.get("icon", "") or ""
-                    if not cat_url:
-                        continue
-
-                    u = re.sub(r'.*/', '', cat_url)
-                    uid = u[:max(4, len(u)-12)] if len(u) > 12 else u
-
-                    matched_id = None
-                    if uid in id_lookup:
-                        matched_id = id_lookup[uid]
-                    if not matched_id:
-                        for sid, db_id in id_lookup.items():
-                            if sid in cat_url:
-                                matched_id = db_id
-                                break
-                    if not matched_id:
-                        cat_clean = clean_name(cat_name)
-                        for ch in filtered:
-                            if ch["clean_name"] == cat_clean:
-                                matched_id = ch["id"]
-                                break
-
-                    if matched_id:
-                        # Update HLS link
-                        update_channel_hls(matched_id, cat_url)
-                        total_hls += 1
-                        # Update logo if we have a better one from catalog
-                        if cat_logo and cat_logo.startswith("http"):
-                            update_channel_logo(matched_id, cat_logo)
-                            total_logos += 1
-
-            add_log(f"HLS linkleri: {total_hls} kanal eslesti")
-            add_log(f"Logo guncelleme: {total_logos} kanal")
-        except Exception as e:
-            add_log(f"Catalog hatasi: {e}")
-
-    DATA_READY = True
-    add_log("=== VxParser v3.2 HAZIR ===")
+GROUP_RULES = {
+    "TR ULUSAL": ["TRT 1","Show TV","Star TV","ATV","Kanal D","FOX TV","TV8","Tele1","Beyaz TV","TV 8.5","A2","TRT 4K","Tabii","Gain","TV 100","Flash TV","Kanal 7","TGRT","TLC","D MAX","ERT"],
+    "TR HABER": ["Haber","CNN Turk","HABER","NTV","TRT Haber","Bloomberg","TVNET","A Haber","Benguturk","Haber Global","Ulusal Kanal","Sky Turk","TGRT Haber"],
+    "TR BEIN SPORTS": ["beIN Sports","beIN SPORT","beIN","beIN 4K","beIN MAX"],
+    "TR SPOR": ["Spor","A Spor","TRT Spor","TJK","S Sport","GS TV","FB TV","BJK TV","Fenerbahce","Galatasaray"],
+    "TR BELGESEL": ["Belgesel","Nat Geo","Discovery","Animal","History","Yaban TV","BBC Earth"],
+    "TR SINEMA UHD": ["4K","UHD"],
+    "TR SINEMA": ["Film","Sinema","Cinema","Movie","Movies","DigiMAX","FilmBox","Magic Box","Yesilcam","Dream TV"],
+    "TR MUZIK": ["Muzik","Kral TV","Kral Pop","Power TV","Power Turk","Number One","NR1"],
+    "TR COCUK": ["Cocuk","Cartoon","Disney","Nick","Minika","Baby TV","Pepee"],
+    "TR YEREL": ["Yerel"],
+    "TR DINI": ["Dini","Din","Diyanet","Semerkand","Hilal","Lalegul"],
+    "TR RADYO": ["Radyo","Radio","FM"],
+    "DE DEUTSCHLAND": ["ARD","ZDF","Das Erste","WDR","NDR","BR ","SWR","HR ","MDR","RBB","Phoenix","3sat","KiKA","ONE","Arte","tagesschau24","zdfinfo","zdfneo"],
+    "DE VIP SPORTS": ["Sky Sport","Sky Bundesliga","Eurosport","DAZN","Sport1"],
+    "DE VIP SPORTS 2": ["Sky Sport Austria","Telekom Sport","Magenta Sport"],
+    "DE SPORT": ["Sport ","Eurosport","Sportdigital","Motorvision"],
+    "DE AUSTRIA": ["ORF","Puls 4","Servus"],
+    "DE SCHWEIZ": ["SRF","Swiss"],
+    "DE FILM": ["Sky Cinema","RTL+","13th Street","AXN","TNT Serie","TNT Film","Sky Hits","Sky Action"],
+    "DE SERIEN": ["Serie","RTL","Sat.1","ProSieben","VOX","kabel eins","RTL2","Super RTL","Sixx","TELE 5"],
+    "DE KINO": ["Kino"],
+    "DE DOKU": ["Doku","Docu","D-MAX","N24 Doku","Spiegel TV"],
+    "DE KIDS": ["Kind","Kids","Toggo"],
+    "DE MUSIK": ["Musik","VIVA","Deluxe Music"],
+    "DE INFOTAINMENT": ["Info","N24","WELT","n-tv","BBC World","France 24"],
+    "DE NEWS": ["News","Tagesschau"],
+    "DE THEMEN": ["Shop","QVC","HSE","Bibel TV","Sonstig","Regional"],
+}

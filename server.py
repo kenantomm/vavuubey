@@ -1,49 +1,231 @@
 """
-server.py - VxParser Entry Point v3.2
-FastAPI + startup + cache cleanup
+server.py - VxParser Render entry point
+Kanallari ceker, DB olusturur, grup remap yapar.
+video.py'yi IMPORT ETMEZ - circular import onlemek icin.
+Hem server hem video state.py'yi kullanir.
 """
-import asyncio
-import logging
-import sys
 import os
-
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    datefmt="%H:%M:%S"
-)
+import re
+import time
+import logging
+import threading
+import traceback
 
 import state
-from video import app
 
-async def run_startup():
-    try:
-        await state.startup_sequence()
-    except Exception as e:
-        state.add_log(f"Startup CRITICAL: {e}")
-        import traceback
-        state.add_log(traceback.format_exc())
+# Ortam degiskenleri
+state.PORT = int(os.environ.get("PORT", 10000))
+state.DB_PATH = os.environ.get("DB_PATH", "/tmp/vxparser.db")
+state.M3U_PATH = os.environ.get("M3U_PATH", "/tmp/playlist.m3u")
 
-async def cache_cleanup_loop():
-    """Periodic cache cleanup to prevent memory issues"""
-    while True:
-        await asyncio.sleep(state.CONFIG["CACHE_CLEANUP_INTERVAL"])
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("vxparser")
+
+
+# ============================================================
+# VERITABANI
+# ============================================================
+def init_db():
+    import sqlite3
+    conn = sqlite3.connect(state.DB_PATH)
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS categories (cid INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, sort_order INTEGER DEFAULT 9999)")
+    c.execute("CREATE TABLE IF NOT EXISTS channels (lid INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, grp TEXT DEFAULT '', cid INTEGER DEFAULT 0, logo TEXT DEFAULT '', url TEXT DEFAULT '', hls TEXT DEFAULT '', sort_order INTEGER DEFAULT 9999)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_ch_cid ON channels(cid)")
+    conn.commit()
+    conn.close()
+    state.slog("DB baslatildi: " + state.DB_PATH)
+
+
+# ============================================================
+# VAVOO KANAL CEKME (live2) - Tum URL'ler fallback
+# ============================================================
+def fetch_vavoo_channels():
+    import requests
+    state.slog("Vavoo live2 cekiliyor...")
+
+    headers = {"User-Agent": state.CONFIG["CDN_USER_AGENT"]}
+
+    # Tum live2 URL'lerini dene
+    channel_list = None
+    for live2_url in state.CONFIG["LIVE2_URLS"]:
         try:
-            state.cleanup_resolve_cache()
+            state.slog(f"  Deneniyor: {live2_url}")
+            resp = requests.get(live2_url, headers=headers, timeout=30, verify=False)
+            resp.raise_for_status()
+            data = resp.json()
+            if data and isinstance(data, list) and len(data) > 0:
+                channel_list = data
+                state.slog(f"  OK: {live2_url} ({len(data)} kayit)")
+                break
+            else:
+                state.slog(f"  Bos/gecersiz: {live2_url}")
         except Exception as e:
-            state.add_log(f"Cache cleanup error: {e}")
+            state.slog(f"  HATA: {live2_url} -> {str(e)[:80]}")
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(run_startup())
-    asyncio.create_task(cache_cleanup_loop())
+    if not channel_list:
+        state.slog("Tum live2 URL'leri BASARISIZ!")
+        return False
+
+    import sqlite3
+    conn = sqlite3.connect(state.DB_PATH)
+    c = conn.cursor()
+    added = 0
+    tr_count = 0
+    de_count = 0
+
+    for ch in channel_list:
+        group_raw = ch.get("group", "").lower()
+        name = ch.get("name", "")
+        url = ch.get("url", "")
+        logo = ch.get("logo", "")
+
+        is_tr = any(x in group_raw for x in ["turkey", "turkish", "tr", "türk", "türkei"])
+        is_de = any(x in group_raw for x in ["deutschland", "german", "deutsch", "austria", "österreich", "schweiz", "switzerland"])
+        if not is_tr and not is_de:
+            continue
+
+        name_clean = re.sub(r"[^\x00-\x7F]+", "", name)
+        if not name_clean:
+            continue
+
+        c.execute("INSERT OR REPLACE INTO channels(name,grp,cid,logo,url,hls,sort_order) VALUES(?,?,?,?,?,?,?)",
+                  (name_clean, ch.get("group", ""), 0, logo, url, "", 9999))
+        added += 1
+        if is_tr:
+            tr_count += 1
+        if is_de:
+            de_count += 1
+
+    conn.commit()
+    conn.close()
+    state.slog(f"Kanallar: {added} (TR={tr_count}, DE={de_count})")
+    return True
+
+
+# ============================================================
+# HLS LINKLERI CEK (catalog) - Tum BASE_URL fallback
+# ============================================================
+def fetch_hls_links():
+    state.slog("HLS linkleri cekiliyor...")
+    sig = state.get_watchedsig()
+    if not sig:
+        state.slog("addonSig yok, HLS atlanacak")
+        return False
+
+    updated = 0
+    import sqlite3
+
+    for group_name in ["Turkey", "Deutschland"]:
+        state.slog(f"  {group_name} catalog cekiliyor...")
+        items = state.fetch_catalog(sig, group_name)
+
+        if items:
+            conn = sqlite3.connect(state.DB_PATH)
+            c = conn.cursor()
+            for item in items:
+                hls_url = item.get("url", "")
+                name_clean = re.sub(r"[^\x00-\x7F]+", "", item.get("name", ""))
+                if hls_url and name_clean:
+                    c.execute("UPDATE channels SET hls=? WHERE name=?", (hls_url, name_clean))
+                    updated += 1
+            conn.commit()
+            conn.close()
+            state.slog(f"  {group_name}: {len(items)} HLS link guncellendi")
+        else:
+            state.slog(f"  {group_name}: catalog BOS (HLS link alinamadi)")
+
+    state.slog(f"HLS toplam: {updated} link guncellendi")
+    return updated > 0
+
+
+# ============================================================
+# GRUP REMAPPING
+# ============================================================
+def remap_groups():
+    import sqlite3
+    conn = sqlite3.connect(state.DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM categories")
+    c.execute("UPDATE channels SET cid=0, grp=''")
+    conn.commit()
+
+    for idx, gn in enumerate(state.GROUP_ORDER):
+        c.execute("INSERT OR IGNORE INTO categories(cid,name,sort_order) VALUES(?,?,?)", (idx+1, gn, idx+1))
+    conn.commit()
+
+    c.execute("SELECT lid, name FROM channels")
+    updated = 0
+    for lid, name in c.fetchall():
+        assigned = False
+        for gi, gn in enumerate(state.GROUP_ORDER):
+            for kw in state.GROUP_RULES.get(gn, []):
+                if kw.lower() in name.lower():
+                    c.execute("UPDATE channels SET cid=?,grp=?,sort_order=? WHERE lid=?", (gi+1, gn, gi+1, lid))
+                    updated += 1
+                    assigned = True
+                    break
+            if assigned:
+                break
+        if not assigned:
+            c.execute("SELECT cid FROM categories WHERE name='DE SONSTIGE'")
+            row = c.fetchone()
+            if row:
+                c.execute("UPDATE channels SET cid=?,grp='DE SONSTIGE',sort_order=9998 WHERE lid=?", (row[0], lid))
+    conn.commit()
+    conn.close()
+    state.slog(f"Grup remap: {updated} kanal")
+
+
+# ============================================================
+# BASLANGIC
+# ============================================================
+def startup_sequence():
+    start = time.time()
+    try:
+        state.slog("=== VxParser Baslangic ===")
+        state.slog(f"PORT={state.PORT} DB={state.DB_PATH}")
+        state.slog(f"BASE_URLS: {state.CONFIG['BASE_URLS']}")
+        state.slog(f"PING_URLS: {state.CONFIG['PING_URLS']}")
+        state.slog(f"APP_VERSION: {state.CONFIG['APP_VERSION']} (v3.3.0 - Resolve Cache TTL Fix)")
+
+        state.slog("[1/5] addonSig (app/ping)...")
+        lokke = state.get_watchedsig()
+        state.slog(f"[1/5] addonSig={'OK' if lokke else 'BASARISIZ'}")
+
+        state.slog("[2/5] Vavoo token (ping2)...")
+        vavoo = state.get_auth_signature()
+        state.slog(f"[2/5] Vavoo={'OK' if vavoo else 'BASARISIZ'}")
+
+        state.slog("[3/5] DB + Kanallar...")
+        init_db()
+        ok = fetch_vavoo_channels()
+        state.slog(f"[3/5] Kanallar={'OK' if ok else 'BASARISIZ'}")
+
+        state.slog("[4/5] HLS linkleri (catalog)...")
+        fetch_hls_links()
+
+        state.slog("[5/5] Grup remap...")
+        remap_groups()
+
+        state.LOAD_TIME = time.time() - start
+        state.DATA_READY = True
+        state.slog(f"=== TAMAM! ({state.LOAD_TIME:.1f}s) ===")
+    except Exception as e:
+        state.STARTUP_ERROR = str(e)
+        state.slog(f"!!! HATA: {e}")
+        traceback.print_exc()
+
+
+def main():
+    state.slog(">>> main() basladi <<<")
+    threading.Thread(target=startup_sequence, daemon=True).start()
+
+    # video.py'yi import et - circular import YOK cunku video server import etmiyor
+    import uvicorn
+    from video import app
+    uvicorn.run(app, host="0.0.0.0", port=state.PORT)
+
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 7860))
-    print(f"VxParser v3.2 starting on port {port}...")
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    main()

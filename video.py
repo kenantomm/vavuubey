@@ -1,1318 +1,787 @@
 """
-video.py - VxParser Routes v3.2
-All FastAPI endpoints, HLS proxy, Admin Panel
-Features: checkbox group assignment, auto-save reorder, logos from Vavoo, cache cleanup
+video.py - FastAPI uygulama.
+server.py'yi IMPORT ETMEZ - circular import onlemek icin.
+Hem resolve hem token fonksiyonlari state.py'den gelir.
 """
-from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse, HTMLResponse
-import state
-import httpx
-import time
 import os
-import json
-import secrets
+import sqlite3
+import threading
+import re
 
-app = FastAPI(title="VxParser")
+from fastapi import FastAPI, Request, Query, HTTPException
+from fastapi.responses import PlainTextResponse, RedirectResponse, Response
 
-def get_proxy_headers():
-    h = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "identity",
-        "Connection": "keep-alive",
-    }
-    if state.VAVOO_TOKEN:
-        h["Cookie"] = f"token={state.VAVOO_TOKEN}"
-    return h
+import state
 
-VAVOO_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Referer": "https://vavoo.to/",
-    "Origin": "https://vavoo.to",
-    "Accept": "*/*",
-}
+app = FastAPI(title="VxParser IPTV Proxy", version="7.3.0")
 
-def detect_host(request: Request) -> str:
-    forwarded = request.headers.get("X-Forwarded-Proto", "https")
-    host = request.headers.get("Host", request.url.hostname or "localhost")
-    return f"{forwarded}://{host}"
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASS", "admin123")
 
-def add_log(msg):
-    state.add_log(msg)
 
-# ===== HLS PROXY =====
-async def proxy_stream(url, ch_id):
-    try:
-        headers = get_proxy_headers()
-        from urllib.parse import urlparse
-        parsed = urlparse(url)
-        if parsed.hostname:
-            headers["Referer"] = f"{parsed.scheme}://{parsed.hostname}/"
-            headers["Origin"] = f"{parsed.scheme}://{parsed.hostname}"
+def get_db():
+    conn = sqlite3.connect(state.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-        add_log(f"[{ch_id}] Proxy: {url[:120]}")
 
-        async with httpx.AsyncClient(timeout=15, verify=False, follow_redirects=False) as client:
-            r = await client.get(url, headers=headers)
-            ct = r.headers.get("content-type", "")
+def get_base_host(request: Request) -> str:
+    proto = request.headers.get("x-forwarded-proto", "https")
+    host = request.headers.get("host", "localhost:10000")
+    return f"{proto}://{host}"
 
-            if r.status_code in (301, 302, 303, 307, 308):
-                location = r.headers.get("location", "")
-                if location:
-                    if not location.startswith("http"):
-                        base = f"{parsed.scheme}://{parsed.hostname}"
-                        location = base + location
-                    r2 = await client.get(location, headers=headers)
-                    if r2.status_code == 200:
-                        return _handle_hls_response(r2.text, str(r2.url), ch_id)
-                    return JSONResponse({"error": f"redirect HTTP {r2.status_code}"}, status_code=502)
-                return JSONResponse({"error": "redirect no location"}, status_code=502)
 
-            if r.status_code != 200:
-                return JSONResponse({"error": f"upstream {r.status_code}"}, status_code=502)
-
-            text = r.text
-            if not text.strip().startswith("#"):
-                if text.strip().startswith("{") or text.strip().startswith("<"):
-                    return JSONResponse({"error": "not HLS", "body": text[:500]}, status_code=502)
-
-            return _handle_hls_response(text, str(r.url), ch_id)
-
-    except httpx.TimeoutException:
-        add_log(f"[{ch_id}] Proxy TIMEOUT")
-        return JSONResponse({"error": "timeout"}, status_code=504)
-    except Exception as e:
-        add_log(f"[{ch_id}] Proxy ERROR: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-def _handle_hls_response(text, base_url, ch_id):
-    base = base_url.rsplit("/", 1)[0] + "/"
-    lines = text.split("\n")
-    rewritten = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            rewritten.append(line)
-        elif stripped.startswith("http"):
-            rewritten.append(f"/channel/{ch_id}/stream?url={stripped}")
-        else:
-            abs_url = base + stripped if not stripped.startswith("/") else base.split("://", 1)[0] + "://" + base.split("://", 1)[1].split("/")[0] + stripped
-            rewritten.append(f"/channel/{ch_id}/stream?url={abs_url}")
-    return PlainTextResponse("\n".join(rewritten), media_type="application/vnd.apple.mpegurl")
-
-# ===== M3U BUILD =====
-def build_m3u(host):
-    lines = ['#EXTM3U url-tvg="" deinterlace="1"']
-    hidden = state.get_hidden_channels()
-    channels = state.get_all_channels(ordered=True)
-    for ch in channels:
-        if ch["id"] in hidden:
-            continue
-        ch_id = ch["id"]
-        ch_name = ch["name"]
-        ch_grp = ch["grp"]
-        ch_logo = ch.get("logo", "")
-        logo_param = f' tvg-logo="{ch_logo}"' if ch_logo else ""
-        lines.append(f'#EXTINF:-1 group-title="{ch_grp}"{logo_param},{ch_name}')
-        lines.append(f'{host}/channel/{ch_id}')
-    return "\n".join(lines)
-
-# ===== PUBLIC ROUTES =====
+# ============================================================
+# DURUM
+# ============================================================
 
 @app.get("/")
-async def root(request: Request):
-    host = detect_host(request)
-    return PlainTextResponse(
-        f"VxParser v3.2 Online\n\n"
-        f"M3U: {host}/get.php?username=admin&password=admin&type=m3u_plus\n"
-        f"Status: {host}/api/status\n"
-        f"Admin: {host}/admin\n"
-    )
+async def root():
+    return {
+        "status": "ready" if state.DATA_READY else "loading",
+        "error": state.STARTUP_ERROR,
+        "load_time": round(state.LOAD_TIME, 1) if state.DATA_READY else None,
+        "message": "Hazir!" if state.DATA_READY else "Kanallar yukleniyor, 30-60sn bekle...",
+        "logs_count": len(state.STARTUP_LOGS),
+    }
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
 
 @app.get("/ping")
 @app.get("/pong")
-@app.get("/health")
-async def health():
-    state.cleanup_resolve_cache()
-    return PlainTextResponse("pong")
+async def ping_pong():
+    """UptimeRobot / cron keep-alive endpoint. Render uyumasin!"""
+    return {"status": "pong", "ready": state.DATA_READY}
 
-@app.get("/get.php")
-async def get_m3u(request: Request, username: str = "", password: str = "", type: str = "m3u_plus"):
-    host = detect_host(request)
-    return PlainTextResponse(build_m3u(host), media_type="audio/x-mpegurl")
 
-@app.get("/player_api.php")
-async def player_api(request: Request, username: str = "", password: str = "", action: str = ""):
-    host = detect_host(request)
-    hidden = state.get_hidden_channels()
-    if action == "get_live_categories":
-        groups = {}
-        for ch in state.get_all_channels(ordered=True):
-            if ch["id"] not in hidden:
-                groups[ch["grp"]] = groups.get(ch["grp"], 0) + 1
-        return JSONResponse([{"category_id": str(i+1), "category_name": g, "parent_id": 0} for i, g in enumerate(groups.keys())])
-    elif action == "get_live_streams":
-        return JSONResponse([{"num": i+1, "name": ch["name"], "stream_type": "live", "stream_id": ch["id"], "stream_icon": ch.get("logo", "")} for i, ch in enumerate(state.get_all_channels(ordered=True)) if ch["id"] not in hidden])
-    return PlainTextResponse(build_m3u(host), media_type="audio/x-mpegurl")
-
-@app.get("/channel/{ch_id}")
-async def channel_stream(ch_id: int):
-    ch = state.get_channel(ch_id)
-    if not ch:
-        return JSONResponse({"error": "Not found"}, status_code=404)
-
-    cache_key = str(ch_id)
-    if cache_key in state.RESOLVE_CACHE:
-        cached = state.RESOLVE_CACHE[cache_key]
-        if cached.get("expires", 0) > time.time():
-            return await proxy_stream(cached["url"], ch_id)
-
-    result = await state.resolve_channel(ch_id)
-    if result.get("success"):
-        stream_url = result["url"]
-        ttl = state.CONFIG["RESOLVE_CACHE_TTL"]
-        state.RESOLVE_CACHE[cache_key] = {"url": stream_url, "expires": time.time() + ttl, "created": time.time()}
-        return await proxy_stream(stream_url, ch_id)
-
-    return JSONResponse({"error": result.get("error", "Could not resolve")}, status_code=502)
-
-@app.get("/channel/{ch_id}/stream")
-async def channel_substream(ch_id: int, url: str):
-    if not url:
-        return JSONResponse({"error": "no url"}, status_code=400)
-    try:
-        headers = get_proxy_headers()
-        from urllib.parse import urlparse
-        parsed = urlparse(url)
-        if parsed.hostname:
-            headers["Referer"] = f"{parsed.scheme}://{parsed.hostname}/"
-            headers["Origin"] = f"{parsed.scheme}://{parsed.hostname}"
-
-        async with httpx.AsyncClient(timeout=15, verify=False, follow_redirects=True) as client:
-            r = await client.get(url, headers=headers)
-            if r.status_code != 200:
-                return JSONResponse({"error": f"upstream {r.status_code}"}, status_code=502)
-            content_type = r.headers.get("content-type", "")
-            if "mpegurl" in content_type or ".m3u8" in url:
-                text = r.text
-                final_url = str(r.url)
-                base = final_url.rsplit("/", 1)[0] + "/"
-                def rewrite(line):
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        return line
-                    if line.startswith("http"):
-                        return f"/channel/{ch_id}/stream?url={line}"
-                    abs_url = base + line if not line.startswith("/") else base.split("://", 1)[0] + "://" + base.split("://", 1)[1].split("/")[0] + line
-                    return f"/channel/{ch_id}/stream?url={abs_url}"
-                rewritten = "\n".join(rewrite(l) for l in text.split("\n"))
-                return PlainTextResponse(rewritten, media_type="application/vnd.apple.mpegurl")
-            ct = content_type or "video/MP2T"
-            return StreamingResponse(iter([r.content]), media_type=ct, headers={"Content-Length": str(len(r.content)), "Cache-Control": "max-age=2"})
-    except httpx.TimeoutException:
-        return JSONResponse({"error": "timeout"}, status_code=504)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-# ===== API ROUTES =====
+# ============================================================
+# API STATUS (Xtream uyumlu)
+# ============================================================
 
 @app.get("/api/status")
-async def api_status(request: Request):
-    host = detect_host(request)
-    import sqlite3
-    info = {
+async def api_status():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM channels")
+    total = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM categories")
+    cats = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM channels WHERE hls != '' AND hls IS NOT NULL")
+    hls_count = c.fetchone()[0]
+    conn.close()
+    return {
+        "status": "ready" if state.DATA_READY else "loading",
         "data_ready": state.DATA_READY,
-        "host": host,
-        "lokke_sig": bool(state.WATCHED_SIG),
-        "vavoo_token": bool(state.VAVOO_TOKEN),
-        "vavoo_cooldown": bool(time.time() < state.VAVOO_TOKEN_COOLDOWN),
-        "live2_domain": state.LIVE2_DOMAIN,
-        "catalog_domain": state.CATALOG_DOMAIN,
-        "resolve_cache": len(state.RESOLVE_CACHE),
-        "version": state.CONFIG["APP_VERSION"],
-        "logs": state.STARTUP_LOGS[-30:]
+        "error": state.STARTUP_ERROR,
+        "load_time": round(state.LOAD_TIME, 1) if state.DATA_READY else None,
+        "available_channels": total,
+        "available_categories": cats,
+        "hls_channels": hls_count,
+        "vavoo_token": bool(state._vavoo_sig),
+        "lokke_token": bool(state._watched_sig),
+        "resolve_cache": state.get_resolve_cache_info(),
+        "startup_logs": state.STARTUP_LOGS,
     }
-    try:
-        conn = sqlite3.connect(state.DB_PATH)
+
+
+# ============================================================
+# DEBUG
+# ============================================================
+
+@app.get("/debug")
+async def debug():
+    return {
+        "data_ready": state.DATA_READY,
+        "error": state.STARTUP_ERROR,
+        "vavoo_token": bool(state._vavoo_sig),
+        "lokke_token": bool(state._watched_sig),
+        "resolve_cache": state.get_resolve_cache_info(),
+        "startup_logs": state.STARTUP_LOGS,
+        "db_path": state.DB_PATH,
+    }
+
+
+# ============================================================
+# CHANNEL TEST (debug - redirect yapmaz)
+# ============================================================
+
+@app.get("/test/{sid}")
+async def test_channel(sid: str):
+    """Kanal bilgisi ve resolve sonucunu goster (redirect yapmaz)"""
+    conn = get_db()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT lid, name, url, hls, grp FROM channels WHERE lid=?", (sid,))
+    ch = c.fetchone()
+    conn.close()
+
+    if not ch:
+        return {"error": f"Kanal {sid} bulunamadi"}
+
+    # Resolve test
+    resolved_url, method = state.resolve_channel(sid)
+
+    return {
+        "lid": ch["lid"],
+        "name": ch["name"],
+        "url": ch["url"],
+        "hls": ch["hls"],
+        "grp": ch["grp"],
+        "resolve_method": method,
+        "resolved_url": resolved_url,
+    }
+
+
+# ============================================================
+# CHANNEL RESOLVE - state.resolve_channel kullanir
+# ============================================================
+
+@app.get("/channel/{sid}")
+async def play_channel(sid: str):
+    """
+    Kanal resolve ve redirect.
+    state.resolve_channel() kullanir - server.py'ye gerek YOK.
+    """
+    url, method = state.resolve_channel(sid)
+    if url:
+        return RedirectResponse(url=url, status_code=302)
+    raise HTTPException(status_code=503, detail=method)
+
+
+# ============================================================
+# M3U PLAYLIST
+# ============================================================
+
+@app.get("/get.php")
+async def get_playlist(
+    request: Request,
+    username: str = Query("admin"),
+    password: str = Query("admin"),
+    type: str = Query("m3u_plus"),
+    output: str = Query("m3u_plus"),
+):
+    host = get_base_host(request)
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        "SELECT c.lid, c.name, c.url, c.hls, c.logo, "
+        "COALESCE(cat.name, 'Sonstige') as group_name "
+        "FROM channels c LEFT JOIN categories cat ON c.cid = cat.cid "
+        "ORDER BY COALESCE(cat.sort_order, 9999), c.name"
+    )
+    channels = c.fetchall()
+    conn.close()
+
+    lines = [f'#EXTM3U url-tvg="{host}/epg.xml" deinterlace="1"']
+    for ch in channels:
+        lid = ch["lid"]
+        logo = ch["logo"] or ""
+        group = ch["group_name"]
+        name = ch["name"]
+        stream_url = f"{host}/channel/{lid}"
+        lines.append(f'#EXTINF:-1 tvg-id="{lid}" tvg-logo="{logo}" group-title="{group}",{name}')
+        lines.append(stream_url)
+
+    return PlainTextResponse(content="\n".join(lines), media_type="audio/x-mpegurl")
+
+
+# ============================================================
+# EPG (XMLTV)
+# ============================================================
+
+@app.get("/epg.xml")
+async def epg_xml():
+    xml_content = state.get_epg_data()
+    if xml_content:
+        return Response(content=xml_content, media_type="application/xml")
+    return Response(content="<?xml version='1.0'?><tv><error>EPG not ready</error></tv>", media_type="application/xml")
+
+
+# ============================================================
+# XTREAM CODES JSON API
+# ============================================================
+
+@app.get("/player_api.php")
+async def player_api(
+    request: Request,
+    username: str = Query("admin"),
+    password: str = Query("admin"),
+    action: str = Query(None),
+):
+    host = get_base_host(request)
+    conn = get_db()
+
+    if action == "get_live_categories":
+        c = conn.cursor()
+        c.execute("SELECT cid as category_id, name as category_name FROM categories ORDER BY sort_order")
+        cats = [dict(r) for r in c.fetchall()]
+        conn.close()
+        return cats
+
+    elif action == "get_live_streams":
+        c = conn.cursor()
+        c.execute(
+            "SELECT c.lid as stream_id, c.name as name, c.logo as stream_icon, "
+            "c.cid as category_id, COALESCE(cat.name, 'Sonstige') as category_name "
+            "FROM channels c LEFT JOIN categories cat ON c.cid = cat.cid "
+            "ORDER BY COALESCE(cat.sort_order, 9999), c.name"
+        )
+        streams = []
+        for r in c.fetchall():
+            row = dict(r)
+            row["stream_url"] = f"{host}/channel/{row['stream_id']}"
+            streams.append(row)
+        conn.close()
+        return streams
+
+    else:
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM channels")
-        info["total_channels"] = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM channels WHERE hls != ''")
-        info["hls_channels"] = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM channels WHERE country='TR'")
-        info["tr_channels"] = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM channels WHERE country='DE'")
-        info["de_channels"] = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM channels WHERE logo != '' AND logo != 'null'")
-        info["logo_channels"] = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM hidden_channels")
-        info["hidden_channels"] = c.fetchone()[0]
-        c.execute("SELECT DISTINCT grp FROM channels ORDER BY grp")
-        info["groups"] = [r[0] for r in c.fetchall()]
+        total = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM categories")
+        cats = c.fetchone()[0]
         conn.close()
-    except Exception as e:
-        info["db_error"] = str(e)
-    return JSONResponse(info)
+        return {
+            "user_info": {"username": username, "status": "Active", "exp_date": "2099-01-01", "max_connections": 1},
+            "server_info": {"port": str(state.PORT), "url": f"{host}/epg.xml"},
+            "available_channels": total,
+            "available_categories": cats,
+        }
 
-@app.get("/api/logs")
-async def api_logs():
-    return JSONResponse({"logs": state.STARTUP_LOGS})
 
-@app.get("/stats")
-async def stats():
-    return JSONResponse({"status": "online" if state.DATA_READY else "loading", "channels": len(state.get_all_channels(ordered=False)) if state.DATA_READY else 0})
-
-@app.get("/test/{ch_id}")
-async def test_channel(ch_id: int):
-    ch = state.get_channel(ch_id)
-    if not ch:
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    ov = state.get_override(ch_id)
-    result = {
-        "channel_id": ch_id,
-        "name": ch.get("name", ""),
-        "url": ch.get("url", ""),
-        "hls": ch.get("hls", ""),
-        "grp": ch.get("grp", ""),
-        "country": ch.get("country", ""),
-        "logo": ch.get("logo", ""),
-        "has_override": bool(ov),
-        "override_url": ov.get("url", "") if ov else ""
-    }
-    resolve = await state.resolve_channel(ch_id)
-    result["resolve_method"] = resolve.get("method", "NONE")
-    result["resolved_url"] = resolve.get("url", "")
-    result["success"] = resolve.get("success", False)
-    return JSONResponse(result)
+# ============================================================
+# RELOAD
+# ============================================================
 
 @app.get("/reload")
-async def reload():
-    if not state.DATA_READY:
-        state.DATA_READY = False
-        import asyncio
-        asyncio.create_task(state.startup_sequence())
-        return JSONResponse({"status": "reloading"})
-    return JSONResponse({"status": "already_ready"})
+async def reload_channels():
+    state.DATA_READY = False
+    state.STARTUP_ERROR = None
+    state.STARTUP_LOGS.clear()
+    state.clear_resolve_cache()  # Cache'i temizle
 
-@app.get("/debug/{ch_id}")
-async def debug_channel(ch_id: int):
-    ch = state.get_channel(ch_id)
-    if not ch:
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    url = ch.get("url", "")
-    hls = ch.get("hls", "")
-    result = {"channel_id": ch_id, "name": ch.get("name", ""), "url_field": url, "hls_field": hls}
-    if hls:
+    def do_reload():
+        import server
         try:
-            resolved = await state.resolve_mediahubmx(hls)
-            result["resolve_hls"] = resolved
+            server.init_db()
+            server.fetch_vavoo_channels()
+            server.fetch_hls_links()
+            server.remap_groups()
+            state.DATA_READY = True
         except Exception as e:
-            result["resolve_error"] = str(e)
-    if url:
-        try:
-            resolved2 = await state.resolve_mediahubmx(url)
-            result["resolve_url"] = resolved2
-        except Exception as e:
-            result["resolve_url_error"] = str(e)
-    return JSONResponse(result)
+            state.STARTUP_ERROR = str(e)
 
-# ===== ADMIN API =====
+    threading.Thread(target=do_reload, daemon=True).start()
+    return {"status": "reloading", "message": "Yukleniyor... 30-60sn bekle"}
 
-@app.post("/api/admin/login")
-async def admin_login(request: Request):
-    body = await request.json()
-    pwd = body.get("password", "")
-    if pwd == state.ADMIN_PASS:
-        token = secrets.token_hex(32)
-        state.ADMIN_SESSIONS[token] = time.time() + 86400
-        return JSONResponse({"token": token, "success": True})
-    return JSONResponse({"success": False, "error": "Sifre hatali"}, status_code=403)
 
-def check_admin(request: Request):
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        token = auth[7:]
-        if token in state.ADMIN_SESSIONS and state.ADMIN_SESSIONS[token] > time.time():
-            return True
-    return False
+# ============================================================
+# STATS
+# ============================================================
 
-@app.get("/api/admin/channels")
-async def admin_channels(request: Request, search: str = "", grp: str = ""):
-    if not check_admin(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    channels = state.get_all_channels(ordered=True)
-    if search:
-        channels = [c for c in channels if search.lower() in c["name"].lower()]
-    if grp:
-        channels = [c for c in channels if c["grp"] == grp]
-    return JSONResponse({"channels": channels, "total": len(channels)})
+# ============================================================
+# ADMIN PANEL (Tek sayfa HTML)
+# ============================================================
 
-@app.get("/api/admin/groups")
-async def admin_groups(request: Request):
-    if not check_admin(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    import sqlite3
-    conn = sqlite3.connect(state.DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT grp, COUNT(*) as cnt FROM channels GROUP BY grp ORDER BY MIN(name)")
-    groups = [{"name": r[0], "count": r[1]} for r in c.fetchall()]
-    conn.close()
-    return JSONResponse({"groups": groups})
-
-@app.post("/api/admin/override")
-async def admin_set_override(request: Request):
-    if not check_admin(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    body = await request.json()
-    ch_id = body.get("channel_id")
-    url = body.get("url", "")
-    enabled = body.get("enabled", True)
-    if not ch_id:
-        return JSONResponse({"error": "channel_id required"}, status_code=400)
-    state.set_override(ch_id, url, 1 if enabled else 0)
-    return JSONResponse({"success": True})
-
-@app.get("/api/admin/overrides")
-async def admin_get_overrides(request: Request):
-    if not check_admin(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    return JSONResponse({"overrides": state.get_all_overrides()})
-
-@app.post("/api/admin/reorder")
-async def admin_reorder(request: Request):
-    if not check_admin(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    body = await request.json()
-    rtype = body.get("type", "")
-    items = body.get("items", [])
-    if not items:
-        return JSONResponse({"error": "items required"}, status_code=400)
-    import sqlite3
-    conn = sqlite3.connect(state.DB_PATH)
-    c = conn.cursor()
-    c.execute("CREATE TABLE IF NOT EXISTS sort_order (key TEXT PRIMARY KEY, value TEXT)")
-    c.execute("INSERT OR REPLACE INTO sort_order (key, value) VALUES (?, ?)", (rtype, json.dumps(items)))
-    conn.commit()
-    conn.close()
-    add_log(f"Admin: {len(items)} {rtype} siralama kaydedildi (auto-save)")
-    return JSONResponse({"success": True, "count": len(items)})
-
-@app.post("/api/admin/move-group")
-async def admin_move_group(request: Request):
-    if not check_admin(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    body = await request.json()
-    ch_id = body.get("channel_id")
-    new_grp = body.get("group", "")
-    if not ch_id or not new_grp:
-        return JSONResponse({"error": "channel_id and group required"}, status_code=400)
-    import sqlite3
-    conn = sqlite3.connect(state.DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE channels SET grp = ? WHERE id = ?", (new_grp, ch_id))
-    conn.commit()
-    conn.close()
-    add_log(f"Admin: Kanal {ch_id} -> '{new_grp}'")
-    return JSONResponse({"success": True})
-
-@app.post("/api/admin/bulk-move-group")
-async def admin_bulk_move_group(request: Request):
-    """Move multiple channels to a group at once"""
-    if not check_admin(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    body = await request.json()
-    ch_ids = body.get("channel_ids", [])
-    new_grp = body.get("group", "")
-    if not ch_ids or not new_grp:
-        return JSONResponse({"error": "channel_ids and group required"}, status_code=400)
-    import sqlite3
-    conn = sqlite3.connect(state.DB_PATH)
-    c = conn.cursor()
-    for ch_id in ch_ids:
-        c.execute("UPDATE channels SET grp = ? WHERE id = ?", (new_grp, ch_id))
-    conn.commit()
-    conn.close()
-    add_log(f"Admin: {len(ch_ids)} kanal -> '{new_grp}'")
-    return JSONResponse({"success": True, "count": len(ch_ids)})
-
-@app.post("/api/admin/create-group")
-async def admin_create_group(request: Request):
-    """Create a new group by moving channels into it"""
-    if not check_admin(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    body = await request.json()
-    grp_name = body.get("name", "")
-    ch_ids = body.get("channel_ids", [])
-    if not grp_name:
-        return JSONResponse({"error": "name required"}, status_code=400)
-    if not ch_ids:
-        return JSONResponse({"error": "channel_ids required"}, status_code=400)
-    import sqlite3
-    conn = sqlite3.connect(state.DB_PATH)
-    c = conn.cursor()
-    for ch_id in ch_ids:
-        c.execute("UPDATE channels SET grp = ? WHERE id = ?", (grp_name, ch_id))
-    conn.commit()
-    conn.close()
-    add_log(f"Admin: Yeni grup '{grp_name}' olusturuldu ({len(ch_ids)} kanal)")
-    return JSONResponse({"success": True, "group": grp_name, "count": len(ch_ids)})
-
-@app.post("/api/admin/rename-group")
-async def admin_rename_group(request: Request):
-    if not check_admin(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    body = await request.json()
-    old_name = body.get("old_name", "")
-    new_name = body.get("new_name", "")
-    if not old_name or not new_name:
-        return JSONResponse({"error": "old_name and new_name required"}, status_code=400)
-    import sqlite3
-    conn = sqlite3.connect(state.DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE channels SET grp = ? WHERE grp = ?", (new_name, old_name))
-    affected = c.rowcount
-    conn.commit()
-    conn.close()
-    add_log(f"Admin: '{old_name}' -> '{new_name}' ({affected} kanal)")
-    return JSONResponse({"success": True, "affected": affected})
-
-@app.post("/api/admin/hide-channel")
-async def admin_hide_channel(request: Request):
-    if not check_admin(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    body = await request.json()
-    ch_id = body.get("channel_id")
-    hidden = body.get("hidden", True)
-    if not ch_id:
-        return JSONResponse({"error": "channel_id required"}, status_code=400)
-    import sqlite3
-    conn = sqlite3.connect(state.DB_PATH)
-    c = conn.cursor()
-    c.execute("CREATE TABLE IF NOT EXISTS hidden_channels (ch_id INTEGER PRIMARY KEY)")
-    if hidden:
-        c.execute("INSERT OR IGNORE INTO hidden_channels (ch_id) VALUES (?)", (ch_id,))
-    else:
-        c.execute("DELETE FROM hidden_channels WHERE ch_id = ?", (ch_id,))
-    conn.commit()
-    conn.close()
-    add_log(f"Admin: Kanal {ch_id} {'gizlendi' if hidden else 'gosterildi'}")
-    return JSONResponse({"success": True})
-
-@app.post("/api/admin/clear-cache")
-async def admin_clear_cache(request: Request):
-    if not check_admin(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    state.clear_resolve_cache()
-    return JSONResponse({"success": True})
-
-# ===== ADMIN PANEL HTML =====
-ADMIN_HTML = r'''<!DOCTYPE html>
+ADMIN_HTML = """<!DOCTYPE html>
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>VxParser Admin v3.2</title>
+<title>VxParser Admin</title>
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:system-ui,-apple-system,sans-serif;background:#0f1117;color:#e1e4e8}
-.login-wrap{display:flex;align-items:center;justify-content:center;min-height:100vh;background:#0f1117}
-.login-box{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:40px;width:360px;text-align:center}
-.login-box h1{color:#58a6ff;margin-bottom:8px;font-size:24px}
-.login-box p{color:#8b949e;margin-bottom:24px;font-size:14px}
-.login-box input{width:100%;padding:10px 14px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e1e4e8;font-size:14px;outline:none;margin-bottom:16px}
-.login-box input:focus{border-color:#58a6ff}
-.login-box button{width:100%;padding:10px;background:#238636;border:none;border-radius:6px;color:#fff;font-size:14px;cursor:pointer;font-weight:600}
-.login-box button:hover{background:#2ea043}
-.login-box .err{color:#f85149;font-size:13px;margin-top:12px}
-.app{display:none}
-.topbar{background:#161b22;border-bottom:1px solid #30363d;padding:12px 20px;display:flex;align-items:center;gap:16px}
-.topbar h1{color:#58a6ff;font-size:18px}
-.topbar .badge{background:#238636;color:#fff;padding:2px 10px;border-radius:10px;font-size:12px}
-.topbar .right{margin-left:auto;display:flex;gap:10px;align-items:center}
-.tabs{display:flex;background:#0d1117;border-bottom:1px solid #30363d;overflow-x:auto}
-.tab{padding:10px 20px;cursor:pointer;color:#8b949e;font-size:13px;font-weight:600;border-bottom:2px solid transparent;white-space:nowrap}
-.tab:hover{color:#e1e4e8}
-.tab.active{color:#58a6ff;border-bottom-color:#58a6ff}
-.content{padding:20px;max-width:1400px}
-.panel{display:none}
-.panel.active{display:block}
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:12px}
-.card h3{color:#e1e4e8;font-size:14px;margin-bottom:8px}
-.card .val{color:#58a6ff;font-size:20px;font-weight:700}
-.card .sub{color:#8b949e;font-size:12px;margin-top:4px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:20px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th{background:#0d1117;color:#8b949e;text-align:left;padding:8px 10px;border-bottom:1px solid #30363d;position:sticky;top:0;z-index:2}
-td{padding:6px 10px;border-bottom:1px solid #21262d;color:#c9d1d9}
-tr:hover{background:#161b22}
-.badge-ok{color:#3fb950;font-weight:600}
-.badge-err{color:#f85149;font-weight:600}
-.badge-warn{color:#d29922;font-weight:600}
-.btn{padding:6px 14px;border-radius:6px;border:1px solid #30363d;background:#21262d;color:#e1e4e8;cursor:pointer;font-size:12px;white-space:nowrap}
-.btn:hover{background:#30363d}
-.btn-primary{background:#238636;border-color:#238636;color:#fff}
-.btn-primary:hover{background:#2ea043}
-.btn-danger{background:#da3633;border-color:#da3633;color:#fff}
-.btn-danger:hover{background:#f85149}
-.btn-warn{background:#9e6a03;border-color:#9e6a03;color:#fff}
-.btn-sm{padding:4px 10px;font-size:11px}
-.btn-xs{padding:2px 8px;font-size:10px}
-input[type="text"],input[type="search"],select{padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e1e4e8;font-size:13px;outline:none}
-input:focus,select:focus{border-color:#58a6ff}
-.toolbar{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center}
-.toolbar input{flex:1;min-width:180px}
-.logbox{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px;font-family:monospace;font-size:12px;max-height:500px;overflow-y:auto;color:#8b949e;line-height:1.6}
-.logbox div{padding:1px 0}
-.empty{text-align:center;color:#8b949e;padding:40px;font-size:14px}
-.modal-bg{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:none;align-items:center;justify-content:center;z-index:100}
-.modal-bg.show{display:flex}
-.modal{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;width:480px;max-width:90vw;max-height:80vh;overflow-y:auto}
-.modal h3{color:#e1e4e8;margin-bottom:16px}
-.modal input,.modal textarea,.modal select{width:100%;padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e1e4e8;font-size:13px;outline:none;margin-bottom:12px}
-.modal textarea{height:80px;resize:vertical;font-family:monospace}
-.modal label{color:#8b949e;font-size:12px;display:block;margin-bottom:4px}
-.modal .btns{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}
-.drag-handle{cursor:grab;color:#484f58;font-size:16px;padding:0 4px;user-select:none}
-.drag-handle:active{cursor:grabbing;color:#58a6ff}
-tr.dragging{opacity:0.4;background:#1f6feb!important}
-tr.drag-over{border-top:2px solid #58a6ff}
-.grp-item{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px;margin-bottom:8px;display:flex;align-items:center;gap:12px}
-.grp-item .grp-name{flex:1;font-weight:600;color:#e1e4e8}
-.grp-item .grp-count{color:#8b949e;font-size:12px}
-.grp-item.dragging{opacity:0.4;border-color:#58a6ff}
-.grp-item.drag-over{border-top:2px solid #58a6ff}
-.hidden-ch{opacity:0.5;text-decoration:line-through}
-select option{background:#0d1117;color:#e1e4e8}
-.ch-logo{width:28px;height:28px;border-radius:4px;object-fit:contain;background:#21262d}
-.auto-save-badge{display:inline-block;background:#238636;color:#fff;font-size:10px;padding:1px 6px;border-radius:8px;margin-left:8px}
-.toast{position:fixed;bottom:20px;right:20px;background:#238636;color:#fff;padding:10px 20px;border-radius:8px;font-size:13px;z-index:200;opacity:0;transition:opacity 0.3s}
-.toast.show{opacity:1}
-.toast.err{background:#da3633}
-input[type="checkbox"]{width:16px;height:16px;cursor:pointer;accent-color:#58a6ff}
-.bulk-bar{background:#1c2128;border:1px solid #58a6ff;border-radius:8px;padding:10px 16px;margin-bottom:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.bulk-bar span{color:#58a6ff;font-weight:600}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f1117; color: #e0e0e0; min-height: 100vh; }
+
+/* NAVBAR */
+.navbar { background: linear-gradient(135deg, #1a1d2e 0%, #252840 100%); padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #2a2d45; position: sticky; top: 0; z-index: 100; }
+.navbar h1 { font-size: 20px; font-weight: 700; color: #8b5cf6; }
+.navbar .nav-links { display: flex; gap: 8px; }
+.nav-btn { padding: 8px 16px; border-radius: 8px; border: 1px solid #2a2d45; background: transparent; color: #a0a0b0; cursor: pointer; font-size: 13px; font-weight: 500; transition: all 0.2s; }
+.nav-btn:hover, .nav-btn.active { background: #8b5cf6; color: white; border-color: #8b5cf6; }
+
+/* LOGIN */
+.login-wrap { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+.login-box { background: #1a1d2e; padding: 40px; border-radius: 16px; border: 1px solid #2a2d45; width: 360px; text-align: center; }
+.login-box h2 { color: #8b5cf6; margin-bottom: 24px; font-size: 24px; }
+.login-box input { width: 100%; padding: 12px 16px; border-radius: 8px; border: 1px solid #2a2d45; background: #0f1117; color: #e0e0e0; font-size: 14px; margin-bottom: 16px; }
+.login-box button { width: 100%; padding: 12px; border-radius: 8px; border: none; background: #8b5cf6; color: white; font-size: 14px; font-weight: 600; cursor: pointer; }
+.login-box button:hover { background: #7c3aed; }
+.login-error { color: #ef4444; font-size: 13px; margin-top: 12px; }
+
+/* TABS */
+.tab-content { display: none; padding: 24px; max-width: 1400px; margin: 0 auto; }
+.tab-content.active { display: block; }
+
+/* CARDS */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+.card { background: #1a1d2e; border: 1px solid #2a2d45; border-radius: 12px; padding: 20px; }
+.card-label { font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+.card-value { font-size: 28px; font-weight: 700; }
+.card-value.green { color: #10b981; }
+.card-value.red { color: #ef4444; }
+.card-value.yellow { color: #f59e0b; }
+.card-value.blue { color: #3b82f6; }
+.card-value.purple { color: #8b5cf6; }
+
+/* STATUS BAR */
+.status-bar { background: #1a1d2e; border: 1px solid #2a2d45; border-radius: 12px; padding: 16px 20px; margin-bottom: 24px; display: flex; align-items: center; gap: 12px; }
+.status-dot { width: 12px; height: 12px; border-radius: 50%; }
+.status-dot.ok { background: #10b981; box-shadow: 0 0 8px #10b981; }
+.status-dot.loading { background: #f59e0b; animation: pulse 1.5s infinite; }
+.status-dot.error { background: #ef4444; box-shadow: 0 0 8px #ef4444; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+/* LOG BOX */
+.log-box { background: #0f1117; border: 1px solid #2a2d45; border-radius: 12px; padding: 16px; max-height: 350px; overflow-y: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.8; }
+.log-box .log-line { color: #9ca3af; }
+.log-box .log-line.ok { color: #10b981; }
+.log-box .log-line.err { color: #ef4444; }
+.log-box .log-line.warn { color: #f59e0b; }
+
+/* TABLE */
+.table-wrap { background: #1a1d2e; border: 1px solid #2a2d45; border-radius: 12px; overflow: hidden; }
+.table-toolbar { padding: 16px 20px; display: flex; gap: 12px; align-items: center; border-bottom: 1px solid #2a2d45; flex-wrap: wrap; }
+.table-toolbar input, .table-toolbar select { padding: 8px 12px; border-radius: 8px; border: 1px solid #2a2d45; background: #0f1117; color: #e0e0e0; font-size: 13px; }
+.table-toolbar input { flex: 1; min-width: 200px; }
+.ch-table { width: 100%; border-collapse: collapse; }
+.ch-table th { background: #252840; padding: 12px 16px; text-align: left; font-size: 12px; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.5px; position: sticky; top: 0; }
+.ch-table td { padding: 10px 16px; border-bottom: 1px solid #1e2133; font-size: 13px; }
+.ch-table tr:hover td { background: #252840; }
+.ch-table .badge { display: inline-block; padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; }
+.badge.hls { background: #10b98120; color: #10b981; }
+.badge.auth { background: #3b82f620; color: #3b82f6; }
+.badge.direct { background: #f59e0b20; color: #f59e0b; }
+.badge.none { background: #ef444420; color: #ef4444; }
+.btn-sm { padding: 5px 10px; border-radius: 6px; border: 1px solid #2a2d45; background: transparent; color: #a0a0b0; cursor: pointer; font-size: 12px; transition: all 0.2s; }
+.btn-sm:hover { background: #8b5cf6; color: white; border-color: #8b5cf6; }
+.btn-sm.test-ok { background: #10b98120; color: #10b981; border-color: #10b981; }
+.btn-sm.test-fail { background: #ef444420; color: #ef4444; border-color: #ef4444; }
+.logo-img { width: 32px; height: 32px; border-radius: 6px; object-fit: contain; background: #0f1117; }
+
+/* GROUPS */
+.groups-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+.group-card { background: #1a1d2e; border: 1px solid #2a2d45; border-radius: 10px; padding: 16px; display: flex; justify-content: space-between; align-items: center; }
+.group-name { font-weight: 600; font-size: 14px; }
+.group-count { font-size: 24px; font-weight: 700; color: #8b5cf6; }
+
+/* TEST MODAL */
+.modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 200; align-items: center; justify-content: center; }
+.modal-overlay.show { display: flex; }
+.modal { background: #1a1d2e; border: 1px solid #2a2d45; border-radius: 16px; padding: 24px; width: 600px; max-width: 90vw; max-height: 80vh; overflow-y: auto; }
+.modal h3 { color: #8b5cf6; margin-bottom: 16px; }
+.modal pre { background: #0f1117; padding: 12px; border-radius: 8px; font-size: 12px; overflow-x: auto; color: #9ca3af; word-break: break-all; }
+.modal .close-btn { float: right; background: none; border: none; color: #6b7280; font-size: 20px; cursor: pointer; }
+.modal .close-btn:hover { color: white; }
+.modal .test-btn { padding: 8px 20px; border-radius: 8px; border: none; background: #8b5cf6; color: white; cursor: pointer; font-weight: 600; margin-top: 12px; }
+.modal .test-btn:hover { background: #7c3aed; }
+
+/* LINKS */
+.link-section { margin-top: 24px; }
+.link-box { background: #1a1d2e; border: 1px solid #2a2d45; border-radius: 12px; padding: 20px; margin-bottom: 12px; }
+.link-box label { font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; }
+.link-box .link-row { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
+.link-box input { flex: 1; padding: 10px 14px; border-radius: 8px; border: 1px solid #2a2d45; background: #0f1117; color: #e0e0e0; font-size: 13px; font-family: 'JetBrains Mono', monospace; }
+.copy-btn { padding: 10px 16px; border-radius: 8px; border: none; background: #8b5cf6; color: white; cursor: pointer; font-weight: 600; white-space: nowrap; }
+.copy-btn:hover { background: #7c3aed; }
+
+/* SCROLLBAR */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #0f1117; }
+::-webkit-scrollbar-thumb { background: #2a2d45; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #8b5cf6; }
+
+@media (max-width: 768px) {
+  .cards { grid-template-columns: repeat(2, 1fr); }
+  .navbar { flex-direction: column; gap: 12px; }
+  .table-toolbar { flex-direction: column; }
+  .table-toolbar input { min-width: 100%; }
+}
 </style>
 </head>
 <body>
 
-<div class="login-wrap" id="loginWrap">
+<!-- LOGIN -->
+<div id="loginPage" class="login-wrap">
   <div class="login-box">
-    <h1>VxParser</h1>
-    <p>Admin Panel v3.2</p>
-    <input type="password" id="pwdInput" placeholder="Sifre" autocomplete="off">
+    <h2>VxParser</h2>
+    <p style="color:#6b7280; margin-bottom:20px;">Admin Panel</p>
+    <input type="password" id="passInput" placeholder="Sifre" onkeydown="if(event.key==='Enter')doLogin()">
     <button onclick="doLogin()">Giris</button>
-    <div class="err" id="loginErr" style="display:none"></div>
+    <div id="loginErr" class="login-error"></div>
   </div>
 </div>
 
-<div class="app" id="appWrap">
-  <div class="topbar">
-    <h1>VxParser</h1>
-    <span class="badge" id="statusBadge">...</span>
-    <div class="right">
-      <button class="btn" onclick="clearCache()">Cache Temizle</button>
-      <button class="btn" onclick="refreshStatus()">Yenile</button>
-      <button class="btn btn-danger" onclick="doLogout()">Cikis</button>
+<!-- APP -->
+<div id="appPage" style="display:none">
+  <nav class="navbar">
+    <h1>VxParser Admin</h1>
+    <div class="nav-links">
+      <button class="nav-btn active" onclick="switchTab('dashboard')">Dashboard</button>
+      <button class="nav-btn" onclick="switchTab('channels')">Kanallar</button>
+      <button class="nav-btn" onclick="switchTab('groups')">Gruplar</button>
+      <button class="nav-btn" onclick="switchTab('links')">Linkler</button>
+      <button class="nav-btn" onclick="switchTab('logs')">Loglar</button>
+      <button class="nav-btn" onclick="doReload()">Reload</button>
+      <button class="nav-btn" onclick="doCacheClear()" style="border-color:#f59e0b;color:#f59e0b">Cache Temizle</button>
+      <button class="nav-btn" onclick="doLogout()" style="border-color:#ef4444;color:#ef4444">Cikis</button>
+    </div>
+  </nav>
+
+  <!-- DASHBOARD -->
+  <div id="tab-dashboard" class="tab-content active">
+    <div class="status-bar">
+      <div id="statusDot" class="status-dot loading"></div>
+      <span id="statusText">Yukleniyor...</span>
+    </div>
+    <div class="cards">
+      <div class="card"><div class="card-label">Toplam Kanal</div><div class="card-value blue" id="statTotal">-</div></div>
+      <div class="card"><div class="card-label">Kategoriler</div><div class="card-value purple" id="statCats">-</div></div>
+      <div class="card"><div class="card-label">HLS Kanal</div><div class="card-value green" id="statHLS">-</div></div>
+      <div class="card"><div class="card-label">Vavoo Token</div><div class="card-value" id="statVavoo">-</div></div>
+      <div class="card"><div class="card-label">Lokke Token</div><div class="card-value" id="statLokke">-</div></div>
+      <div class="card"><div class="card-label">Resolve Cache</div><div class="card-value yellow" id="statCache">-</div></div>
+      <div class="card"><div class="card-label">Yukleme Suresi</div><div class="card-value" id="statTime">-</div></div>
     </div>
   </div>
-  <div class="tabs">
-    <div class="tab active" onclick="showTab('dashboard')">Dashboard</div>
-    <div class="tab" onclick="showTab('channels')">Kanallar</div>
-    <div class="tab" onclick="showTab('groups')">Gruplar</div>
-    <div class="tab" onclick="showTab('overrides')">Linkler</div>
-    <div class="tab" onclick="showTab('logs')">Loglar</div>
+
+  <!-- CHANNELS -->
+  <div id="tab-channels" class="tab-content">
+    <div class="table-wrap">
+      <div class="table-toolbar">
+        <input type="text" id="chSearch" placeholder="Kanal ara..." oninput="filterChannels()">
+        <select id="chGroup" onchange="filterChannels()"><option value="">Tum Gruplar</option></select>
+        <select id="chType" onchange="filterChannels()">
+          <option value="">Tum Tipler</option>
+          <option value="hls">HLS Var</option>
+          <option value="url">URL Var</option>
+          <option value="nohls">HLS Yok</option>
+        </select>
+        <span id="chCount" style="color:#6b7280;font-size:13px"></span>
+      </div>
+      <div style="max-height:60vh;overflow-y:auto">
+        <table class="ch-table">
+          <thead><tr><th>#</th><th></th><th>Kanal</th><th>Grup</th><th>Tip</th><th>Islem</th></tr></thead>
+          <tbody id="chBody"></tbody>
+        </table>
+      </div>
+    </div>
   </div>
-  <div class="content">
-    <div class="panel active" id="panel-dashboard"></div>
-    <div class="panel" id="panel-channels"></div>
-    <div class="panel" id="panel-groups"></div>
-    <div class="panel" id="panel-overrides"></div>
-    <div class="panel" id="panel-logs"></div>
+
+  <!-- GROUPS -->
+  <div id="tab-groups" class="tab-content">
+    <div class="groups-grid" id="groupsGrid"></div>
+  </div>
+
+  <!-- LINKS -->
+  <div id="tab-links" class="tab-content">
+    <div class="link-section">
+      <div class="link-box">
+        <label>M3U Playlist</label>
+        <div class="link-row">
+          <input type="text" id="linkM3U" readonly>
+          <button class="copy-btn" onclick="copyLink('linkM3U')">Kopyala</button>
+        </div>
+      </div>
+      <div class="link-box">
+        <label>Xtream Codes API</label>
+        <div class="link-row">
+          <input type="text" id="linkXtream" readonly>
+          <button class="copy-btn" onclick="copyLink('linkXtream')">Kopyala</button>
+        </div>
+      </div>
+      <div class="link-box">
+        <label>EPG (XMLTV)</label>
+        <div class="link-row">
+          <input type="text" id="linkEPG" readonly>
+          <button class="copy-btn" onclick="copyLink('linkEPG')">Kopyala</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- LOGS -->
+  <div id="tab-logs" class="tab-content">
+    <div style="margin-bottom:12px;display:flex;gap:8px">
+      <button class="btn-sm" onclick="loadLogs()">Yenile</button>
+      <button class="btn-sm" onclick="clearLogs()">Temizle</button>
+    </div>
+    <div class="log-box" id="logBox"></div>
   </div>
 </div>
 
-<!-- Override Modal -->
-<div class="modal-bg" id="overrideModal">
+<!-- TEST MODAL -->
+<div id="testModal" class="modal-overlay">
   <div class="modal">
-    <h3>Override Ayarla</h3>
-    <label>Kanal ID</label>
-    <input type="text" id="ovChId" readonly>
-    <label>Stream URL</label>
-    <textarea id="ovUrl" placeholder="https://..."></textarea>
-    <div class="btns">
-      <button class="btn" onclick="closeModal('overrideModal')">Iptal</button>
-      <button class="btn btn-primary" onclick="saveOverride()">Kaydet</button>
-    </div>
+    <button class="close-btn" onclick="closeModal()">&times;</button>
+    <h3 id="modalTitle">Kanal Test</h3>
+    <div id="modalBody"></div>
+    <button class="test-btn" id="modalTestBtn" onclick="runResolveTest()">Resolve Test</button>
+    <pre id="modalResult" style="display:none"></pre>
   </div>
 </div>
-
-<!-- Move Group Modal -->
-<div class="modal-bg" id="moveGrpModal">
-  <div class="modal">
-    <h3>Grup Degistir</h3>
-    <label>Kanal</label>
-    <input type="text" id="mgChName" readonly>
-    <label>Yeni Grup</label>
-    <select id="mgGrpSelect"></select>
-    <label>Veya Yeni Grup Adi</label>
-    <input type="text" id="mgNewGrp" placeholder="Yeni grup adi yazin...">
-    <div class="btns">
-      <button class="btn" onclick="closeModal('moveGrpModal')">Iptal</button>
-      <button class="btn btn-primary" onclick="saveMoveGrp()">Tasi</button>
-    </div>
-  </div>
-</div>
-
-<!-- Rename Group Modal -->
-<div class="modal-bg" id="renameGrpModal">
-  <div class="modal">
-    <h3>Grup Yeniden Adlandir</h3>
-    <label>Mevcut Ad</label>
-    <input type="text" id="rgOldName" readonly>
-    <label>Yeni Ad</label>
-    <input type="text" id="rgNewName" placeholder="Yeni grup adi...">
-    <div class="btns">
-      <button class="btn" onclick="closeModal('renameGrpModal')">Iptal</button>
-      <button class="btn btn-primary" onclick="saveRenameGrp()">Kaydet</button>
-    </div>
-  </div>
-</div>
-
-<!-- Bulk Group Assign Modal -->
-<div class="modal-bg" id="bulkGrpModal">
-  <div class="modal">
-    <h3>Secilen Kanallari Gruba Ekle</h3>
-    <label id="bulkGrpInfo"></label>
-    <label>Grup Sec</label>
-    <select id="bulkGrpSelect"></select>
-    <label>Veya Yeni Grup Olustur</label>
-    <input type="text" id="bulkNewGrp" placeholder="Yeni grup adi yazin...">
-    <div class="btns">
-      <button class="btn" onclick="closeModal('bulkGrpModal')">Iptal</button>
-      <button class="btn btn-primary" onclick="saveBulkGrp()">Kaydet</button>
-    </div>
-  </div>
-</div>
-
-<!-- Toast -->
-<div class="toast" id="toast"></div>
 
 <script>
-var TOKEN = localStorage.getItem("vx_token") || "";
-var currentTab = "dashboard";
-var allGroups = [];
-var allChannels = [];
-var selectedIds = {};
-var autoSaveTimer = null;
+let allChannels = [];
+let currentTestLid = null;
+const H = window.location.origin;
 
-function toast(msg, isErr) {
-  var t = document.getElementById("toast");
-  t.textContent = msg;
-  t.className = "toast show" + (isErr ? " err" : "");
-  setTimeout(function() { t.className = "toast"; }, 3000);
-}
-
+// AUTH
 function doLogin() {
-  var pwd = document.getElementById("pwdInput").value;
-  if (!pwd) return;
-  var errEl = document.getElementById("loginErr");
-  errEl.style.display = "none";
-  fetch("/api/admin/login", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({password: pwd})
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    if (d.success) {
-      TOKEN = d.token;
-      localStorage.setItem("vx_token", TOKEN);
-      showApp();
-    } else {
-      errEl.textContent = d.error || "Giris basarisiz";
-      errEl.style.display = "block";
-    }
-  })
-  .catch(function(e) {
-    errEl.textContent = "Baglanti hatasi";
-    errEl.style.display = "block";
+  const p = document.getElementById('passInput').value;
+  fetch('/api/admin/login', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({password:p})})
+  .then(r=>r.json()).then(d=>{
+    if(d.ok){document.getElementById('loginPage').style.display='none';document.getElementById('appPage').style.display='block';loadAll();}
+    else{document.getElementById('loginErr').textContent='Yanlis sifre!';}
+  });
+}
+function doLogout(){document.getElementById('appPage').style.display='none';document.getElementById('loginPage').style.display='flex';document.getElementById('passInput').value='';}
+
+// TABS
+function switchTab(name){
+  document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById('tab-'+name).classList.add('active');
+  event.target.classList.add('active');
+  if(name==='channels') loadChannels();
+  if(name==='groups') loadGroups();
+  if(name==='links') loadLinks();
+  if(name==='logs') loadLogs();
+}
+
+// LOAD ALL
+function loadAll(){
+  fetch('/api/status').then(r=>r.json()).then(d=>{
+    document.getElementById('statTotal').textContent=d.available_channels||0;
+    document.getElementById('statCats').textContent=d.available_categories||0;
+    document.getElementById('statHLS').textContent=d.hls_channels||0;
+    document.getElementById('statVavoo').textContent=d.vavoo_token?'OK':'YOK';
+    document.getElementById('statVavoo').className='card-value '+(d.vavoo_token?'green':'red');
+    document.getElementById('statLokke').textContent=d.lokke_token?'OK':'YOK';
+    document.getElementById('statLokke').className='card-value '+(d.lokke_token?'green':'red');
+    document.getElementById('statCache').textContent=(d.resolve_cache?.active||0)+'/'+(d.resolve_cache?.total_cached||0);
+    document.getElementById('statTime').textContent=(d.load_time||0)+'s';
+    const dot=document.getElementById('statusDot');
+    const txt=document.getElementById('statusText');
+    if(d.data_ready){dot.className='status-dot ok';txt.textContent='Hazir! '+d.available_channels+' kanal yuklu';}
+    else if(d.error){dot.className='status-dot error';txt.textContent='HATA: '+d.error;}
+    else{dot.className='status-dot loading';txt.textContent='Kanallar yukleniyor...';}
   });
 }
 
-function doLogout() {
-  TOKEN = "";
-  localStorage.removeItem("vx_token");
-  document.getElementById("loginWrap").style.display = "flex";
-  document.getElementById("appWrap").style.display = "none";
+// CHANNELS
+function loadChannels(){
+  fetch('/api/admin/channels').then(r=>r.json()).then(d=>{
+    allChannels=d.channels||[];
+    // group filter
+    const sel=document.getElementById('chGroup');
+    const groups=[...new Set(allChannels.map(c=>c.grp).filter(Boolean))].sort();
+    sel.innerHTML='<option value="">Tum Gruplar</option>'+groups.map(g=>'<option>'+g+'</option>').join('');
+    filterChannels();
+  });
+}
+function filterChannels(){
+  const q=document.getElementById('chSearch').value.toLowerCase();
+  const g=document.getElementById('chGroup').value;
+  const t=document.getElementById('chType').value;
+  let list=allChannels;
+  if(q) list=list.filter(c=>c.name.toLowerCase().includes(q));
+  if(g) list=list.filter(c=>c.grp===g);
+  if(t==='hls') list=list.filter(c=>c.has_hls);
+  else if(t==='url') list=list.filter(c=>c.url);
+  else if(t==='nohls') list=list.filter(c=>!c.has_hls);
+  document.getElementById('chCount').textContent=list.length+' kanal';
+  const tb=document.getElementById('chBody');
+  tb.innerHTML=list.slice(0,500).map(c=>{
+    const badge=c.has_hls?'<span class="badge hls">HLS</span>':(c.url?'<span class="badge auth">URL</span>':'<span class="badge none">YOK</span>');
+    const logo=c.logo?'<img class="logo-img" src="'+c.logo+'">':'<div class="logo-img"></div>';
+    return `<tr><td>${c.lid}</td><td>${logo}</td><td>${c.name}</td><td>${c.grp}</td><td>${badge}</td><td><button class="btn-sm" onclick="openTest(${c.lid},this.dataset.n)" data-n="${c.name.replace(/"/g,'&quot;')}">Test</button></td></tr>`;
+  }).join('');
 }
 
-function showApp() {
-  document.getElementById("loginWrap").style.display = "none";
-  document.getElementById("appWrap").style.display = "block";
-  refreshStatus();
-  showTab("dashboard");
-}
-
-function authHeaders() {
-  return {"Authorization": "Bearer " + TOKEN};
-}
-
-function escHtml(s) {
-  if (!s) return "";
-  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
-}
-
-function showTab(name) {
-  currentTab = name;
-  var tabs = document.querySelectorAll(".tab");
-  var panels = document.querySelectorAll(".panel");
-  for (var i = 0; i < tabs.length; i++) tabs[i].classList.remove("active");
-  for (var i = 0; i < panels.length; i++) panels[i].classList.remove("active");
-  var idx = {"dashboard":0,"channels":1,"groups":2,"overrides":3,"logs":4};
-  if (idx[name] !== undefined) {
-    tabs[idx[name]].classList.add("active");
-    panels[idx[name]].classList.add("active");
-  }
-  if (name === "dashboard") loadDashboard();
-  if (name === "channels") loadChannels();
-  if (name === "groups") loadGroups();
-  if (name === "overrides") loadOverrides();
-  if (name === "logs") loadLogs();
-}
-
-function refreshStatus() {
-  fetch("/api/status")
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    var badge = document.getElementById("statusBadge");
-    if (d.data_ready) {
-      badge.textContent = "ONLINE v" + (d.version || "3.2");
-      badge.style.background = "#238636";
-    } else {
-      badge.textContent = "LOADING";
-      badge.style.background = "#d29922";
-    }
+// GROUPS
+function loadGroups(){
+  fetch('/stats').then(r=>r.json()).then(d=>{
+    document.getElementById('groupsGrid').innerHTML=(d.groups||[]).map(g=>
+      '<div class="group-card"><div><div class="group-name">'+g.group+'</div></div><div class="group-count">'+g.count+'</div></div>'
+    ).join('');
   });
 }
 
-function clearCache() {
-  fetch("/api/admin/clear-cache", {method:"POST", headers: authHeaders()})
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    if (d.success) toast("Resolve cache temizlendi!");
+// LINKS
+function loadLinks(){
+  document.getElementById('linkM3U').value=H+'/get.php?username=admin&password=admin&type=m3u_plus';
+  document.getElementById('linkXtream').value=H+'/player_api.php?username=admin&password=admin';
+  document.getElementById('linkEPG').value=H+'/epg.xml';
+}
+function copyLink(id){
+  navigator.clipboard.writeText(document.getElementById(id).value).then(()=>{
+    const b=event.target;b.textContent='Kopyalandi!';setTimeout(()=>b.textContent='Kopyala',1500);
   });
 }
 
-function loadDashboard() {
-  fetch("/api/status")
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    var h = '<div class="grid">';
-    h += '<div class="card"><h3>Toplam Kanal</h3><div class="val">' + (d.total_channels || 0) + '</div></div>';
-    h += '<div class="card"><h3>TR Kanallar</h3><div class="val">' + (d.tr_channels || 0) + '</div></div>';
-    h += '<div class="card"><h3>DE Kanallar</h3><div class="val">' + (d.de_channels || 0) + '</div></div>';
-    h += '<div class="card"><h3>HLS Eslesme</h3><div class="val">' + (d.hls_channels || 0) + '</div></div>';
-    h += '<div class="card"><h3>Logo</h3><div class="val">' + (d.logo_channels || 0) + '</div></div>';
-    h += '<div class="card"><h3>Lokke Sig</h3><div class="val"><span class="' + (d.lokke_sig ? "badge-ok" : "badge-err") + '">' + (d.lokke_sig ? "OK" : "YOK") + '</span></div></div>';
-    h += '<div class="card"><h3>Vavoo Token</h3><div class="val"><span class="' + (d.vavoo_token ? "badge-ok" : "badge-warn") + '">' + (d.vavoo_token ? "OK" : "YOK") + '</span></div>';
-    if (d.vavoo_cooldown) h += '<div class="sub">Cooldown aktif</div>';
-    h += '</div>';
-    h += '<div class="card"><h3>Resolve Cache</h3><div class="val">' + (d.resolve_cache || 0) + '</div></div>';
-    h += '<div class="card"><h3>Gizli Kanal</h3><div class="val">' + (d.hidden_channels || 0) + '</div></div>';
-    h += '</div>';
-    if (d.logs && d.logs.length > 0) {
-      h += '<div class="card"><h3>Son Loglar</h3><div class="logbox" style="max-height:250px">';
-      for (var i = 0; i < d.logs.length; i++) h += '<div>' + escHtml(d.logs[i]) + '</div>';
-      h += '</div></div>';
-    }
-    document.getElementById("panel-dashboard").innerHTML = h;
+// LOGS
+function loadLogs(){
+  fetch('/api/status').then(r=>r.json()).then(d=>{
+    const box=document.getElementById('logBox');
+    box.innerHTML=(d.startup_logs||[]).map(l=>{
+      let cls='log-line';
+      if(l.includes('OK')||l.includes('TAMAM')||l.includes('alindi'))cls+=' ok';
+      else if(l.includes('HATA')||l.includes('BASARISIZ'))cls+=' err';
+      else if(l.includes('cekiliyor')||l.includes('aliniyor'))cls+=' warn';
+      return '<div class="'+cls+'">'+l+'</div>';
+    }).join('');
+  });
+}
+function clearLogs(){document.getElementById('logBox').innerHTML='';}
+
+// RELOAD
+function doReload(){
+  if(!confirm('Kanallari yeniden yuklemek istiyor musun?'))return;
+  fetch('/reload').then(r=>r.json()).then(d=>{
+    alert(d.message||'Reload basladi');
+    setTimeout(loadAll, 5000);
+    setTimeout(loadAll, 15000);
+    setTimeout(loadAll, 30000);
+  });
+}
+function doCacheClear(){
+  fetch('/api/admin/cache/clear',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(d.ok){alert('Resolve cache temizlendi!');loadAll();}
+    else{alert('Hata: '+d.message);}
   });
 }
 
-var chSearch = "";
-var chGroup = "";
-
-function loadChannels() {
-  var q = "/api/admin/channels?search=" + encodeURIComponent(chSearch) + "&grp=" + encodeURIComponent(chGroup);
-  fetch(q, {headers: authHeaders()})
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    allChannels = d.channels || [];
-    var selCount = getSelectedCount();
-    var h = '<div class="toolbar">';
-    h += '<input type="search" placeholder="Kanal ara..." value="' + escHtml(chSearch) + '" onkeyup="chSearch=this.value;loadChannels()">';
-    h += '<select id="chGrpFilter" onchange="chGroup=this.value;loadChannels()"><option value="">Tum Gruplar</option>';
-    for (var g = 0; g < allGroups.length; g++) {
-      var sel = (chGroup === allGroups[g].name) ? ' selected' : '';
-      h += '<option value="' + escHtml(allGroups[g].name) + '"' + sel + '>' + escHtml(allGroups[g].name) + ' (' + allGroups[g].count + ')</option>';
-    }
-    h += '</select>';
-    h += '</div>';
-
-    h += '<div style="color:#8b949e;font-size:12px;margin-bottom:8px">' + allChannels.length + ' kanal <span class="auto-save-badge">AUTO-SAVE</span> Surukleyerek siralayin, otomatik kaydeder</div>';
-
-    if (allChannels.length === 0) {
-      h += '<div class="empty">Kanal bulunamadi</div>';
-    } else {
-      h += '<table id="chTable"><thead><tr>';
-      h += '<th style="width:32px"><input type="checkbox" id="selAll" onchange="toggleSelectAll(this.checked)"></th>';
-      h += '<th style="width:30px"></th>';
-      h += '<th style="width:24px">#</th>';
-      h += '<th>Logo</th>';
-      h += '<th>Isim</th>';
-      h += '<th>Grup</th>';
-      h += '<th>HLS</th>';
-      h += '<th>Islem</th>';
-      h += '</tr></thead><tbody id="chBody">';
-      var max = Math.min(allChannels.length, 800);
-      for (var i = 0; i < max; i++) {
-        var c = allChannels[i];
-        var checked = selectedIds[c.id] ? " checked" : "";
-        var hidden = c._hidden ? ' class="hidden-ch"' : "";
-        h += '<tr draggable="true" data-id="' + c.id + '" data-idx="' + i + '" ondragstart="dragStart(event)" ondragover="dragOver(event)" ondrop="dropCh(event)" ondragend="dragEnd(event)"' + hidden + '>';
-        h += '<td><input type="checkbox" data-chid="' + c.id + '"' + checked + ' onchange="toggleSelect(' + c.id + ',this.checked)"></td>';
-        h += '<td class="drag-handle" title="Surukle">&#9776;</td>';
-        h += '<td style="color:#484f58;font-size:11px">' + (i+1) + '</td>';
-        if (c.logo && c.logo.indexOf("http") === 0) {
-          h += '<td><img class="ch-logo" src="' + escHtml(c.logo) + '" onerror="this.style.display=\'none\'" loading="lazy"></td>';
-        } else {
-          h += '<td><span style="color:#30363d">-</span></td>';
-        }
-        h += '<td>' + escHtml(c.name) + '</td>';
-        h += '<td><span style="color:#8b949e">' + escHtml(c.grp) + '</span></td>';
-        h += '<td>' + (c.hls ? '<span class="badge-ok">HLS</span>' : '<span class="badge-warn">Yok</span>') + '</td>';
-        h += '<td style="white-space:nowrap">';
-        h += '<button class="btn btn-xs" onclick="testCh(' + c.id + ')">Test</button> ';
-        h += '<button class="btn btn-xs" onclick="openOverride(' + c.id + ')">URL</button> ';
-        h += '<button class="btn btn-xs" onclick="openMoveGrp(' + c.id + ',\'' + escHtml(c.name).replace(/'/g,"\\'") + '\',\'' + escHtml(c.grp).replace(/'/g,"\\'") + '\')">Grup</button> ';
-        h += '<button class="btn btn-xs" onclick="hideCh(' + c.id + ')" title="Gizle/Goster">&#128065;</button> ';
-        h += '<button class="btn btn-xs" onclick="moveChUpDown(' + i + ',-1)" title="Yukari">&#9650;</button>';
-        h += '<button class="btn btn-xs" onclick="moveChUpDown(' + i + ',1)" title="Asagi">&#9660;</button>';
-        h += '</td></tr>';
-      }
-      h += '</tbody></table>';
-    }
-
-    // Bulk action bar
-    if (selCount > 0) {
-      h = '<div class="bulk-bar"><span>' + selCount + ' kanal secili</span>';
-      h += '<button class="btn btn-primary btn-sm" onclick="openBulkGrp()">Gruba Ekle</button>';
-      h += '<button class="btn btn-sm" onclick="bulkHide(true)">Gizle</button>';
-      h += '<button class="btn btn-sm" onclick="bulkHide(false)">Goster</button>';
-      h += '<button class="btn btn-sm" onclick="clearSelection()">Secimi Temizle</button>';
-      h += '</div>' + h;
-    }
-
-    document.getElementById("panel-channels").innerHTML = h;
+// TEST MODAL
+function openTest(lid,name){
+  currentTestLid=lid;
+  document.getElementById('modalTitle').textContent='Test: '+name+' (#'+lid+')';
+  document.getElementById('modalBody').innerHTML='<p style="color:#6b7280">Kanal bilgisi yukleniyor...</p>';
+  document.getElementById('modalResult').style.display='none';
+  document.getElementById('modalTestBtn').style.display='inline-block';
+  document.getElementById('testModal').classList.add('show');
+  fetch('/test/'+lid).then(r=>r.json()).then(d=>{
+    if(d.error){document.getElementById('modalBody').innerHTML='<p style="color:#ef4444">'+d.error+'</p>';return;}
+    document.getElementById('modalBody').innerHTML=
+      '<p><b>ID:</b> '+d.lid+'</p>'+
+      '<p><b>URL:</b> '+(d.url?'Var':'YOK')+'</p>'+
+      '<p><b>HLS:</b> '+(d.hls?'Var':'YOK')+'</p>'+
+      '<p><b>Grup:</b> '+d.grp+'</p>';
   });
 }
+function runResolveTest(){
+  const lid=currentTestLid;
+  const btn=document.getElementById('modalTestBtn');
+  btn.textContent='Test ediliyor...';btn.disabled=true;
+  fetch('/api/admin/resolve/'+lid).then(r=>r.json()).then(d=>{
+    btn.textContent='Resolve Test';btn.disabled=false;
+    const pre=document.getElementById('modalResult');
+    pre.style.display='block';
+    pre.textContent=JSON.stringify(d,null,2);
+    if(d.resolved_url){btn.textContent='Basarili!';btn.style.background='#10b981';}
+    else{btn.textContent='Basarisiz';btn.style.background='#ef4444';}
+    setTimeout(()=>{btn.style.background='';},3000);
+  }).catch(()=>{btn.textContent='Hata';btn.disabled=false;});
+}
+function closeModal(){document.getElementById('testModal').classList.remove('show');}
 
-function getSelectedCount() {
-  var count = 0;
-  for (var k in selectedIds) { if (selectedIds[k]) count++; }
-  return count;
-}
-
-function toggleSelectAll(checked) {
-  for (var i = 0; i < allChannels.length; i++) {
-    selectedIds[allChannels[i].id] = checked;
-  }
-  loadChannels();
-}
-
-function toggleSelect(chId, checked) {
-  selectedIds[chId] = checked;
-  // Update bulk bar without full reload for performance
-  var selCount = getSelectedCount();
-  var existing = document.querySelector(".bulk-bar");
-  if (checked && !existing) {
-    loadChannels();
-  } else if (!checked && existing && selCount === 0) {
-    loadChannels();
-  } else if (existing) {
-    existing.querySelector("span").textContent = selCount + " kanal secili";
-  }
-}
-
-function clearSelection() {
-  selectedIds = {};
-  loadChannels();
-}
-
-function hideCh(chId) {
-  fetch("/api/admin/hide-channel", {
-    method: "POST",
-    headers: Object.assign({"Content-Type": "application/json"}, authHeaders()),
-    body: JSON.stringify({channel_id: chId, hidden: true})
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    if (d.success) {
-      toast("Kanal gizlendi");
-      loadChannels();
-    }
-  });
-}
-
-function bulkHide(hidden) {
-  var ids = [];
-  for (var k in selectedIds) { if (selectedIds[k]) ids.push(parseInt(k)); }
-  if (!ids.length) return;
-  var done = 0;
-  for (var i = 0; i < ids.length; i++) {
-    fetch("/api/admin/hide-channel", {
-      method: "POST",
-      headers: Object.assign({"Content-Type": "application/json"}, authHeaders()),
-      body: JSON.stringify({channel_id: ids[i], hidden: hidden})
-    }).then(function(r) { return r.json(); }).then(function(d) {
-      done++;
-      if (done >= ids.length) {
-        toast(ids.length + " kanal " + (hidden ? "gizlendi" : "gosterildi"));
-        clearSelection();
-        loadChannels();
-      }
-    });
-  }
-}
-
-/* Auto-save drag & drop */
-var dragSrcIdx = null;
-function dragStart(e) {
-  var idx = parseInt(e.currentTarget.dataset.idx);
-  dragSrcIdx = idx;
-  e.currentTarget.classList.add("dragging");
-  e.dataTransfer.effectAllowed = "move";
-  e.dataTransfer.setData("text/plain", idx);
-}
-function dragOver(e) {
-  e.preventDefault();
-  e.dataTransfer.dropEffect = "move";
-  var tr = e.currentTarget;
-  if (tr.tagName === "TR") {
-    tr.classList.add("drag-over");
-  }
-}
-function dropCh(e) {
-  e.preventDefault();
-  e.currentTarget.classList.remove("drag-over");
-  var tgtIdx = parseInt(e.currentTarget.dataset.idx);
-  if (dragSrcIdx === null || dragSrcIdx === tgtIdx) return;
-  var item = allChannels.splice(dragSrcIdx, 1)[0];
-  allChannels.splice(tgtIdx, 0, item);
-  loadChannels();
-  // Auto-save with debounce
-  clearTimeout(autoSaveTimer);
-  autoSaveTimer = setTimeout(autoSaveOrder, 1000);
-}
-function dragEnd(e) {
-  e.currentTarget.classList.remove("dragging");
-  var rows = document.querySelectorAll("#chBody tr");
-  for (var i = 0; i < rows.length; i++) rows[i].classList.remove("drag-over");
-  dragSrcIdx = null;
-}
-function moveChUpDown(idx, dir) {
-  var newIdx = idx + dir;
-  if (newIdx < 0 || newIdx >= allChannels.length) return;
-  var tmp = allChannels[idx];
-  allChannels[idx] = allChannels[newIdx];
-  allChannels[newIdx] = tmp;
-  loadChannels();
-  clearTimeout(autoSaveTimer);
-  autoSaveTimer = setTimeout(autoSaveOrder, 1000);
-}
-function autoSaveOrder() {
-  var items = [];
-  for (var i = 0; i < allChannels.length; i++) {
-    items.push({"id": allChannels[i].id, "sort": i});
-  }
-  fetch("/api/admin/reorder", {
-    method: "POST",
-    headers: Object.assign({"Content-Type": "application/json"}, authHeaders()),
-    body: JSON.stringify({type: "channel", items: items})
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    if (d.success) toast("Siralama otomatik kaydedildi! (" + d.count + " kanal)");
-  });
-}
-
-/* Bulk Group Assignment */
-function openBulkGrp() {
-  var ids = [];
-  for (var k in selectedIds) { if (selectedIds[k]) ids.push(parseInt(k)); }
-  if (!ids.length) { toast("Kanal secin!", true); return; }
-  document.getElementById("bulkGrpInfo").textContent = ids.length + " kanal secili";
-  var sel = document.getElementById("bulkGrpSelect");
-  sel.innerHTML = '<option value="">-- Grup Sec --</option>';
-  for (var i = 0; i < allGroups.length; i++) {
-    var opt = document.createElement("option");
-    opt.value = allGroups[i].name;
-    opt.textContent = allGroups[i].name + " (" + allGroups[i].count + ")";
-    sel.appendChild(opt);
-  }
-  document.getElementById("bulkNewGrp").value = "";
-  document.getElementById("bulkGrpModal").classList.add("show");
-}
-function saveBulkGrp() {
-  var selVal = document.getElementById("bulkGrpSelect").value;
-  var newVal = document.getElementById("bulkNewGrp").value.trim();
-  var targetGrp = newVal || selVal;
-  if (!targetGrp) { toast("Grup secin veya yeni ad yazin", true); return; }
-  var ids = [];
-  for (var k in selectedIds) { if (selectedIds[k]) ids.push(parseInt(k)); }
-
-  var endpoint = newVal ? "/api/admin/create-group" : "/api/admin/bulk-move-group";
-  var body = newVal ? {name: newVal, channel_ids: ids} : {channel_ids: ids, group: selVal};
-
-  fetch(endpoint, {
-    method: "POST",
-    headers: Object.assign({"Content-Type": "application/json"}, authHeaders()),
-    body: JSON.stringify(body)
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    if (d.success) {
-      closeModal("bulkGrpModal");
-      toast(d.count + " kanal '" + targetGrp + "' grubuna eklendi");
-      selectedIds = {};
-      loadGroups();
-      loadChannels();
-    }
-  });
-}
-
-function testCh(id) {
-  fetch("/test/" + id)
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    var msg = d.name + "\n" + (d.resolve_method || "-") + "\n" + (d.success ? "BASARILI" : "BASARISIZ");
-    if (d.resolved_url) msg += "\n" + d.resolved_url;
-    alert(msg);
-  });
-}
-
-/* Groups */
-function loadGroups() {
-  fetch("/api/admin/groups", {headers: authHeaders()})
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    allGroups = d.groups || [];
-    var h = '<div class="toolbar">';
-    h += '<button class="btn btn-primary" onclick="saveGrpOrder()">Grup Siralamayi Kaydet</button>';
-    h += '<div style="flex:1"></div>';
-    h += '<span style="color:#8b949e;font-size:12px">Toplam: ' + allGroups.length + ' grup</span>';
-    h += '</div>';
-    h += '<div id="grpList">';
-    for (var i = 0; i < allGroups.length; i++) {
-      var g = allGroups[i];
-      h += '<div class="grp-item" draggable="true" data-name="' + escHtml(g.name) + '" ondragstart="grpDragStart(event)" ondragover="grpDragOver(event)" ondrop="grpDrop(event)" ondragend="grpDragEnd(event)">';
-      h += '<span class="drag-handle">&#9776;</span>';
-      h += '<span class="grp-name">' + escHtml(g.name) + '</span>';
-      h += '<span class="grp-count">' + g.count + ' kanal</span>';
-      h += '<button class="btn btn-xs" onclick="chGroup=\'' + escHtml(g.name).replace(/'/g,"\\'") + '\';showTab(\'channels\')">Kanallar</button>';
-      h += '<button class="btn btn-xs" onclick="openRenameGrp(\'' + escHtml(g.name).replace(/'/g,"\\'") + '\')">Yeniden Adlandir</button>';
-      h += '</div>';
-    }
-    h += '</div>';
-    document.getElementById("panel-groups").innerHTML = h;
-  });
-}
-
-var grpDragSrc = null;
-function grpDragStart(e) {
-  grpDragSrc = e.currentTarget.dataset.name;
-  e.currentTarget.classList.add("dragging");
-  e.dataTransfer.effectAllowed = "move";
-}
-function grpDragOver(e) {
-  e.preventDefault();
-  e.dataTransfer.dropEffect = "move";
-  e.currentTarget.classList.add("drag-over");
-}
-function grpDrop(e) {
-  e.preventDefault();
-  e.currentTarget.classList.remove("drag-over");
-  var targetName = e.currentTarget.dataset.name;
-  if (grpDragSrc === targetName) return;
-  var srcIdx = -1, tgtIdx = -1;
-  for (var i = 0; i < allGroups.length; i++) {
-    if (allGroups[i].name === grpDragSrc) srcIdx = i;
-    if (allGroups[i].name === targetName) tgtIdx = i;
-  }
-  if (srcIdx < 0 || tgtIdx < 0) return;
-  var item = allGroups.splice(srcIdx, 1)[0];
-  allGroups.splice(tgtIdx, 0, item);
-  loadGroups();
-}
-function grpDragEnd(e) {
-  e.currentTarget.classList.remove("dragging");
-  var items = document.querySelectorAll(".grp-item");
-  for (var i = 0; i < items.length; i++) items[i].classList.remove("drag-over");
-}
-function saveGrpOrder() {
-  var items = [];
-  for (var i = 0; i < allGroups.length; i++) {
-    items.push({"id": allGroups[i].name, "sort": i});
-  }
-  fetch("/api/admin/reorder", {
-    method: "POST",
-    headers: Object.assign({"Content-Type": "application/json"}, authHeaders()),
-    body: JSON.stringify({type: "group", items: items})
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    if (d.success) toast("Grup siralamasi kaydedildi! (" + d.count + " grup)");
-  });
-}
-
-function openRenameGrp(oldName) {
-  document.getElementById("rgOldName").value = oldName;
-  document.getElementById("rgNewName").value = "";
-  document.getElementById("renameGrpModal").classList.add("show");
-}
-function saveRenameGrp() {
-  var oldName = document.getElementById("rgOldName").value;
-  var newName = document.getElementById("rgNewName").value.trim();
-  if (!newName) { toast("Yeni ad bos olamaz", true); return; }
-  fetch("/api/admin/rename-group", {
-    method: "POST",
-    headers: Object.assign({"Content-Type": "application/json"}, authHeaders()),
-    body: JSON.stringify({old_name: oldName, new_name: newName})
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    if (d.success) {
-      closeModal("renameGrpModal");
-      toast("Grup yeniden adlandirildi (" + d.affected + " kanal)");
-      loadGroups();
-      loadChannels();
-    }
-  });
-}
-
-/* Move to Group */
-var moveGrpChId = 0;
-function openMoveGrp(chId, chName, curGrp) {
-  moveGrpChId = chId;
-  document.getElementById("mgChName").value = chName + " (su an: " + curGrp + ")";
-  document.getElementById("mgNewGrp").value = "";
-  var sel = document.getElementById("mgGrpSelect");
-  sel.innerHTML = '<option value="">-- Grup Sec --</option>';
-  for (var i = 0; i < allGroups.length; i++) {
-    var opt = document.createElement("option");
-    opt.value = allGroups[i].name;
-    opt.textContent = allGroups[i].name;
-    if (allGroups[i].name === curGrp) opt.selected = true;
-    sel.appendChild(opt);
-  }
-  document.getElementById("moveGrpModal").classList.add("show");
-}
-function saveMoveGrp() {
-  var selVal = document.getElementById("mgGrpSelect").value;
-  var newVal = document.getElementById("mgNewGrp").value.trim();
-  var targetGrp = newVal || selVal;
-  if (!targetGrp) { toast("Grup secin veya yeni ad yazin", true); return; }
-  fetch("/api/admin/move-group", {
-    method: "POST",
-    headers: Object.assign({"Content-Type": "application/json"}, authHeaders()),
-    body: JSON.stringify({channel_id: moveGrpChId, group: targetGrp})
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    if (d.success) {
-      closeModal("moveGrpModal");
-      toast("Kanal grup degistirildi");
-      loadChannels();
-      loadGroups();
-    }
-  });
-}
-
-function loadOverrides() {
-  fetch("/api/admin/overrides", {headers: authHeaders()})
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    var ovs = d.overrides || [];
-    var h = '<div style="margin-bottom:12px;color:#8b949e;font-size:13px">Manuel stream URL override\'lari</div>';
-    if (ovs.length === 0) {
-      h += '<div class="empty">Hic override yok</div>';
-    } else {
-      h += '<table><tr><th>ID</th><th>Kanal</th><th>URL</th><th>Durum</th></tr>';
-      for (var i = 0; i < ovs.length; i++) {
-        var o = ovs[i];
-        h += '<tr><td>' + o.ch_id + '</td><td>' + escHtml(o.ch_name || "") + '</td>';
-        h += '<td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escHtml(o.url || "") + '</td>';
-        h += '<td>' + (o.enabled ? '<span class="badge-ok">Aktif</span>' : '<span class="badge-err">Pasif</span>') + '</td></tr>';
-      }
-      h += '</table>';
-    }
-    document.getElementById("panel-overrides").innerHTML = h;
-  });
-}
-
-function loadLogs() {
-  fetch("/api/logs")
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    var logs = d.logs || [];
-    var h = '<div class="logbox">';
-    for (var i = 0; i < logs.length; i++) h += '<div>' + escHtml(logs[i]) + '</div>';
-    h += '</div>';
-    document.getElementById("panel-logs").innerHTML = h;
-  });
-}
-
-function openOverride(chId) {
-  document.getElementById("ovChId").value = chId;
-  document.getElementById("ovUrl").value = "";
-  document.getElementById("overrideModal").classList.add("show");
-}
-function closeModal(id) {
-  document.getElementById(id).classList.remove("show");
-}
-function saveOverride() {
-  var chId = parseInt(document.getElementById("ovChId").value);
-  var url = document.getElementById("ovUrl").value.trim();
-  if (!url) { toast("URL bos olamaz", true); return; }
-  fetch("/api/admin/override", {
-    method: "POST",
-    headers: Object.assign({"Content-Type": "application/json"}, authHeaders()),
-    body: JSON.stringify({channel_id: chId, url: url, enabled: true})
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    if (d.success) {
-      closeModal("overrideModal");
-      toast("Override kaydedildi");
-      if (currentTab === "overrides") loadOverrides();
-    }
-  });
-}
-
-// Init
-document.getElementById("pwdInput").addEventListener("keydown", function(e) {
-  if (e.key === "Enter") doLogin();
-});
-
-if (TOKEN) {
-  fetch("/api/admin/groups", {headers: authHeaders()})
-  .then(function(r) {
-    if (r.status === 401) {
-      TOKEN = "";
-      localStorage.removeItem("vx_token");
-    } else {
-      return r.json().then(function(d) {
-        allGroups = d.groups || [];
-        showApp();
-      });
-    }
-  });
-}
+// AUTO REFRESH
+setInterval(loadAll, 30000);
 </script>
 </body>
-</html>'''
+</html>"""
+
 
 @app.get("/admin")
-async def admin_panel():
-    return HTMLResponse(ADMIN_HTML)
+async def admin_page():
+    return Response(content=ADMIN_HTML, media_type="text/html")
+
+
+@app.post("/api/admin/login")
+async def admin_login(request: Request):
+    body = await request.json()
+    if body.get("password") == ADMIN_PASSWORD:
+        return {"ok": True}
+    return {"ok": False, "error": "Wrong password"}
+
+
+@app.get("/api/admin/channels")
+async def admin_channels():
+    conn = get_db()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(
+        "SELECT c.lid, c.name, c.url, c.hls, c.logo, "
+        "COALESCE(cat.name, 'Sonstige') as grp "
+        "FROM channels c LEFT JOIN categories cat ON c.cid = cat.cid "
+        "ORDER BY COALESCE(cat.sort_order, 9999), c.name"
+    )
+    channels = []
+    for r in c.fetchall():
+        channels.append({
+            "lid": r["lid"],
+            "name": r["name"],
+            "grp": r["grp"],
+            "logo": r["logo"] or "",
+            "url": r["url"] or "",
+            "has_hls": bool(r["hls"]),
+        })
+    conn.close()
+    return {"channels": channels, "total": len(channels)}
+
+
+@app.get("/api/admin/resolve/{sid}")
+async def admin_resolve(sid: str):
+    url, method = state.resolve_channel(sid)
+    return {
+        "channel_id": sid,
+        "resolve_method": method,
+        "resolved_url": url,
+        "success": bool(url),
+        "resolve_cache": state.get_resolve_cache_info(),
+    }
+
+
+@app.post("/api/admin/cache/clear")
+async def admin_cache_clear():
+    """Resolve cache'i temizle - CDN URL'leri yeniden cozulur."""
+    state.clear_resolve_cache()
+    return {"ok": True, "message": "Resolve cache temizlendi"}
+
+
+# ============================================================
+# STATS
+# ============================================================
+
+@app.get("/stats")
+async def stats():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM channels")
+    total = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM categories")
+    cats = c.fetchone()[0]
+    c.execute(
+        "SELECT COALESCE(cat.name, 'Eslesmeyen') as g, COUNT(*) as cnt "
+        "FROM channels c LEFT JOIN categories cat ON c.cid = cat.cid "
+        "GROUP BY c.cid ORDER BY MIN(cat.sort_order)"
+    )
+    groups = [{"group": r[0], "count": r[1]} for r in c.fetchall()]
+    c.execute("SELECT COUNT(*) FROM channels WHERE hls != '' AND hls IS NOT NULL")
+    hls_count = c.fetchone()[0]
+    conn.close()
+
+    return {
+        "total_channels": total,
+        "total_categories": cats,
+        "hls_channels": hls_count,
+        "vavoo_token": bool(state._vavoo_sig),
+        "lokke_token": bool(state._watched_sig),
+        "error": state.STARTUP_ERROR,
+        "groups": groups,
+        "data_ready": state.DATA_READY,
+    }
