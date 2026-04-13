@@ -476,6 +476,90 @@ async def admin_get_overrides(request: Request):
     overrides = state.get_all_overrides()
     return JSONResponse({"overrides": overrides})
 
+@app.post("/api/admin/reorder")
+async def admin_reorder(request: Request):
+    """Save custom channel/group order. Body: {type:'channel'|'group', items:[{id,sort_order}]}"""
+    if not check_admin(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    body = await request.json()
+    rtype = body.get("type", "")
+    items = body.get("items", [])
+    if not items:
+        return JSONResponse({"error": "items required"}, status_code=400)
+    import sqlite3
+    conn = sqlite3.connect(state.DB_PATH)
+    c = conn.cursor()
+    # Create sort_order table if not exists
+    c.execute("CREATE TABLE IF NOT EXISTS sort_order (key TEXT PRIMARY KEY, value TEXT)")
+    c.execute("INSERT OR REPLACE INTO sort_order (key, value) VALUES (?, ?)",
+        (rtype, json.dumps(items)))
+    conn.commit()
+    conn.close()
+    add_log(f"Admin: {len(items)} {rtype} siralama kaydedildi")
+    return JSONResponse({"success": True, "count": len(items)})
+
+@app.post("/api/admin/move-group")
+async def admin_move_group(request: Request):
+    """Move channel to a different group"""
+    if not check_admin(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    body = await request.json()
+    ch_id = body.get("channel_id")
+    new_grp = body.get("group", "")
+    if not ch_id or not new_grp:
+        return JSONResponse({"error": "channel_id and group required"}, status_code=400)
+    import sqlite3
+    conn = sqlite3.connect(state.DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE channels SET grp = ? WHERE id = ?", (new_grp, ch_id))
+    conn.commit()
+    conn.close()
+    add_log(f"Admin: Kanal {ch_id} -> '{new_grp}' grubuna tasindi")
+    return JSONResponse({"success": True})
+
+@app.post("/api/admin/rename-group")
+async def admin_rename_group(request: Request):
+    """Rename a group (batch update all channels in it)"""
+    if not check_admin(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    body = await request.json()
+    old_name = body.get("old_name", "")
+    new_name = body.get("new_name", "")
+    if not old_name or not new_name:
+        return JSONResponse({"error": "old_name and new_name required"}, status_code=400)
+    import sqlite3
+    conn = sqlite3.connect(state.DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE channels SET grp = ? WHERE grp = ?", (new_name, old_name))
+    affected = c.rowcount
+    conn.commit()
+    conn.close()
+    add_log(f"Admin: '{old_name}' -> '{new_name}' ({affected} kanal)")
+    return JSONResponse({"success": True, "affected": affected})
+
+@app.post("/api/admin/hide-channel")
+async def admin_hide_channel(request: Request):
+    """Hide or unhide a channel from M3U"""
+    if not check_admin(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    body = await request.json()
+    ch_id = body.get("channel_id")
+    hidden = body.get("hidden", True)
+    if not ch_id:
+        return JSONResponse({"error": "channel_id required"}, status_code=400)
+    import sqlite3
+    conn = sqlite3.connect(state.DB_PATH)
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS hidden_channels (ch_id INTEGER PRIMARY KEY)")
+    if hidden:
+        c.execute("INSERT OR IGNORE INTO hidden_channels (ch_id) VALUES (?)", (ch_id,))
+    else:
+        c.execute("DELETE FROM hidden_channels WHERE ch_id = ?", (ch_id,))
+    conn.commit()
+    conn.close()
+    add_log(f"Admin: Kanal {ch_id} {'gizlendi' if hidden else 'gosterildi'}")
+    return JSONResponse({"success": True})
+
 # ===== ADMIN PANEL HTML =====
 
 ADMIN_HTML = r'''<!DOCTYPE html>
@@ -495,7 +579,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#0f1117;color:#e1
 .login-box input:focus{border-color:#58a6ff}
 .login-box button{width:100%;padding:10px;background:#238636;border:none;border-radius:6px;color:#fff;font-size:14px;cursor:pointer;font-weight:600}
 .login-box button:hover{background:#2ea043}
-.login-box .err{color:#f85149;font-size:13px;margin-top:12px;display:none}
+.login-box .err{color:#f85149;font-size:13px;margin-top:12px}
 .app{display:none}
 .topbar{background:#161b22;border-bottom:1px solid #30363d;padding:12px 20px;display:flex;align-items:center;gap:16px}
 .topbar h1{color:#58a6ff;font-size:18px}
@@ -514,7 +598,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#0f1117;color:#e1
 .card .sub{color:#8b949e;font-size:12px;margin-top:4px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:20px}
 table{width:100%;border-collapse:collapse;font-size:13px}
-th{background:#0d1117;color:#8b949e;text-align:left;padding:8px 12px;border-bottom:1px solid #30363d;position:sticky;top:0}
+th{background:#0d1117;color:#8b949e;text-align:left;padding:8px 12px;border-bottom:1px solid #30363d;position:sticky;top:0;z-index:2}
 td{padding:8px 12px;border-bottom:1px solid #21262d;color:#c9d1d9}
 tr:hover{background:#161b22}
 .badge-ok{color:#3fb950;font-weight:600}
@@ -526,6 +610,7 @@ tr:hover{background:#161b22}
 .btn-primary:hover{background:#2ea043}
 .btn-danger{background:#da3633;border-color:#da3633;color:#fff}
 .btn-sm{padding:4px 10px;font-size:11px}
+.btn-xs{padding:2px 8px;font-size:10px}
 input[type="text"],input[type="search"],select{padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e1e4e8;font-size:13px;outline:none}
 input:focus,select:focus{border-color:#58a6ff}
 .toolbar{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap;align-items:center}
@@ -535,11 +620,24 @@ input:focus,select:focus{border-color:#58a6ff}
 .empty{text-align:center;color:#8b949e;padding:40px;font-size:14px}
 .modal-bg{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:none;align-items:center;justify-content:center;z-index:100}
 .modal-bg.show{display:flex}
-.modal{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;width:400px;max-width:90vw}
+.modal{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;width:440px;max-width:90vw}
 .modal h3{color:#e1e4e8;margin-bottom:16px}
-.modal input,.modal textarea{width:100%;padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e1e4e8;font-size:13px;outline:none;margin-bottom:12px}
+.modal input,.modal textarea,.modal select{width:100%;padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e1e4e8;font-size:13px;outline:none;margin-bottom:12px}
 .modal textarea{height:80px;resize:vertical;font-family:monospace}
-.modal .btns{display:flex;gap:8px;justify-content:flex-end}
+.modal label{color:#8b949e;font-size:12px;display:block;margin-bottom:4px}
+.modal .btns{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}
+/* Drag and drop */
+.drag-handle{cursor:grab;color:#484f58;font-size:16px;padding:0 4px;user-select:none}
+.drag-handle:active{cursor:grabbing;color:#58a6ff}
+tr.dragging{opacity:0.4;background:#1f6feb}
+tr.drag-over{border-top:2px solid #58a6ff}
+.grp-item{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px;margin-bottom:8px;display:flex;align-items:center;gap:12px}
+.grp-item .grp-name{flex:1;font-weight:600;color:#e1e4e8}
+.grp-item .grp-count{color:#8b949e;font-size:12px}
+.grp-item.dragging{opacity:0.4;border-color:#58a6ff}
+.grp-item.drag-over{border-top:2px solid #58a6ff}
+.hidden-ch{opacity:0.5;text-decoration:line-through}
+select option{background:#0d1117;color:#e1e4e8}
 </style>
 </head>
 <body>
@@ -550,7 +648,7 @@ input:focus,select:focus{border-color:#58a6ff}
     <p>Admin Panel</p>
     <input type="password" id="pwdInput" placeholder="Sifre" autocomplete="off">
     <button onclick="doLogin()">Giris</button>
-    <div class="err" id="loginErr"></div>
+    <div class="err" id="loginErr" style="display:none"></div>
   </div>
 </div>
 
@@ -582,13 +680,43 @@ input:focus,select:focus{border-color:#58a6ff}
 <div class="modal-bg" id="overrideModal">
   <div class="modal">
     <h3>Override Ayarla</h3>
-    <label style="color:#8b949e;font-size:12px">Kanal ID</label>
+    <label>Kanal ID</label>
     <input type="text" id="ovChId" readonly>
-    <label style="color:#8b949e;font-size:12px">Stream URL</label>
+    <label>Stream URL</label>
     <textarea id="ovUrl" placeholder="https://..."></textarea>
     <div class="btns">
-      <button class="btn" onclick="closeModal()">Iptal</button>
+      <button class="btn" onclick="closeModal('overrideModal')">Iptal</button>
       <button class="btn btn-primary" onclick="saveOverride()">Kaydet</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="moveGrpModal">
+  <div class="modal">
+    <h3>Grup Degistir</h3>
+    <label>Kanal</label>
+    <input type="text" id="mgChName" readonly>
+    <label>Yeni Grup</label>
+    <select id="mgGrpSelect"></select>
+    <label>Veya Yeni Grup Adi</label>
+    <input type="text" id="mgNewGrp" placeholder="Yeni grup adi yazin...">
+    <div class="btns">
+      <button class="btn" onclick="closeModal('moveGrpModal')">Iptal</button>
+      <button class="btn btn-primary" onclick="saveMoveGrp()">Tasi</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="renameGrpModal">
+  <div class="modal">
+    <h3>Grup Yeniden Adlandir</h3>
+    <label>Mevcut Ad</label>
+    <input type="text" id="rgOldName" readonly>
+    <label>Yeni Ad</label>
+    <input type="text" id="rgNewName" placeholder="Yeni grup adi...">
+    <div class="btns">
+      <button class="btn" onclick="closeModal('renameGrpModal')">Iptal</button>
+      <button class="btn btn-primary" onclick="saveRenameGrp()">Kaydet</button>
     </div>
   </div>
 </div>
@@ -596,6 +724,9 @@ input:focus,select:focus{border-color:#58a6ff}
 <script>
 var TOKEN = localStorage.getItem("vx_token") || "";
 var currentTab = "dashboard";
+var allGroups = [];
+var allChannels = [];
+var grpOrder = [];
 
 function doLogin() {
   var pwd = document.getElementById("pwdInput").value;
@@ -642,16 +773,17 @@ function authHeaders() {
   return {"Authorization": "Bearer " + TOKEN};
 }
 
+function escHtml(s) {
+  if (!s) return "";
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+}
+
 function showTab(name) {
   currentTab = name;
   var tabs = document.querySelectorAll(".tab");
   var panels = document.querySelectorAll(".panel");
-  for (var i = 0; i < tabs.length; i++) {
-    tabs[i].classList.remove("active");
-  }
-  for (var i = 0; i < panels.length; i++) {
-    panels[i].classList.remove("active");
-  }
+  for (var i = 0; i < tabs.length; i++) tabs[i].classList.remove("active");
+  for (var i = 0; i < panels.length; i++) panels[i].classList.remove("active");
   var idx = {"dashboard":0,"channels":1,"groups":2,"overrides":3,"logs":4};
   if (idx[name] !== undefined) {
     tabs[idx[name]].classList.add("active");
@@ -679,11 +811,6 @@ function refreshStatus() {
   });
 }
 
-function escHtml(s) {
-  if (!s) return "";
-  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
-}
-
 function loadDashboard() {
   fetch("/api/status")
   .then(function(r) { return r.json(); })
@@ -696,15 +823,11 @@ function loadDashboard() {
     h += '<div class="card"><h3>Vavoo Token</h3><div class="val"><span class="' + (d.vavoo_token ? "badge-ok" : "badge-warn") + '">' + (d.vavoo_token ? "OK" : "YOK") + '</span></div>';
     if (d.vavoo_cooldown) h += '<div class="sub">Cooldown aktif</div>';
     h += '</div>';
-    h += '<div class="card"><h3>live2 Domain</h3><div class="val" style="font-size:14px">' + escHtml(d.live2_domain || "-") + '</div></div>';
     h += '<div class="card"><h3>Resolve Cache</h3><div class="val">' + (d.resolve_cache || 0) + '</div></div>';
     h += '</div>';
-
     if (d.logs && d.logs.length > 0) {
       h += '<div class="card"><h3>Son Loglar</h3><div class="logbox" style="max-height:250px">';
-      for (var i = 0; i < d.logs.length; i++) {
-        h += '<div>' + escHtml(d.logs[i]) + '</div>';
-      }
+      for (var i = 0; i < d.logs.length; i++) h += '<div>' + escHtml(d.logs[i]) + '</div>';
       h += '</div></div>';
     }
     document.getElementById("panel-dashboard").innerHTML = h;
@@ -713,41 +836,109 @@ function loadDashboard() {
 
 var chSearch = "";
 var chGroup = "";
-var chPage = 0;
-var chTotal = 0;
 
 function loadChannels() {
   var q = "/api/admin/channels?search=" + encodeURIComponent(chSearch) + "&grp=" + encodeURIComponent(chGroup);
   fetch(q, {headers: authHeaders()})
   .then(function(r) { return r.json(); })
   .then(function(d) {
-    chTotal = d.total || 0;
-    var chs = d.channels || [];
+    allChannels = d.channels || [];
     var h = '<div class="toolbar">';
-    h += '<input type="search" placeholder="Kanal ara..." value="' + escHtml(chSearch) + '" onkeyup="chSearch=this.value;chPage=0;loadChannels()">';
-    h += '<button class="btn" onclick="showTab(\'groups\')">Gruplar</button>';
+    h += '<input type="search" placeholder="Kanal ara..." value="' + escHtml(chSearch) + '" onkeyup="chSearch=this.value;loadChannels()">';
+    h += '<select id="chGrpFilter" onchange="chGroup=this.value;loadChannels()"><option value="">Tum Gruplar</option>';
+    for (var g = 0; g < allGroups.length; g++) {
+      var sel = (chGroup === allGroups[g].name) ? ' selected' : '';
+      h += '<option value="' + escHtml(allGroups[g].name) + '"' + sel + '>' + escHtml(allGroups[g].name) + ' (' + allGroups[g].count + ')</option>';
+    }
+    h += '</select>';
+    h += '<button class="btn" onclick="saveChannelOrder()" title="Siralama kaydet">Siralayi Kaydet</button>';
     h += '</div>';
-    h += '<div style="color:#8b949e;font-size:12px;margin-bottom:12px">' + chTotal + ' kanal</div>';
-    if (chs.length === 0) {
+    h += '<div style="color:#8b949e;font-size:12px;margin-bottom:12px">' + allChannels.length + ' kanal | Surukleyerek siralayin</div>';
+    if (allChannels.length === 0) {
       h += '<div class="empty">Kanal bulunamadi</div>';
     } else {
-      h += '<table><tr><th>ID</th><th>Isim</th><th>Grup</th><th>URL</th><th>HLS</th><th>Islem</th></tr>';
-      var max = Math.min(chs.length, 200);
+      h += '<table id="chTable"><thead><tr><th style="width:30px"></th><th style="width:30px">#</th><th>ID</th><th>Isim</th><th>Grup</th><th>URL</th><th>HLS</th><th>Islem</th></tr></thead><tbody id="chBody">';
+      var max = Math.min(allChannels.length, 500);
       for (var i = 0; i < max; i++) {
-        var c = chs[i];
-        h += '<tr>';
+        var c = allChannels[i];
+        h += '<tr draggable="true" data-id="' + c.id + '" ondragstart="dragStart(event)" ondragover="dragOver(event)" ondrop="dropCh(event)" ondragend="dragEnd(event)">';
+        h += '<td class="drag-handle" title="Surukle">&#9776;</td>';
+        h += '<td style="color:#484f58;font-size:11px">' + (i+1) + '</td>';
         h += '<td>' + c.id + '</td>';
         h += '<td>' + escHtml(c.name) + '</td>';
         h += '<td><span style="color:#8b949e">' + escHtml(c.grp) + '</span></td>';
-        h += '<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + (c.url ? '<span class="badge-ok">Var</span>' : '<span class="badge-err">Yok</span>') + '</td>';
+        h += '<td>' + (c.url ? '<span class="badge-ok">Var</span>' : '<span class="badge-err">Yok</span>') + '</td>';
         h += '<td>' + (c.hls ? '<span class="badge-ok">HLS</span>' : '<span class="badge-warn">Yok</span>') + '</td>';
-        h += '<td><button class="btn btn-sm" onclick="testCh(' + c.id + ')">Test</button>';
-        h += ' <button class="btn btn-sm" onclick="openOverride(' + c.id + ',\'' + escHtml(c.name).replace(/'/g, "\\'") + '\')">Override</button></td>';
-        h += '</tr>';
+        h += '<td style="white-space:nowrap">';
+        h += '<button class="btn btn-xs" onclick="testCh(' + c.id + ')" title="Test">Test</button> ';
+        h += '<button class="btn btn-xs" onclick="openOverride(' + c.id + ')" title="Override">URL</button> ';
+        h += '<button class="btn btn-xs" onclick="openMoveGrp(' + c.id + ',\'' + escHtml(c.name).replace(/'/g, "\\'") + '\',\'' + escHtml(c.grp).replace(/'/g, "\\'") + '\')" title="Grup degistir">Grup</button> ';
+        h += '<button class="btn btn-xs" onclick="moveChUpDown(' + i + ',-1)" title="Yukari">&#9650;</button>';
+        h += '<button class="btn btn-xs" onclick="moveChUpDown(' + i + ',1)" title="Asagi">&#9660;</button>';
+        h += '</td></tr>';
       }
-      h += '</table>';
+      h += '</tbody></table>';
     }
     document.getElementById("panel-channels").innerHTML = h;
+  });
+}
+
+/* Drag & Drop */
+var dragSrcId = null;
+function dragStart(e) {
+  dragSrcId = parseInt(e.currentTarget.dataset.id);
+  e.currentTarget.classList.add("dragging");
+  e.dataTransfer.effectAllowed = "move";
+}
+function dragOver(e) {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "move";
+  var tr = e.currentTarget;
+  if (tr.tagName === "TR") {
+    tr.classList.add("drag-over");
+  }
+}
+function dropCh(e) {
+  e.preventDefault();
+  e.currentTarget.classList.remove("drag-over");
+  var targetId = parseInt(e.currentTarget.dataset.id);
+  if (dragSrcId === targetId) return;
+  var srcIdx = -1, tgtIdx = -1;
+  for (var i = 0; i < allChannels.length; i++) {
+    if (allChannels[i].id === dragSrcId) srcIdx = i;
+    if (allChannels[i].id === targetId) tgtIdx = i;
+  }
+  if (srcIdx < 0 || tgtIdx < 0) return;
+  var item = allChannels.splice(srcIdx, 1)[0];
+  allChannels.splice(tgtIdx, 0, item);
+  loadChannels();
+}
+function dragEnd(e) {
+  e.currentTarget.classList.remove("dragging");
+  var rows = document.querySelectorAll("#chBody tr");
+  for (var i = 0; i < rows.length; i++) rows[i].classList.remove("drag-over");
+}
+function moveChUpDown(idx, dir) {
+  var newIdx = idx + dir;
+  if (newIdx < 0 || newIdx >= allChannels.length) return;
+  var tmp = allChannels[idx];
+  allChannels[idx] = allChannels[newIdx];
+  allChannels[newIdx] = tmp;
+  loadChannels();
+}
+function saveChannelOrder() {
+  var items = [];
+  for (var i = 0; i < allChannels.length; i++) {
+    items.push({"id": allChannels[i].id, "sort": i});
+  }
+  fetch("/api/admin/reorder", {
+    method: "POST",
+    headers: Object.assign({"Content-Type": "application/json"}, authHeaders()),
+    body: JSON.stringify({type: "channel", items: items})
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (d.success) alert("Siralama kaydedildi! (" + d.count + " kanal)");
   });
 }
 
@@ -755,25 +946,142 @@ function testCh(id) {
   fetch("/test/" + id)
   .then(function(r) { return r.json(); })
   .then(function(d) {
-    var msg = d.name + " | " + (d.resolve_method || "-") + " | " + (d.success ? "BASARILI" : "BASARISIZ");
+    var msg = d.name + "\n" + (d.resolve_method || "-") + "\n" + (d.success ? "BASARILI" : "BASARISIZ");
     if (d.resolved_url) msg += "\n" + d.resolved_url;
     alert(msg);
   });
 }
 
+/* Groups */
 function loadGroups() {
   fetch("/api/admin/groups", {headers: authHeaders()})
   .then(function(r) { return r.json(); })
   .then(function(d) {
-    var gs = d.groups || [];
-    var h = '<table><tr><th>Grup</th><th>Kanal Sayisi</th><th>Islem</th></tr>';
-    for (var i = 0; i < gs.length; i++) {
-      var g = gs[i];
-      h += '<tr><td>' + escHtml(g.name) + '</td><td>' + g.count + '</td>';
-      h += '<td><button class="btn btn-sm" onclick="chGroup=\'' + escHtml(g.name).replace(/'/g, "\\'") + '\';showTab(\'channels\')">Filtrele</button></td></tr>';
+    allGroups = d.groups || [];
+    var h = '<div style="margin-bottom:16px;color:#8b949e;font-size:13px">Gruplari surukleyerek siralayin. Siralama kaydedildiginde M3U liste sirasi degisir.</div>';
+    h += '<div class="toolbar">';
+    h += '<button class="btn btn-primary" onclick="saveGrpOrder()">Grup Siralamayi Kaydet</button>';
+    h += '</div>';
+    h += '<div id="grpList">';
+    for (var i = 0; i < allGroups.length; i++) {
+      var g = allGroups[i];
+      h += '<div class="grp-item" draggable="true" data-name="' + escHtml(g.name) + '" ondragstart="grpDragStart(event)" ondragover="grpDragOver(event)" ondrop="grpDrop(event)" ondragend="grpDragEnd(event)">';
+      h += '<span class="drag-handle">&#9776;</span>';
+      h += '<span class="grp-name">' + escHtml(g.name) + '</span>';
+      h += '<span class="grp-count">' + g.count + ' kanal</span>';
+      h += '<button class="btn btn-xs" onclick="chGroup=\'' + escHtml(g.name).replace(/'/g, "\\'") + '\';showTab(\'channels\')">Kanallar</button>';
+      h += '<button class="btn btn-xs" onclick="openRenameGrp(\'' + escHtml(g.name).replace(/'/g, "\\'") + '\')">Yeniden Adlandir</button>';
+      h += '</div>';
     }
-    h += '</table>';
+    h += '</div>';
     document.getElementById("panel-groups").innerHTML = h;
+  });
+}
+
+var grpDragSrc = null;
+function grpDragStart(e) {
+  grpDragSrc = e.currentTarget.dataset.name;
+  e.currentTarget.classList.add("dragging");
+  e.dataTransfer.effectAllowed = "move";
+}
+function grpDragOver(e) {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "move";
+  e.currentTarget.classList.add("drag-over");
+}
+function grpDrop(e) {
+  e.preventDefault();
+  e.currentTarget.classList.remove("drag-over");
+  var targetName = e.currentTarget.dataset.name;
+  if (grpDragSrc === targetName) return;
+  var srcIdx = -1, tgtIdx = -1;
+  for (var i = 0; i < allGroups.length; i++) {
+    if (allGroups[i].name === grpDragSrc) srcIdx = i;
+    if (allGroups[i].name === targetName) tgtIdx = i;
+  }
+  if (srcIdx < 0 || tgtIdx < 0) return;
+  var item = allGroups.splice(srcIdx, 1)[0];
+  allGroups.splice(tgtIdx, 0, item);
+  loadGroups();
+}
+function grpDragEnd(e) {
+  e.currentTarget.classList.remove("dragging");
+  var items = document.querySelectorAll(".grp-item");
+  for (var i = 0; i < items.length; i++) items[i].classList.remove("drag-over");
+}
+function saveGrpOrder() {
+  var items = [];
+  for (var i = 0; i < allGroups.length; i++) {
+    items.push({"id": allGroups[i].name, "sort": i});
+  }
+  fetch("/api/admin/reorder", {
+    method: "POST",
+    headers: Object.assign({"Content-Type": "application/json"}, authHeaders()),
+    body: JSON.stringify({type: "group", items: items})
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (d.success) alert("Grup siralamasi kaydedildi! (" + d.count + " grup)");
+  });
+}
+
+function openRenameGrp(oldName) {
+  document.getElementById("rgOldName").value = oldName;
+  document.getElementById("rgNewName").value = "";
+  document.getElementById("renameGrpModal").classList.add("show");
+}
+function saveRenameGrp() {
+  var oldName = document.getElementById("rgOldName").value;
+  var newName = document.getElementById("rgNewName").value.trim();
+  if (!newName) { alert("Yeni ad bos olamaz"); return; }
+  fetch("/api/admin/rename-group", {
+    method: "POST",
+    headers: Object.assign({"Content-Type": "application/json"}, authHeaders()),
+    body: JSON.stringify({old_name: oldName, new_name: newName})
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (d.success) {
+      closeModal("renameGrpModal");
+      loadGroups();
+      loadChannels();
+    }
+  });
+}
+
+/* Move to Group */
+var moveGrpChId = 0;
+function openMoveGrp(chId, chName, curGrp) {
+  moveGrpChId = chId;
+  document.getElementById("mgChName").value = chName + " (su an: " + curGrp + ")";
+  document.getElementById("mgNewGrp").value = "";
+  var sel = document.getElementById("mgGrpSelect");
+  sel.innerHTML = '<option value="">-- Grup Sec --</option>';
+  for (var i = 0; i < allGroups.length; i++) {
+    var opt = document.createElement("option");
+    opt.value = allGroups[i].name;
+    opt.textContent = allGroups[i].name;
+    if (allGroups[i].name === curGrp) opt.selected = true;
+    sel.appendChild(opt);
+  }
+  document.getElementById("moveGrpModal").classList.add("show");
+}
+function saveMoveGrp() {
+  var selVal = document.getElementById("mgGrpSelect").value;
+  var newVal = document.getElementById("mgNewGrp").value.trim();
+  var targetGrp = newVal || selVal;
+  if (!targetGrp) { alert("Grup secin veya yeni ad yazin"); return; }
+  fetch("/api/admin/move-group", {
+    method: "POST",
+    headers: Object.assign({"Content-Type": "application/json"}, authHeaders()),
+    body: JSON.stringify({channel_id: moveGrpChId, group: targetGrp})
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (d.success) {
+      closeModal("moveGrpModal");
+      loadChannels();
+    }
   });
 }
 
@@ -805,24 +1113,20 @@ function loadLogs() {
   .then(function(d) {
     var logs = d.logs || [];
     var h = '<div class="logbox">';
-    for (var i = 0; i < logs.length; i++) {
-      h += '<div>' + escHtml(logs[i]) + '</div>';
-    }
+    for (var i = 0; i < logs.length; i++) h += '<div>' + escHtml(logs[i]) + '</div>';
     h += '</div>';
     document.getElementById("panel-logs").innerHTML = h;
   });
 }
 
-function openOverride(chId, chName) {
+function openOverride(chId) {
   document.getElementById("ovChId").value = chId;
   document.getElementById("ovUrl").value = "";
   document.getElementById("overrideModal").classList.add("show");
 }
-
-function closeModal() {
-  document.getElementById("overrideModal").classList.remove("show");
+function closeModal(id) {
+  document.getElementById(id).classList.remove("show");
 }
-
 function saveOverride() {
   var chId = parseInt(document.getElementById("ovChId").value);
   var url = document.getElementById("ovUrl").value.trim();
@@ -835,7 +1139,7 @@ function saveOverride() {
   .then(function(r) { return r.json(); })
   .then(function(d) {
     if (d.success) {
-      closeModal();
+      closeModal("overrideModal");
       if (currentTab === "channels") loadChannels();
       if (currentTab === "overrides") loadOverrides();
     }
@@ -847,13 +1151,16 @@ document.getElementById("pwdInput").addEventListener("keydown", function(e) {
 });
 
 if (TOKEN) {
-  fetch("/api/admin/channels", {headers: authHeaders()})
+  fetch("/api/admin/groups", {headers: authHeaders()})
   .then(function(r) {
     if (r.status === 401) {
       TOKEN = "";
       localStorage.removeItem("vx_token");
     } else {
-      showApp();
+      return r.json().then(function(d) {
+        allGroups = d.groups || [];
+        showApp();
+      });
     }
   });
 }
