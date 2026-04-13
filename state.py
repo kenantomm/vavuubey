@@ -14,6 +14,42 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ============================================================
+# CONFIG - Tum URL'ler ve ayarlar
+# ============================================================
+CONFIG = {
+    # addonSig (MediaHubMX imzasi) almak icin ping endpointleri
+    "PING_URLS": [
+        "https://www.lokke.app/api/app/ping",
+        "https://www.vavoo.tv/api/app/ping",
+    ],
+    # API cagrilari icin base URL'ler (fallback sirasiyla)
+    "BASE_URLS": [
+        "https://vavoo.to",
+        "https://kool.to",
+        "https://oha.to",
+    ],
+    # vavoo_auth token almak icin ping2 endpointleri
+    "PING2_URLS": [
+        "https://www.vavoo.to/api/box/ping2",
+        "https://www.vavoo.tv/api/box/ping2",
+        "https://kool.to/api/box/ping2",
+        "https://oha.to/api/box/ping2",
+    ],
+    # live2 kanal listesi icin URL'ler
+    "LIVE2_URLS": [
+        "https://www.vavoo.to/live2/index?output=json",
+        "https://kool.to/live2/index?output=json",
+        "https://oha.to/live2/index?output=json",
+    ],
+    # Cache suresi (sn)
+    "SIG_CACHE_TTL": 8 * 60,        # 8 dakika
+    "RESOLVE_TIMEOUT": 15,          # 15 saniye
+    "CDN_USER_AGENT": "VAVOO/2.6",
+    "API_USER_AGENT": "MediaHubMX/2",
+    "APP_VERSION": "3.1.8",
+}
+
+# ============================================================
 # PAYLASILAN STATE
 # ============================================================
 DATA_READY = False
@@ -40,27 +76,74 @@ def slog(msg):
 
 
 # ============================================================
-# 1. VAVOO TOKEN (ping2)
+# YARDIMCI: URL dene (fallback)
+# ============================================================
+def _try_urls(url_list, method="GET", headers=None, json_data=None, form_data=None, timeout=15, key_to_check=None):
+    """
+    Birden fazla URL'yi sirayla dener. Ilk basarili sonucu dondurur.
+    Returns: (response_json_or_text, success, tried_url)
+    """
+    for url in url_list:
+        try:
+            if method == "GET":
+                r = requests.get(url, headers=headers, timeout=timeout, verify=False)
+            elif method == "POST_JSON":
+                r = requests.post(url, json=json_data, headers=headers, timeout=timeout, verify=False)
+            elif method == "POST_FORM":
+                r = requests.post(url, data=form_data, headers=headers, timeout=timeout, verify=False)
+            else:
+                continue
+
+            if r.status_code == 200:
+                try:
+                    data = r.json()
+                    if key_to_check:
+                        if data.get(key_to_check):
+                            return data, True, url
+                        else:
+                            slog(f"  {url} -> 200 ama '{key_to_check}' yok, keys={list(data.keys())[:5]}")
+                    else:
+                        return data, True, url
+                except:
+                    return r.text, True, url
+            else:
+                slog(f"  {url} -> status={r.status_code}")
+        except Exception as e:
+            slog(f"  {url} -> HATA: {str(e)[:80]}")
+    return None, False, ""
+
+
+# ============================================================
+# 1. VAVOO TOKEN (ping2) - vavoo_auth icin
 # ============================================================
 def get_auth_signature():
     global _vavoo_sig, _vavoo_sig_time
-    if _vavoo_sig and (time.time() - _vavoo_sig_time) < 1800:
+    if _vavoo_sig and (time.time() - _vavoo_sig_time) < CONFIG["SIG_CACHE_TTL"]:
         return _vavoo_sig
 
     slog("Vavoo Token (ping2) aliniyor...")
-    headers = {"User-Agent": "VAVOO/2.6", "Accept": "application/json"}
+    headers = {"User-Agent": CONFIG["CDN_USER_AGENT"], "Accept": "application/json"}
     try:
         vec_req = requests.get("http://mastaaa1987.github.io/repo/veclist.json", headers=headers, timeout=10, verify=False)
         veclist = vec_req.json()["value"]
         slog(f"veclist: {len(veclist)} vec")
 
         sig = None
-        for i in range(5):
-            vec = {"vec": random.choice(veclist)}
-            req = requests.post("https://www.vavoo.tv/api/box/ping2", data=vec, headers=headers, timeout=10, verify=False).json()
-            if req.get("signed"):
-                sig = req["signed"]
+        # Tum ping2 URL'lerini dene
+        for ping_url in CONFIG["PING2_URLS"]:
+            if sig:
                 break
+            slog(f"  Deneniyor: {ping_url}")
+            for i in range(3):
+                vec = {"vec": random.choice(veclist)}
+                try:
+                    req = requests.post(ping_url, data=vec, headers=headers, timeout=10, verify=False).json()
+                    if req.get("signed"):
+                        sig = req["signed"]
+                        slog(f"  Token alindi: {ping_url}")
+                        break
+                except Exception as e:
+                    continue
 
         if sig:
             _vavoo_sig = sig
@@ -68,21 +151,21 @@ def get_auth_signature():
             slog("Vavoo Token alindi!")
             return sig
         else:
-            slog("Vavoo Token ALINAMADI (5 deneme)")
+            slog("Vavoo Token ALINAMADI (tum URL'ler denendi)")
     except Exception as e:
         slog(f"Vavoo Token HATASI: {e}")
     return None
 
 
 # ============================================================
-# 2. LOKKE IMZA (app/ping)
+# 2. ADDONSIG (app/ping) - MediaHubMX imzasi icin
 # ============================================================
 def get_watchedsig():
     global _watched_sig, _watched_sig_time
-    if _watched_sig and (time.time() - _watched_sig_time) < 1800:
+    if _watched_sig and (time.time() - _watched_sig_time) < CONFIG["SIG_CACHE_TTL"]:
         return _watched_sig
 
-    slog("Lokke Imza (app/ping) aliniyor...")
+    slog("addonSig (app/ping) aliniyor...")
     headers = {"user-agent": "okhttp/4.11.0", "accept": "application/json", "content-type": "application/json; charset=utf-8"}
     data = {
         "token": "", "reason": "boot", "locale": "de", "theme": "dark",
@@ -101,50 +184,75 @@ def get_watchedsig():
         "proxy": {"supported": ["ss"], "engine": "cu", "enabled": False, "autoServer": True, "id": 0},
         "iap": {"supported": False},
     }
-    try:
-        resp = requests.post("https://www.lokke.app/api/app/ping", json=data, headers=headers, timeout=15, verify=False)
-        result = resp.json()
-        sig = result.get("addonSig")
-        if sig:
-            _watched_sig = sig
-            _watched_sig_time = time.time()
-            slog("Lokke Imzasi alindi!")
-            return sig
-        else:
-            slog(f"Lokke cevap: {list(result.keys())}")
-    except Exception as e:
-        slog(f"Lokke HATASI: {e}")
+
+    # Tum PING_URL'leri dene
+    for ping_url in CONFIG["PING_URLS"]:
+        try:
+            slog(f"  Deneniyor: {ping_url}")
+            resp = requests.post(ping_url, json=data, headers=headers, timeout=15, verify=False)
+            result = resp.json()
+            sig = result.get("addonSig")
+            if sig:
+                _watched_sig = sig
+                _watched_sig_time = time.time()
+                slog(f"  addonSig alindi: {ping_url}")
+                return sig
+            else:
+                slog(f"  {ping_url} -> addonSig yok, keys={list(result.keys())[:5]}")
+        except Exception as e:
+            slog(f"  {ping_url} -> HATA: {str(e)[:80]}")
+
+    slog("addonSig ALINAMADI (tum URL'ler denendi)")
     return None
 
 
 # ============================================================
-# 3. HLS RESOLVE (mediahubmx)
+# 3. HLS RESOLVE (mediahubmx) - Tum BASE_URL fallback
 # ============================================================
 def resolve_hls_link(link):
     sig = get_watchedsig()
     if not sig:
         return None
-    headers = {"user-agent": "MediaHubMX/2", "accept": "application/json", "content-type": "application/json; charset=utf-8", "mediahubmx-signature": sig}
-    data = {"language": "de", "region": "AT", "url": link, "clientVersion": "3.0.2"}
-    try:
-        r = requests.post("https://www.vavoo.to/mediahubmx-resolve.json", json=data, headers=headers, timeout=15, verify=False)
-        result = r.json()
-        if result and len(result) > 0:
-            return result[0].get("url")
-    except Exception as e:
-        print(f"Resolve hatasi: {e}")
+
+    headers = {
+        "user-agent": CONFIG["API_USER_AGENT"],
+        "accept": "application/json",
+        "content-type": "application/json; charset=utf-8",
+        "mediahubmx-signature": sig,
+    }
+    data = {
+        "language": "de", "region": "AT",
+        "url": link,
+        "clientVersion": CONFIG["APP_VERSION"],
+    }
+
+    # Tum BASE_URL'leri dene
+    for base in CONFIG["BASE_URLS"]:
+        try:
+            url = f"{base}/mediahubmx-resolve.json"
+            r = requests.post(url, json=data, headers=headers, timeout=CONFIG["RESOLVE_TIMEOUT"], verify=False)
+            result = r.json()
+            if result and isinstance(result, list) and len(result) > 0:
+                resolved = result[0].get("url")
+                if resolved:
+                    slog(f"  Resolve OK: {base}")
+                    return resolved
+        except Exception as e:
+            continue
+
     return None
 
 
 # ============================================================
-# 4. CHANNEL RESOLVE (3 yontem) - video.py'den cagrilir
+# 4. CHANNEL RESOLVE (4 yontem) - video.py'den cagrilir
 # ============================================================
 def resolve_channel(lid):
     """
     Kanal ID'sine gore stream URL'ini coz.
-    Y1: HLS + Lokke (en stabil)
-    Y2: URL + vavoo_auth token
-    Y3: Direkt URL (son care)
+    Y1:   HLS field + Lokke resolve (catalog'tan gelen)
+    Y1.5: URL field + Lokke resolve (catalog bos olsa bile)
+    Y2:   URL + vavoo_auth token
+    Y3:   Direkt URL (son care)
     """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -159,13 +267,20 @@ def resolve_channel(lid):
     url = ch["url"]
     hls = ch["hls"]
 
-    # Y1: HLS + Lokke
+    # Y1: HLS field + Lokke (catalog'tan gelen)
     if hls:
         resolved = resolve_hls_link(hls)
         if resolved:
             return resolved, f"Y1-HLS: {name}"
 
-    # Y2: Standart Token
+    # Y1.5: URL field + Lokke resolve
+    # Catalog bos olsa bile, live2 URL'sini resolve et
+    if url:
+        resolved = resolve_hls_link(url)
+        if resolved:
+            return resolved, f"Y1.5-URL-Resolve: {name}"
+
+    # Y2: Standart vavoo_auth Token
     if url:
         sig = get_auth_signature()
         if sig:
@@ -181,21 +296,52 @@ def resolve_channel(lid):
 
 
 # ============================================================
-# 5. EPG DATA (XMLTV)
+# 5. CATALOG FETCH (server.py'den cagrilir) - Tum BASE_URL fallback
+# ============================================================
+def fetch_catalog(sig, group_name):
+    """
+    MediaHubMX catalog'tan HLS linklerini cek.
+    Tum BASE_URL'leri fallback olarak dener.
+    """
+    headers = {
+        "user-agent": CONFIG["API_USER_AGENT"],
+        "accept": "application/json",
+        "mediahubmx-signature": sig,
+    }
+    data = {
+        "language": "de", "region": "AT",
+        "catalogId": "iptv", "id": "iptv",
+        "adult": False, "sort": "name",
+        "clientVersion": CONFIG["APP_VERSION"],
+        "filter": {"group": group_name},
+    }
+
+    for base in CONFIG["BASE_URLS"]:
+        try:
+            url = f"{base}/mediahubmx-catalog.json"
+            slog(f"  Catalog deneniyor: {url}")
+            resp = requests.post(url, json=data, headers=headers, timeout=20, verify=False)
+            catalog_data = resp.json()
+            items = catalog_data.get("items", [])
+            if items:
+                slog(f"  Catalog OK: {base} ({len(items)} kayit)")
+                return items
+            else:
+                slog(f"  Catalog bos: {base} status={resp.status_code} keys={list(catalog_data.keys())[:5]}")
+        except Exception as e:
+            slog(f"  Catalog HATA: {base} -> {str(e)[:80]}")
+
+    return []
+
+
+# ============================================================
+# 6. EPG DATA (XMLTV)
 # ============================================================
 def get_epg_data():
-    """
-    Vavoo EPG'den kanal program verisini cek ve XMLTV dondur.
-    """
     import sqlite3
     from datetime import datetime, timedelta
     import xml.etree.ElementTree as ET
 
-    sig = get_auth_signature()
-    if not sig:
-        return None
-
-    headers = {"User-Agent": "VAVOO/2.6", "Accept": "application/json"}
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
@@ -206,22 +352,19 @@ def get_epg_data():
 
         tv = ET.Element("tv")
         tv.set("generator-info-name", "VxParser")
-        tv.set("source-info-url", "https://www.vavoo.to")
+        tv.set("source-info-url", CONFIG["BASE_URLS"][0])
 
         now = datetime.utcnow()
-        today_str = now.strftime("%Y-%m-%d")
 
         for ch in channels:
             lid = ch["lid"]
             name = ch["name"]
 
-            # channel element
             ch_el = ET.SubElement(tv, "channel")
             ch_el.set("id", str(lid))
             display = ET.SubElement(ch_el, "display-name")
             display.text = name
 
-            # programme element (1 gun)
             prog = ET.SubElement(tv, "programme")
             prog.set("start", now.strftime("%Y%m%d%H%M%S") + " +0000")
             prog.set("stop", (now + timedelta(hours=6)).strftime("%Y%m%d%H%M%S") + " +0000")

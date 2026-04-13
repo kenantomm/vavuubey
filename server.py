@@ -38,33 +38,33 @@ def init_db():
 
 
 # ============================================================
-# VAVOO KANAL CEKME
+# VAVOO KANAL CEKME (live2) - Tum URL'ler fallback
 # ============================================================
 def fetch_vavoo_channels():
     import requests
     state.slog("Vavoo live2 cekiliyor...")
 
-    # Baglanti testi
-    try:
-        state.slog("DNS test: vavoo.to...")
-        test = requests.get("https://www.vavoo.to/", timeout=10, verify=False, headers={"User-Agent": "VAVOO/2.6"})
-        state.slog(f"vavoo.to OK (status={test.status_code})")
-    except Exception as e:
-        state.slog(f"vavoo.to BASARISIZ: {e}")
-        return False
+    headers = {"User-Agent": state.CONFIG["CDN_USER_AGENT"]}
 
-    # Kanal listesi
-    try:
-        resp = requests.get("https://www.vavoo.to/live2/index?output=json", headers={"User-Agent": "VAVOO/2.6"}, timeout=30, verify=False)
-        resp.raise_for_status()
-        channel_list = resp.json()
-        state.slog(f"Kanal listesi: {len(channel_list) if isinstance(channel_list, list) else 'hata'} kayit")
-    except Exception as e:
-        state.slog(f"Kanal cekme HATASI: {e}")
-        return False
+    # Tum live2 URL'lerini dene
+    channel_list = None
+    for live2_url in state.CONFIG["LIVE2_URLS"]:
+        try:
+            state.slog(f"  Deneniyor: {live2_url}")
+            resp = requests.get(live2_url, headers=headers, timeout=30, verify=False)
+            resp.raise_for_status()
+            data = resp.json()
+            if data and isinstance(data, list) and len(data) > 0:
+                channel_list = data
+                state.slog(f"  OK: {live2_url} ({len(data)} kayit)")
+                break
+            else:
+                state.slog(f"  Bos/gecersiz: {live2_url}")
+        except Exception as e:
+            state.slog(f"  HATA: {live2_url} -> {str(e)[:80]}")
 
-    if not channel_list or not isinstance(channel_list, list):
-        state.slog("Gecersiz kanal listesi!")
+    if not channel_list:
+        state.slog("Tum live2 URL'leri BASARISIZ!")
         return False
 
     import sqlite3
@@ -103,24 +103,24 @@ def fetch_vavoo_channels():
     return True
 
 
+# ============================================================
+# HLS LINKLERI CEK (catalog) - Tum BASE_URL fallback
+# ============================================================
 def fetch_hls_links():
-    import requests
     state.slog("HLS linkleri cekiliyor...")
     sig = state.get_watchedsig()
     if not sig:
-        state.slog("Lokke imzasi yok, HLS atlanacak")
+        state.slog("addonSig yok, HLS atlanacak")
         return False
 
-    headers = {"user-agent": "MediaHubMX/2", "accept": "application/json", "mediahubmx-signature": sig}
     updated = 0
+    import sqlite3
 
     for group_name in ["Turkey", "Deutschland"]:
-        try:
-            data = {"language":"de","region":"AT","catalogId":"iptv","id":"iptv","adult":False,"sort":"name","clientVersion":"3.0.2","filter":{"group":group_name}}
-            resp = requests.post("https://www.vavoo.to/mediahubmx-catalog.json", json=data, headers=headers, timeout=20, verify=False)
-            items = resp.json().get("items", [])
-            state.slog(f"{group_name} HLS: {len(items)} kayit")
-            import sqlite3
+        state.slog(f"  {group_name} catalog cekiliyor...")
+        items = state.fetch_catalog(sig, group_name)
+
+        if items:
             conn = sqlite3.connect(state.DB_PATH)
             c = conn.cursor()
             for item in items:
@@ -131,11 +131,12 @@ def fetch_hls_links():
                     updated += 1
             conn.commit()
             conn.close()
-        except Exception as e:
-            state.slog(f"{group_name} HLS HATASI: {e}")
+            state.slog(f"  {group_name}: {len(items)} HLS link guncellendi")
+        else:
+            state.slog(f"  {group_name}: catalog BOS (HLS link alinamadi)")
 
-    state.slog(f"HLS: {updated} link guncellendi")
-    return True
+    state.slog(f"HLS toplam: {updated} link guncellendi")
+    return updated > 0
 
 
 # ============================================================
@@ -184,12 +185,15 @@ def startup_sequence():
     try:
         state.slog("=== VxParser Baslangic ===")
         state.slog(f"PORT={state.PORT} DB={state.DB_PATH}")
+        state.slog(f"BASE_URLS: {state.CONFIG['BASE_URLS']}")
+        state.slog(f"PING_URLS: {state.CONFIG['PING_URLS']}")
+        state.slog(f"APP_VERSION: {state.CONFIG['APP_VERSION']}")
 
-        state.slog("[1/5] Lokke imzasi...")
+        state.slog("[1/5] addonSig (app/ping)...")
         lokke = state.get_watchedsig()
-        state.slog(f"[1/5] Lokke={'OK' if lokke else 'BASARISIZ'}")
+        state.slog(f"[1/5] addonSig={'OK' if lokke else 'BASARISIZ'}")
 
-        state.slog("[2/5] Vavoo token...")
+        state.slog("[2/5] Vavoo token (ping2)...")
         vavoo = state.get_auth_signature()
         state.slog(f"[2/5] Vavoo={'OK' if vavoo else 'BASARISIZ'}")
 
@@ -198,7 +202,7 @@ def startup_sequence():
         ok = fetch_vavoo_channels()
         state.slog(f"[3/5] Kanallar={'OK' if ok else 'BASARISIZ'}")
 
-        state.slog("[4/5] HLS linkleri...")
+        state.slog("[4/5] HLS linkleri (catalog)...")
         fetch_hls_links()
 
         state.slog("[5/5] Grup remap...")
