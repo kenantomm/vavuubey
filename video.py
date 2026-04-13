@@ -1,6 +1,7 @@
 """
-video.py - VxParser Routes
+video.py - VxParser Routes v3.2
 All FastAPI endpoints, HLS proxy, Admin Panel
+Features: checkbox group assignment, auto-save reorder, logos from Vavoo, cache cleanup
 """
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse, HTMLResponse
@@ -14,17 +15,15 @@ import secrets
 app = FastAPI(title="VxParser")
 
 def get_proxy_headers():
-    """Build headers for proxying to Vavoo CDN - include token if available"""
     h = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "*/*",
         "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
         "Accept-Encoding": "identity",
+        "Connection": "keep-alive",
     }
-    # Add Vavoo token as cookie if available
     if state.VAVOO_TOKEN:
         h["Cookie"] = f"token={state.VAVOO_TOKEN}"
-    # Set Referer based on URL domain
     return h
 
 VAVOO_HEADERS = {
@@ -44,9 +43,7 @@ def add_log(msg):
 
 # ===== HLS PROXY =====
 async def proxy_stream(url, ch_id):
-    """Fetch and proxy a stream URL, rewriting HLS segments through self"""
     try:
-        # Build proper headers with Referer matching the URL domain
         headers = get_proxy_headers()
         from urllib.parse import urlparse
         parsed = urlparse(url)
@@ -54,50 +51,33 @@ async def proxy_stream(url, ch_id):
             headers["Referer"] = f"{parsed.scheme}://{parsed.hostname}/"
             headers["Origin"] = f"{parsed.scheme}://{parsed.hostname}"
 
-        add_log(f"[{ch_id}] Proxy fetch: {url[:120]}")
+        add_log(f"[{ch_id}] Proxy: {url[:120]}")
 
-        # First try WITHOUT follow_redirects to see what we get
         async with httpx.AsyncClient(timeout=15, verify=False, follow_redirects=False) as client:
             r = await client.get(url, headers=headers)
-
-            # Log response details
             ct = r.headers.get("content-type", "")
-            add_log(f"[{ch_id}] Upstream: HTTP {r.status_code} | CT: {ct} | Size: {len(r.content)}")
 
-            # Handle redirects manually
             if r.status_code in (301, 302, 303, 307, 308):
                 location = r.headers.get("location", "")
-                add_log(f"[{ch_id}] Redirect -> {location[:150]}")
                 if location:
                     if not location.startswith("http"):
                         base = f"{parsed.scheme}://{parsed.hostname}"
                         location = base + location
-                    # Follow the redirect
                     r2 = await client.get(location, headers=headers)
-                    ct2 = r2.headers.get("content-type", "")
-                    add_log(f"[{ch_id}] Redirect target: HTTP {r2.status_code} | CT: {ct2} | Size: {len(r2.content)}")
                     if r2.status_code == 200:
-                        text = r2.text
-                        final_url = str(r2.url)
-                        return _handle_hls_response(text, final_url, ch_id)
-                    else:
-                        return JSONResponse({"error": f"redirect target HTTP {r2.status_code}", "location": location[:200]}, status_code=502)
+                        return _handle_hls_response(r2.text, str(r2.url), ch_id)
+                    return JSONResponse({"error": f"redirect HTTP {r2.status_code}"}, status_code=502)
                 return JSONResponse({"error": "redirect no location"}, status_code=502)
 
             if r.status_code != 200:
-                add_log(f"[{ch_id}] Upstream error: {r.text[:300]}")
-                return JSONResponse({"error": f"upstream {r.status_code}", "body": r.text[:200]}, status_code=502)
+                return JSONResponse({"error": f"upstream {r.status_code}"}, status_code=502)
 
             text = r.text
-            # Check if response looks like HLS
             if not text.strip().startswith("#"):
-                add_log(f"[{ch_id}] WARNING: Not HLS! First 200: {text[:200]}")
-                # Maybe it's JSON error or HTML
                 if text.strip().startswith("{") or text.strip().startswith("<"):
                     return JSONResponse({"error": "not HLS", "body": text[:500]}, status_code=502)
 
-            final_url = str(r.url)
-            return _handle_hls_response(text, final_url, ch_id)
+            return _handle_hls_response(text, str(r.url), ch_id)
 
     except httpx.TimeoutException:
         add_log(f"[{ch_id}] Proxy TIMEOUT")
@@ -106,15 +86,9 @@ async def proxy_stream(url, ch_id):
         add_log(f"[{ch_id}] Proxy ERROR: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
-
 def _handle_hls_response(text, base_url, ch_id):
-    """Parse HLS playlist and rewrite segment URLs through our proxy"""
     base = base_url.rsplit("/", 1)[0] + "/"
-
-    # Detect if master playlist (has #EXT-X-STREAM-INF) or media playlist
     lines = text.split("\n")
-    is_master = any("#EXT-X-STREAM-INF" in l for l in lines)
-
     rewritten = []
     for line in lines:
         stripped = line.strip()
@@ -123,23 +97,18 @@ def _handle_hls_response(text, base_url, ch_id):
         elif stripped.startswith("http"):
             rewritten.append(f"/channel/{ch_id}/stream?url={stripped}")
         else:
-            # Relative URL
             abs_url = base + stripped if not stripped.startswith("/") else base.split("://", 1)[0] + "://" + base.split("://", 1)[1].split("/")[0] + stripped
             rewritten.append(f"/channel/{ch_id}/stream?url={abs_url}")
-
-    result = "\n".join(rewritten)
-
-    # Log a summary
-    seg_count = sum(1 for l in lines if l.strip() and not l.strip().startswith("#"))
-    add_log(f"[{ch_id}] HLS OK: {len(lines)} lines, {seg_count} segments, master={is_master}")
-
-    return PlainTextResponse(result, media_type="application/vnd.apple.mpegurl")
+    return PlainTextResponse("\n".join(rewritten), media_type="application/vnd.apple.mpegurl")
 
 # ===== M3U BUILD =====
 def build_m3u(host):
     lines = ['#EXTM3U url-tvg="" deinterlace="1"']
+    hidden = state.get_hidden_channels()
     channels = state.get_all_channels(ordered=True)
     for ch in channels:
+        if ch["id"] in hidden:
+            continue
         ch_id = ch["id"]
         ch_name = ch["name"]
         ch_grp = ch["grp"]
@@ -155,7 +124,7 @@ def build_m3u(host):
 async def root(request: Request):
     host = detect_host(request)
     return PlainTextResponse(
-        f"VxParser Online\n\n"
+        f"VxParser v3.2 Online\n\n"
         f"M3U: {host}/get.php?username=admin&password=admin&type=m3u_plus\n"
         f"Status: {host}/api/status\n"
         f"Admin: {host}/admin\n"
@@ -165,6 +134,7 @@ async def root(request: Request):
 @app.get("/pong")
 @app.get("/health")
 async def health():
+    state.cleanup_resolve_cache()
     return PlainTextResponse("pong")
 
 @app.get("/get.php")
@@ -175,41 +145,40 @@ async def get_m3u(request: Request, username: str = "", password: str = "", type
 @app.get("/player_api.php")
 async def player_api(request: Request, username: str = "", password: str = "", action: str = ""):
     host = detect_host(request)
+    hidden = state.get_hidden_channels()
     if action == "get_live_categories":
         groups = {}
         for ch in state.get_all_channels(ordered=True):
-            groups[ch["grp"]] = groups.get(ch["grp"], 0) + 1
+            if ch["id"] not in hidden:
+                groups[ch["grp"]] = groups.get(ch["grp"], 0) + 1
         return JSONResponse([{"category_id": str(i+1), "category_name": g, "parent_id": 0} for i, g in enumerate(groups.keys())])
     elif action == "get_live_streams":
-        return JSONResponse([{"num": i+1, "name": ch["name"], "stream_type": "live", "stream_id": ch["id"], "stream_icon": ch.get("logo", "")} for i, ch in enumerate(state.get_all_channels(ordered=True))])
+        return JSONResponse([{"num": i+1, "name": ch["name"], "stream_type": "live", "stream_id": ch["id"], "stream_icon": ch.get("logo", "")} for i, ch in enumerate(state.get_all_channels(ordered=True)) if ch["id"] not in hidden])
     return PlainTextResponse(build_m3u(host), media_type="audio/x-mpegurl")
 
 @app.get("/channel/{ch_id}")
 async def channel_stream(ch_id: int):
-    """Resolve channel and proxy stream - Y3-Direct first"""
     ch = state.get_channel(ch_id)
     if not ch:
         return JSONResponse({"error": "Not found"}, status_code=404)
 
-    # Check resolve cache
     cache_key = str(ch_id)
     if cache_key in state.RESOLVE_CACHE:
         cached = state.RESOLVE_CACHE[cache_key]
         if cached.get("expires", 0) > time.time():
             return await proxy_stream(cached["url"], ch_id)
 
-    # Resolve channel (Y3-Direct first)
     result = await state.resolve_channel(ch_id)
     if result.get("success"):
         stream_url = result["url"]
-        state.RESOLVE_CACHE[cache_key] = {"url": stream_url, "expires": time.time() + 300}
+        ttl = state.CONFIG["RESOLVE_CACHE_TTL"]
+        state.RESOLVE_CACHE[cache_key] = {"url": stream_url, "expires": time.time() + ttl, "created": time.time()}
         return await proxy_stream(stream_url, ch_id)
 
     return JSONResponse({"error": result.get("error", "Could not resolve")}, status_code=502)
 
 @app.get("/channel/{ch_id}/stream")
 async def channel_substream(ch_id: int, url: str):
-    """Proxy sub-segments/variant playlists for HLS"""
     if not url:
         return JSONResponse({"error": "no url"}, status_code=400)
     try:
@@ -223,12 +192,8 @@ async def channel_substream(ch_id: int, url: str):
         async with httpx.AsyncClient(timeout=15, verify=False, follow_redirects=True) as client:
             r = await client.get(url, headers=headers)
             if r.status_code != 200:
-                add_log(f"[{ch_id}] Seg error: HTTP {r.status_code} for {url[:100]}")
-                return JSONResponse({"error": f"upstream {r.status_code}", "url": url[:100]}, status_code=502)
-
+                return JSONResponse({"error": f"upstream {r.status_code}"}, status_code=502)
             content_type = r.headers.get("content-type", "")
-
-            # If it's another m3u8 (variant playlist), rewrite and return as HLS
             if "mpegurl" in content_type or ".m3u8" in url:
                 text = r.text
                 final_url = str(r.url)
@@ -243,22 +208,11 @@ async def channel_substream(ch_id: int, url: str):
                     return f"/channel/{ch_id}/stream?url={abs_url}"
                 rewritten = "\n".join(rewrite(l) for l in text.split("\n"))
                 return PlainTextResponse(rewritten, media_type="application/vnd.apple.mpegurl")
-
-            # Binary segment (.ts, .aac, etc.)
             ct = content_type or "video/MP2T"
-            return StreamingResponse(
-                iter([r.content]),
-                media_type=ct,
-                headers={
-                    "Content-Length": str(len(r.content)),
-                    "Cache-Control": "max-age=2",
-                }
-            )
+            return StreamingResponse(iter([r.content]), media_type=ct, headers={"Content-Length": str(len(r.content)), "Cache-Control": "max-age=2"})
     except httpx.TimeoutException:
-        add_log(f"[{ch_id}] Seg TIMEOUT: {url[:100]}")
         return JSONResponse({"error": "timeout"}, status_code=504)
     except Exception as e:
-        add_log(f"[{ch_id}] Seg ERROR: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
 # ===== API ROUTES =====
@@ -276,6 +230,7 @@ async def api_status(request: Request):
         "live2_domain": state.LIVE2_DOMAIN,
         "catalog_domain": state.CATALOG_DOMAIN,
         "resolve_cache": len(state.RESOLVE_CACHE),
+        "version": state.CONFIG["APP_VERSION"],
         "logs": state.STARTUP_LOGS[-30:]
     }
     try:
@@ -289,6 +244,10 @@ async def api_status(request: Request):
         info["tr_channels"] = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM channels WHERE country='DE'")
         info["de_channels"] = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM channels WHERE logo != '' AND logo != 'null'")
+        info["logo_channels"] = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM hidden_channels")
+        info["hidden_channels"] = c.fetchone()[0]
         c.execute("SELECT DISTINCT grp FROM channels ORDER BY grp")
         info["groups"] = [r[0] for r in c.fetchall()]
         conn.close()
@@ -329,7 +288,6 @@ async def test_channel(ch_id: int):
 
 @app.get("/reload")
 async def reload():
-    """Reload channels"""
     if not state.DATA_READY:
         state.DATA_READY = False
         import asyncio
@@ -339,78 +297,24 @@ async def reload():
 
 @app.get("/debug/{ch_id}")
 async def debug_channel(ch_id: int):
-    """Debug endpoint: fetch upstream URL and show raw response"""
     ch = state.get_channel(ch_id)
     if not ch:
         return JSONResponse({"error": "Not found"}, status_code=404)
-
     url = ch.get("url", "")
     hls = ch.get("hls", "")
-    result = {
-        "channel_id": ch_id,
-        "name": ch.get("name", ""),
-        "url_field": url,
-        "hls_field": hls,
-    }
-
-    # Try fetching the URL directly
-    test_url = url if url else hls
-    if not test_url:
-        return JSONResponse({**result, "error": "No URL"})
-
-    try:
-        headers = get_proxy_headers()
-        from urllib.parse import urlparse
-        parsed = urlparse(test_url)
-        if parsed.hostname:
-            headers["Referer"] = f"{parsed.scheme}://{parsed.hostname}/"
-
-        # Don't follow redirects to see the chain
-        async with httpx.AsyncClient(timeout=15, verify=False, follow_redirects=False) as client:
-            r = await client.get(test_url, headers=headers)
-            result["status_code"] = r.status_code
-            result["content_type"] = r.headers.get("content-type", "")
-            result["content_length"] = len(r.content)
-            result["headers"] = dict(r.headers)
-            result["body_preview"] = r.text[:1000]
-
-            if r.status_code in (301, 302, 303, 307, 308):
-                result["redirect_location"] = r.headers.get("location", "")
-                # Follow redirect once
-                loc = result["redirect_location"]
-                if loc:
-                    if not loc.startswith("http"):
-                        loc = f"{parsed.scheme}://{parsed.hostname}{loc}"
-                    r2 = await client.get(loc, headers=headers)
-                    result["redirect_status"] = r2.status_code
-                    result["redirect_ct"] = r2.headers.get("content-type", "")
-                    result["redirect_body"] = r2.text[:1000]
-                    result["final_url"] = str(r2.url)
-    except Exception as e:
-        result["fetch_error"] = str(e)
-
-    # Also try MediaHubMX resolve with HLS URL
+    result = {"channel_id": ch_id, "name": ch.get("name", ""), "url_field": url, "hls_field": hls}
     if hls:
         try:
-            add_log(f"[debug {ch_id}] MediaHubMX resolve deneniyor: {hls[:80]}")
             resolved = await state.resolve_mediahubmx(hls)
             result["resolve_hls"] = resolved
-            if resolved:
-                add_log(f"[debug {ch_id}] Resolve BASARILI: {resolved[:100]}")
         except Exception as e:
             result["resolve_error"] = str(e)
-
-    # Also try resolve with live2 URL
     if url:
         try:
-            add_log(f"[debug {ch_id}] MediaHubMX resolve deneniyor (live2): {url[:80]}")
             resolved2 = await state.resolve_mediahubmx(url)
             result["resolve_url"] = resolved2
-            if resolved2:
-                add_log(f"[debug {ch_id}] Resolve (live2) BASARILI: {resolved2[:100]}")
         except Exception as e:
             result["resolve_url_error"] = str(e)
-
     return JSONResponse(result)
 
 # ===== ADMIN API =====
@@ -473,12 +377,10 @@ async def admin_set_override(request: Request):
 async def admin_get_overrides(request: Request):
     if not check_admin(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    overrides = state.get_all_overrides()
-    return JSONResponse({"overrides": overrides})
+    return JSONResponse({"overrides": state.get_all_overrides()})
 
 @app.post("/api/admin/reorder")
 async def admin_reorder(request: Request):
-    """Save custom channel/group order. Body: {type:'channel'|'group', items:[{id,sort_order}]}"""
     if not check_admin(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     body = await request.json()
@@ -489,18 +391,15 @@ async def admin_reorder(request: Request):
     import sqlite3
     conn = sqlite3.connect(state.DB_PATH)
     c = conn.cursor()
-    # Create sort_order table if not exists
     c.execute("CREATE TABLE IF NOT EXISTS sort_order (key TEXT PRIMARY KEY, value TEXT)")
-    c.execute("INSERT OR REPLACE INTO sort_order (key, value) VALUES (?, ?)",
-        (rtype, json.dumps(items)))
+    c.execute("INSERT OR REPLACE INTO sort_order (key, value) VALUES (?, ?)", (rtype, json.dumps(items)))
     conn.commit()
     conn.close()
-    add_log(f"Admin: {len(items)} {rtype} siralama kaydedildi")
+    add_log(f"Admin: {len(items)} {rtype} siralama kaydedildi (auto-save)")
     return JSONResponse({"success": True, "count": len(items)})
 
 @app.post("/api/admin/move-group")
 async def admin_move_group(request: Request):
-    """Move channel to a different group"""
     if not check_admin(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     body = await request.json()
@@ -514,12 +413,53 @@ async def admin_move_group(request: Request):
     c.execute("UPDATE channels SET grp = ? WHERE id = ?", (new_grp, ch_id))
     conn.commit()
     conn.close()
-    add_log(f"Admin: Kanal {ch_id} -> '{new_grp}' grubuna tasindi")
+    add_log(f"Admin: Kanal {ch_id} -> '{new_grp}'")
     return JSONResponse({"success": True})
+
+@app.post("/api/admin/bulk-move-group")
+async def admin_bulk_move_group(request: Request):
+    """Move multiple channels to a group at once"""
+    if not check_admin(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    body = await request.json()
+    ch_ids = body.get("channel_ids", [])
+    new_grp = body.get("group", "")
+    if not ch_ids or not new_grp:
+        return JSONResponse({"error": "channel_ids and group required"}, status_code=400)
+    import sqlite3
+    conn = sqlite3.connect(state.DB_PATH)
+    c = conn.cursor()
+    for ch_id in ch_ids:
+        c.execute("UPDATE channels SET grp = ? WHERE id = ?", (new_grp, ch_id))
+    conn.commit()
+    conn.close()
+    add_log(f"Admin: {len(ch_ids)} kanal -> '{new_grp}'")
+    return JSONResponse({"success": True, "count": len(ch_ids)})
+
+@app.post("/api/admin/create-group")
+async def admin_create_group(request: Request):
+    """Create a new group by moving channels into it"""
+    if not check_admin(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    body = await request.json()
+    grp_name = body.get("name", "")
+    ch_ids = body.get("channel_ids", [])
+    if not grp_name:
+        return JSONResponse({"error": "name required"}, status_code=400)
+    if not ch_ids:
+        return JSONResponse({"error": "channel_ids required"}, status_code=400)
+    import sqlite3
+    conn = sqlite3.connect(state.DB_PATH)
+    c = conn.cursor()
+    for ch_id in ch_ids:
+        c.execute("UPDATE channels SET grp = ? WHERE id = ?", (grp_name, ch_id))
+    conn.commit()
+    conn.close()
+    add_log(f"Admin: Yeni grup '{grp_name}' olusturuldu ({len(ch_ids)} kanal)")
+    return JSONResponse({"success": True, "group": grp_name, "count": len(ch_ids)})
 
 @app.post("/api/admin/rename-group")
 async def admin_rename_group(request: Request):
-    """Rename a group (batch update all channels in it)"""
     if not check_admin(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     body = await request.json()
@@ -539,7 +479,6 @@ async def admin_rename_group(request: Request):
 
 @app.post("/api/admin/hide-channel")
 async def admin_hide_channel(request: Request):
-    """Hide or unhide a channel from M3U"""
     if not check_admin(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     body = await request.json()
@@ -560,14 +499,20 @@ async def admin_hide_channel(request: Request):
     add_log(f"Admin: Kanal {ch_id} {'gizlendi' if hidden else 'gosterildi'}")
     return JSONResponse({"success": True})
 
-# ===== ADMIN PANEL HTML =====
+@app.post("/api/admin/clear-cache")
+async def admin_clear_cache(request: Request):
+    if not check_admin(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    state.clear_resolve_cache()
+    return JSONResponse({"success": True})
 
+# ===== ADMIN PANEL HTML =====
 ADMIN_HTML = r'''<!DOCTYPE html>
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>VxParser Admin</title>
+<title>VxParser Admin v3.2</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:system-ui,-apple-system,sans-serif;background:#0f1117;color:#e1e4e8}
@@ -589,7 +534,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#0f1117;color:#e1
 .tab{padding:10px 20px;cursor:pointer;color:#8b949e;font-size:13px;font-weight:600;border-bottom:2px solid transparent;white-space:nowrap}
 .tab:hover{color:#e1e4e8}
 .tab.active{color:#58a6ff;border-bottom-color:#58a6ff}
-.content{padding:20px}
+.content{padding:20px;max-width:1400px}
 .panel{display:none}
 .panel.active{display:block}
 .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:12px}
@@ -598,38 +543,39 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#0f1117;color:#e1
 .card .sub{color:#8b949e;font-size:12px;margin-top:4px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:20px}
 table{width:100%;border-collapse:collapse;font-size:13px}
-th{background:#0d1117;color:#8b949e;text-align:left;padding:8px 12px;border-bottom:1px solid #30363d;position:sticky;top:0;z-index:2}
-td{padding:8px 12px;border-bottom:1px solid #21262d;color:#c9d1d9}
+th{background:#0d1117;color:#8b949e;text-align:left;padding:8px 10px;border-bottom:1px solid #30363d;position:sticky;top:0;z-index:2}
+td{padding:6px 10px;border-bottom:1px solid #21262d;color:#c9d1d9}
 tr:hover{background:#161b22}
 .badge-ok{color:#3fb950;font-weight:600}
 .badge-err{color:#f85149;font-weight:600}
 .badge-warn{color:#d29922;font-weight:600}
-.btn{padding:6px 14px;border-radius:6px;border:1px solid #30363d;background:#21262d;color:#e1e4e8;cursor:pointer;font-size:12px}
+.btn{padding:6px 14px;border-radius:6px;border:1px solid #30363d;background:#21262d;color:#e1e4e8;cursor:pointer;font-size:12px;white-space:nowrap}
 .btn:hover{background:#30363d}
 .btn-primary{background:#238636;border-color:#238636;color:#fff}
 .btn-primary:hover{background:#2ea043}
 .btn-danger{background:#da3633;border-color:#da3633;color:#fff}
+.btn-danger:hover{background:#f85149}
+.btn-warn{background:#9e6a03;border-color:#9e6a03;color:#fff}
 .btn-sm{padding:4px 10px;font-size:11px}
 .btn-xs{padding:2px 8px;font-size:10px}
 input[type="text"],input[type="search"],select{padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e1e4e8;font-size:13px;outline:none}
 input:focus,select:focus{border-color:#58a6ff}
-.toolbar{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap;align-items:center}
-.toolbar input{flex:1;min-width:200px}
-.logbox{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px;font-family:monospace;font-size:12px;max-height:400px;overflow-y:auto;color:#8b949e;line-height:1.6}
+.toolbar{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center}
+.toolbar input{flex:1;min-width:180px}
+.logbox{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px;font-family:monospace;font-size:12px;max-height:500px;overflow-y:auto;color:#8b949e;line-height:1.6}
 .logbox div{padding:1px 0}
 .empty{text-align:center;color:#8b949e;padding:40px;font-size:14px}
 .modal-bg{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:none;align-items:center;justify-content:center;z-index:100}
 .modal-bg.show{display:flex}
-.modal{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;width:440px;max-width:90vw}
+.modal{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;width:480px;max-width:90vw;max-height:80vh;overflow-y:auto}
 .modal h3{color:#e1e4e8;margin-bottom:16px}
 .modal input,.modal textarea,.modal select{width:100%;padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e1e4e8;font-size:13px;outline:none;margin-bottom:12px}
 .modal textarea{height:80px;resize:vertical;font-family:monospace}
 .modal label{color:#8b949e;font-size:12px;display:block;margin-bottom:4px}
 .modal .btns{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}
-/* Drag and drop */
 .drag-handle{cursor:grab;color:#484f58;font-size:16px;padding:0 4px;user-select:none}
 .drag-handle:active{cursor:grabbing;color:#58a6ff}
-tr.dragging{opacity:0.4;background:#1f6feb}
+tr.dragging{opacity:0.4;background:#1f6feb!important}
 tr.drag-over{border-top:2px solid #58a6ff}
 .grp-item{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px;margin-bottom:8px;display:flex;align-items:center;gap:12px}
 .grp-item .grp-name{flex:1;font-weight:600;color:#e1e4e8}
@@ -638,6 +584,14 @@ tr.drag-over{border-top:2px solid #58a6ff}
 .grp-item.drag-over{border-top:2px solid #58a6ff}
 .hidden-ch{opacity:0.5;text-decoration:line-through}
 select option{background:#0d1117;color:#e1e4e8}
+.ch-logo{width:28px;height:28px;border-radius:4px;object-fit:contain;background:#21262d}
+.auto-save-badge{display:inline-block;background:#238636;color:#fff;font-size:10px;padding:1px 6px;border-radius:8px;margin-left:8px}
+.toast{position:fixed;bottom:20px;right:20px;background:#238636;color:#fff;padding:10px 20px;border-radius:8px;font-size:13px;z-index:200;opacity:0;transition:opacity 0.3s}
+.toast.show{opacity:1}
+.toast.err{background:#da3633}
+input[type="checkbox"]{width:16px;height:16px;cursor:pointer;accent-color:#58a6ff}
+.bulk-bar{background:#1c2128;border:1px solid #58a6ff;border-radius:8px;padding:10px 16px;margin-bottom:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.bulk-bar span{color:#58a6ff;font-weight:600}
 </style>
 </head>
 <body>
@@ -645,7 +599,7 @@ select option{background:#0d1117;color:#e1e4e8}
 <div class="login-wrap" id="loginWrap">
   <div class="login-box">
     <h1>VxParser</h1>
-    <p>Admin Panel</p>
+    <p>Admin Panel v3.2</p>
     <input type="password" id="pwdInput" placeholder="Sifre" autocomplete="off">
     <button onclick="doLogin()">Giris</button>
     <div class="err" id="loginErr" style="display:none"></div>
@@ -657,6 +611,7 @@ select option{background:#0d1117;color:#e1e4e8}
     <h1>VxParser</h1>
     <span class="badge" id="statusBadge">...</span>
     <div class="right">
+      <button class="btn" onclick="clearCache()">Cache Temizle</button>
       <button class="btn" onclick="refreshStatus()">Yenile</button>
       <button class="btn btn-danger" onclick="doLogout()">Cikis</button>
     </div>
@@ -677,6 +632,7 @@ select option{background:#0d1117;color:#e1e4e8}
   </div>
 </div>
 
+<!-- Override Modal -->
 <div class="modal-bg" id="overrideModal">
   <div class="modal">
     <h3>Override Ayarla</h3>
@@ -691,6 +647,7 @@ select option{background:#0d1117;color:#e1e4e8}
   </div>
 </div>
 
+<!-- Move Group Modal -->
 <div class="modal-bg" id="moveGrpModal">
   <div class="modal">
     <h3>Grup Degistir</h3>
@@ -707,6 +664,7 @@ select option{background:#0d1117;color:#e1e4e8}
   </div>
 </div>
 
+<!-- Rename Group Modal -->
 <div class="modal-bg" id="renameGrpModal">
   <div class="modal">
     <h3>Grup Yeniden Adlandir</h3>
@@ -721,12 +679,39 @@ select option{background:#0d1117;color:#e1e4e8}
   </div>
 </div>
 
+<!-- Bulk Group Assign Modal -->
+<div class="modal-bg" id="bulkGrpModal">
+  <div class="modal">
+    <h3>Secilen Kanallari Gruba Ekle</h3>
+    <label id="bulkGrpInfo"></label>
+    <label>Grup Sec</label>
+    <select id="bulkGrpSelect"></select>
+    <label>Veya Yeni Grup Olustur</label>
+    <input type="text" id="bulkNewGrp" placeholder="Yeni grup adi yazin...">
+    <div class="btns">
+      <button class="btn" onclick="closeModal('bulkGrpModal')">Iptal</button>
+      <button class="btn btn-primary" onclick="saveBulkGrp()">Kaydet</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
 <script>
 var TOKEN = localStorage.getItem("vx_token") || "";
 var currentTab = "dashboard";
 var allGroups = [];
 var allChannels = [];
-var grpOrder = [];
+var selectedIds = {};
+var autoSaveTimer = null;
+
+function toast(msg, isErr) {
+  var t = document.getElementById("toast");
+  t.textContent = msg;
+  t.className = "toast show" + (isErr ? " err" : "");
+  setTimeout(function() { t.className = "toast"; }, 3000);
+}
 
 function doLogin() {
   var pwd = document.getElementById("pwdInput").value;
@@ -802,12 +787,20 @@ function refreshStatus() {
   .then(function(d) {
     var badge = document.getElementById("statusBadge");
     if (d.data_ready) {
-      badge.textContent = "ONLINE";
+      badge.textContent = "ONLINE v" + (d.version || "3.2");
       badge.style.background = "#238636";
     } else {
       badge.textContent = "LOADING";
       badge.style.background = "#d29922";
     }
+  });
+}
+
+function clearCache() {
+  fetch("/api/admin/clear-cache", {method:"POST", headers: authHeaders()})
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (d.success) toast("Resolve cache temizlendi!");
   });
 }
 
@@ -819,11 +812,14 @@ function loadDashboard() {
     h += '<div class="card"><h3>Toplam Kanal</h3><div class="val">' + (d.total_channels || 0) + '</div></div>';
     h += '<div class="card"><h3>TR Kanallar</h3><div class="val">' + (d.tr_channels || 0) + '</div></div>';
     h += '<div class="card"><h3>DE Kanallar</h3><div class="val">' + (d.de_channels || 0) + '</div></div>';
+    h += '<div class="card"><h3>HLS Eslesme</h3><div class="val">' + (d.hls_channels || 0) + '</div></div>';
+    h += '<div class="card"><h3>Logo</h3><div class="val">' + (d.logo_channels || 0) + '</div></div>';
     h += '<div class="card"><h3>Lokke Sig</h3><div class="val"><span class="' + (d.lokke_sig ? "badge-ok" : "badge-err") + '">' + (d.lokke_sig ? "OK" : "YOK") + '</span></div></div>';
     h += '<div class="card"><h3>Vavoo Token</h3><div class="val"><span class="' + (d.vavoo_token ? "badge-ok" : "badge-warn") + '">' + (d.vavoo_token ? "OK" : "YOK") + '</span></div>';
     if (d.vavoo_cooldown) h += '<div class="sub">Cooldown aktif</div>';
     h += '</div>';
     h += '<div class="card"><h3>Resolve Cache</h3><div class="val">' + (d.resolve_cache || 0) + '</div></div>';
+    h += '<div class="card"><h3>Gizli Kanal</h3><div class="val">' + (d.hidden_channels || 0) + '</div></div>';
     h += '</div>';
     if (d.logs && d.logs.length > 0) {
       h += '<div class="card"><h3>Son Loglar</h3><div class="logbox" style="max-height:250px">';
@@ -843,6 +839,7 @@ function loadChannels() {
   .then(function(r) { return r.json(); })
   .then(function(d) {
     allChannels = d.channels || [];
+    var selCount = getSelectedCount();
     var h = '<div class="toolbar">';
     h += '<input type="search" placeholder="Kanal ara..." value="' + escHtml(chSearch) + '" onkeyup="chSearch=this.value;loadChannels()">';
     h += '<select id="chGrpFilter" onchange="chGroup=this.value;loadChannels()"><option value="">Tum Gruplar</option>';
@@ -851,44 +848,142 @@ function loadChannels() {
       h += '<option value="' + escHtml(allGroups[g].name) + '"' + sel + '>' + escHtml(allGroups[g].name) + ' (' + allGroups[g].count + ')</option>';
     }
     h += '</select>';
-    h += '<button class="btn" onclick="saveChannelOrder()" title="Siralama kaydet">Siralayi Kaydet</button>';
     h += '</div>';
-    h += '<div style="color:#8b949e;font-size:12px;margin-bottom:12px">' + allChannels.length + ' kanal | Surukleyerek siralayin</div>';
+
+    h += '<div style="color:#8b949e;font-size:12px;margin-bottom:8px">' + allChannels.length + ' kanal <span class="auto-save-badge">AUTO-SAVE</span> Surukleyerek siralayin, otomatik kaydeder</div>';
+
     if (allChannels.length === 0) {
       h += '<div class="empty">Kanal bulunamadi</div>';
     } else {
-      h += '<table id="chTable"><thead><tr><th style="width:30px"></th><th style="width:30px">#</th><th>ID</th><th>Isim</th><th>Grup</th><th>URL</th><th>HLS</th><th>Islem</th></tr></thead><tbody id="chBody">';
-      var max = Math.min(allChannels.length, 500);
+      h += '<table id="chTable"><thead><tr>';
+      h += '<th style="width:32px"><input type="checkbox" id="selAll" onchange="toggleSelectAll(this.checked)"></th>';
+      h += '<th style="width:30px"></th>';
+      h += '<th style="width:24px">#</th>';
+      h += '<th>Logo</th>';
+      h += '<th>Isim</th>';
+      h += '<th>Grup</th>';
+      h += '<th>HLS</th>';
+      h += '<th>Islem</th>';
+      h += '</tr></thead><tbody id="chBody">';
+      var max = Math.min(allChannels.length, 800);
       for (var i = 0; i < max; i++) {
         var c = allChannels[i];
-        h += '<tr draggable="true" data-id="' + c.id + '" ondragstart="dragStart(event)" ondragover="dragOver(event)" ondrop="dropCh(event)" ondragend="dragEnd(event)">';
+        var checked = selectedIds[c.id] ? " checked" : "";
+        var hidden = c._hidden ? ' class="hidden-ch"' : "";
+        h += '<tr draggable="true" data-id="' + c.id + '" data-idx="' + i + '" ondragstart="dragStart(event)" ondragover="dragOver(event)" ondrop="dropCh(event)" ondragend="dragEnd(event)"' + hidden + '>';
+        h += '<td><input type="checkbox" data-chid="' + c.id + '"' + checked + ' onchange="toggleSelect(' + c.id + ',this.checked)"></td>';
         h += '<td class="drag-handle" title="Surukle">&#9776;</td>';
         h += '<td style="color:#484f58;font-size:11px">' + (i+1) + '</td>';
-        h += '<td>' + c.id + '</td>';
+        if (c.logo && c.logo.indexOf("http") === 0) {
+          h += '<td><img class="ch-logo" src="' + escHtml(c.logo) + '" onerror="this.style.display=\'none\'" loading="lazy"></td>';
+        } else {
+          h += '<td><span style="color:#30363d">-</span></td>';
+        }
         h += '<td>' + escHtml(c.name) + '</td>';
         h += '<td><span style="color:#8b949e">' + escHtml(c.grp) + '</span></td>';
-        h += '<td>' + (c.url ? '<span class="badge-ok">Var</span>' : '<span class="badge-err">Yok</span>') + '</td>';
         h += '<td>' + (c.hls ? '<span class="badge-ok">HLS</span>' : '<span class="badge-warn">Yok</span>') + '</td>';
         h += '<td style="white-space:nowrap">';
-        h += '<button class="btn btn-xs" onclick="testCh(' + c.id + ')" title="Test">Test</button> ';
-        h += '<button class="btn btn-xs" onclick="openOverride(' + c.id + ')" title="Override">URL</button> ';
-        h += '<button class="btn btn-xs" onclick="openMoveGrp(' + c.id + ',\'' + escHtml(c.name).replace(/'/g, "\\'") + '\',\'' + escHtml(c.grp).replace(/'/g, "\\'") + '\')" title="Grup degistir">Grup</button> ';
+        h += '<button class="btn btn-xs" onclick="testCh(' + c.id + ')">Test</button> ';
+        h += '<button class="btn btn-xs" onclick="openOverride(' + c.id + ')">URL</button> ';
+        h += '<button class="btn btn-xs" onclick="openMoveGrp(' + c.id + ',\'' + escHtml(c.name).replace(/'/g,"\\'") + '\',\'' + escHtml(c.grp).replace(/'/g,"\\'") + '\')">Grup</button> ';
+        h += '<button class="btn btn-xs" onclick="hideCh(' + c.id + ')" title="Gizle/Goster">&#128065;</button> ';
         h += '<button class="btn btn-xs" onclick="moveChUpDown(' + i + ',-1)" title="Yukari">&#9650;</button>';
         h += '<button class="btn btn-xs" onclick="moveChUpDown(' + i + ',1)" title="Asagi">&#9660;</button>';
         h += '</td></tr>';
       }
       h += '</tbody></table>';
     }
+
+    // Bulk action bar
+    if (selCount > 0) {
+      h = '<div class="bulk-bar"><span>' + selCount + ' kanal secili</span>';
+      h += '<button class="btn btn-primary btn-sm" onclick="openBulkGrp()">Gruba Ekle</button>';
+      h += '<button class="btn btn-sm" onclick="bulkHide(true)">Gizle</button>';
+      h += '<button class="btn btn-sm" onclick="bulkHide(false)">Goster</button>';
+      h += '<button class="btn btn-sm" onclick="clearSelection()">Secimi Temizle</button>';
+      h += '</div>' + h;
+    }
+
     document.getElementById("panel-channels").innerHTML = h;
   });
 }
 
-/* Drag & Drop */
-var dragSrcId = null;
+function getSelectedCount() {
+  var count = 0;
+  for (var k in selectedIds) { if (selectedIds[k]) count++; }
+  return count;
+}
+
+function toggleSelectAll(checked) {
+  for (var i = 0; i < allChannels.length; i++) {
+    selectedIds[allChannels[i].id] = checked;
+  }
+  loadChannels();
+}
+
+function toggleSelect(chId, checked) {
+  selectedIds[chId] = checked;
+  // Update bulk bar without full reload for performance
+  var selCount = getSelectedCount();
+  var existing = document.querySelector(".bulk-bar");
+  if (checked && !existing) {
+    loadChannels();
+  } else if (!checked && existing && selCount === 0) {
+    loadChannels();
+  } else if (existing) {
+    existing.querySelector("span").textContent = selCount + " kanal secili";
+  }
+}
+
+function clearSelection() {
+  selectedIds = {};
+  loadChannels();
+}
+
+function hideCh(chId) {
+  fetch("/api/admin/hide-channel", {
+    method: "POST",
+    headers: Object.assign({"Content-Type": "application/json"}, authHeaders()),
+    body: JSON.stringify({channel_id: chId, hidden: true})
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (d.success) {
+      toast("Kanal gizlendi");
+      loadChannels();
+    }
+  });
+}
+
+function bulkHide(hidden) {
+  var ids = [];
+  for (var k in selectedIds) { if (selectedIds[k]) ids.push(parseInt(k)); }
+  if (!ids.length) return;
+  var done = 0;
+  for (var i = 0; i < ids.length; i++) {
+    fetch("/api/admin/hide-channel", {
+      method: "POST",
+      headers: Object.assign({"Content-Type": "application/json"}, authHeaders()),
+      body: JSON.stringify({channel_id: ids[i], hidden: hidden})
+    }).then(function(r) { return r.json(); }).then(function(d) {
+      done++;
+      if (done >= ids.length) {
+        toast(ids.length + " kanal " + (hidden ? "gizlendi" : "gosterildi"));
+        clearSelection();
+        loadChannels();
+      }
+    });
+  }
+}
+
+/* Auto-save drag & drop */
+var dragSrcIdx = null;
 function dragStart(e) {
-  dragSrcId = parseInt(e.currentTarget.dataset.id);
+  var idx = parseInt(e.currentTarget.dataset.idx);
+  dragSrcIdx = idx;
   e.currentTarget.classList.add("dragging");
   e.dataTransfer.effectAllowed = "move";
+  e.dataTransfer.setData("text/plain", idx);
 }
 function dragOver(e) {
   e.preventDefault();
@@ -901,22 +996,20 @@ function dragOver(e) {
 function dropCh(e) {
   e.preventDefault();
   e.currentTarget.classList.remove("drag-over");
-  var targetId = parseInt(e.currentTarget.dataset.id);
-  if (dragSrcId === targetId) return;
-  var srcIdx = -1, tgtIdx = -1;
-  for (var i = 0; i < allChannels.length; i++) {
-    if (allChannels[i].id === dragSrcId) srcIdx = i;
-    if (allChannels[i].id === targetId) tgtIdx = i;
-  }
-  if (srcIdx < 0 || tgtIdx < 0) return;
-  var item = allChannels.splice(srcIdx, 1)[0];
+  var tgtIdx = parseInt(e.currentTarget.dataset.idx);
+  if (dragSrcIdx === null || dragSrcIdx === tgtIdx) return;
+  var item = allChannels.splice(dragSrcIdx, 1)[0];
   allChannels.splice(tgtIdx, 0, item);
   loadChannels();
+  // Auto-save with debounce
+  clearTimeout(autoSaveTimer);
+  autoSaveTimer = setTimeout(autoSaveOrder, 1000);
 }
 function dragEnd(e) {
   e.currentTarget.classList.remove("dragging");
   var rows = document.querySelectorAll("#chBody tr");
   for (var i = 0; i < rows.length; i++) rows[i].classList.remove("drag-over");
+  dragSrcIdx = null;
 }
 function moveChUpDown(idx, dir) {
   var newIdx = idx + dir;
@@ -925,8 +1018,10 @@ function moveChUpDown(idx, dir) {
   allChannels[idx] = allChannels[newIdx];
   allChannels[newIdx] = tmp;
   loadChannels();
+  clearTimeout(autoSaveTimer);
+  autoSaveTimer = setTimeout(autoSaveOrder, 1000);
 }
-function saveChannelOrder() {
+function autoSaveOrder() {
   var items = [];
   for (var i = 0; i < allChannels.length; i++) {
     items.push({"id": allChannels[i].id, "sort": i});
@@ -938,7 +1033,52 @@ function saveChannelOrder() {
   })
   .then(function(r) { return r.json(); })
   .then(function(d) {
-    if (d.success) alert("Siralama kaydedildi! (" + d.count + " kanal)");
+    if (d.success) toast("Siralama otomatik kaydedildi! (" + d.count + " kanal)");
+  });
+}
+
+/* Bulk Group Assignment */
+function openBulkGrp() {
+  var ids = [];
+  for (var k in selectedIds) { if (selectedIds[k]) ids.push(parseInt(k)); }
+  if (!ids.length) { toast("Kanal secin!", true); return; }
+  document.getElementById("bulkGrpInfo").textContent = ids.length + " kanal secili";
+  var sel = document.getElementById("bulkGrpSelect");
+  sel.innerHTML = '<option value="">-- Grup Sec --</option>';
+  for (var i = 0; i < allGroups.length; i++) {
+    var opt = document.createElement("option");
+    opt.value = allGroups[i].name;
+    opt.textContent = allGroups[i].name + " (" + allGroups[i].count + ")";
+    sel.appendChild(opt);
+  }
+  document.getElementById("bulkNewGrp").value = "";
+  document.getElementById("bulkGrpModal").classList.add("show");
+}
+function saveBulkGrp() {
+  var selVal = document.getElementById("bulkGrpSelect").value;
+  var newVal = document.getElementById("bulkNewGrp").value.trim();
+  var targetGrp = newVal || selVal;
+  if (!targetGrp) { toast("Grup secin veya yeni ad yazin", true); return; }
+  var ids = [];
+  for (var k in selectedIds) { if (selectedIds[k]) ids.push(parseInt(k)); }
+
+  var endpoint = newVal ? "/api/admin/create-group" : "/api/admin/bulk-move-group";
+  var body = newVal ? {name: newVal, channel_ids: ids} : {channel_ids: ids, group: selVal};
+
+  fetch(endpoint, {
+    method: "POST",
+    headers: Object.assign({"Content-Type": "application/json"}, authHeaders()),
+    body: JSON.stringify(body)
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (d.success) {
+      closeModal("bulkGrpModal");
+      toast(d.count + " kanal '" + targetGrp + "' grubuna eklendi");
+      selectedIds = {};
+      loadGroups();
+      loadChannels();
+    }
   });
 }
 
@@ -958,9 +1098,10 @@ function loadGroups() {
   .then(function(r) { return r.json(); })
   .then(function(d) {
     allGroups = d.groups || [];
-    var h = '<div style="margin-bottom:16px;color:#8b949e;font-size:13px">Gruplari surukleyerek siralayin. Siralama kaydedildiginde M3U liste sirasi degisir.</div>';
-    h += '<div class="toolbar">';
+    var h = '<div class="toolbar">';
     h += '<button class="btn btn-primary" onclick="saveGrpOrder()">Grup Siralamayi Kaydet</button>';
+    h += '<div style="flex:1"></div>';
+    h += '<span style="color:#8b949e;font-size:12px">Toplam: ' + allGroups.length + ' grup</span>';
     h += '</div>';
     h += '<div id="grpList">';
     for (var i = 0; i < allGroups.length; i++) {
@@ -969,8 +1110,8 @@ function loadGroups() {
       h += '<span class="drag-handle">&#9776;</span>';
       h += '<span class="grp-name">' + escHtml(g.name) + '</span>';
       h += '<span class="grp-count">' + g.count + ' kanal</span>';
-      h += '<button class="btn btn-xs" onclick="chGroup=\'' + escHtml(g.name).replace(/'/g, "\\'") + '\';showTab(\'channels\')">Kanallar</button>';
-      h += '<button class="btn btn-xs" onclick="openRenameGrp(\'' + escHtml(g.name).replace(/'/g, "\\'") + '\')">Yeniden Adlandir</button>';
+      h += '<button class="btn btn-xs" onclick="chGroup=\'' + escHtml(g.name).replace(/'/g,"\\'") + '\';showTab(\'channels\')">Kanallar</button>';
+      h += '<button class="btn btn-xs" onclick="openRenameGrp(\'' + escHtml(g.name).replace(/'/g,"\\'") + '\')">Yeniden Adlandir</button>';
       h += '</div>';
     }
     h += '</div>';
@@ -1021,7 +1162,7 @@ function saveGrpOrder() {
   })
   .then(function(r) { return r.json(); })
   .then(function(d) {
-    if (d.success) alert("Grup siralamasi kaydedildi! (" + d.count + " grup)");
+    if (d.success) toast("Grup siralamasi kaydedildi! (" + d.count + " grup)");
   });
 }
 
@@ -1033,7 +1174,7 @@ function openRenameGrp(oldName) {
 function saveRenameGrp() {
   var oldName = document.getElementById("rgOldName").value;
   var newName = document.getElementById("rgNewName").value.trim();
-  if (!newName) { alert("Yeni ad bos olamaz"); return; }
+  if (!newName) { toast("Yeni ad bos olamaz", true); return; }
   fetch("/api/admin/rename-group", {
     method: "POST",
     headers: Object.assign({"Content-Type": "application/json"}, authHeaders()),
@@ -1043,6 +1184,7 @@ function saveRenameGrp() {
   .then(function(d) {
     if (d.success) {
       closeModal("renameGrpModal");
+      toast("Grup yeniden adlandirildi (" + d.affected + " kanal)");
       loadGroups();
       loadChannels();
     }
@@ -1070,7 +1212,7 @@ function saveMoveGrp() {
   var selVal = document.getElementById("mgGrpSelect").value;
   var newVal = document.getElementById("mgNewGrp").value.trim();
   var targetGrp = newVal || selVal;
-  if (!targetGrp) { alert("Grup secin veya yeni ad yazin"); return; }
+  if (!targetGrp) { toast("Grup secin veya yeni ad yazin", true); return; }
   fetch("/api/admin/move-group", {
     method: "POST",
     headers: Object.assign({"Content-Type": "application/json"}, authHeaders()),
@@ -1080,7 +1222,9 @@ function saveMoveGrp() {
   .then(function(d) {
     if (d.success) {
       closeModal("moveGrpModal");
+      toast("Kanal grup degistirildi");
       loadChannels();
+      loadGroups();
     }
   });
 }
@@ -1130,7 +1274,7 @@ function closeModal(id) {
 function saveOverride() {
   var chId = parseInt(document.getElementById("ovChId").value);
   var url = document.getElementById("ovUrl").value.trim();
-  if (!url) { alert("URL bos olamaz"); return; }
+  if (!url) { toast("URL bos olamaz", true); return; }
   fetch("/api/admin/override", {
     method: "POST",
     headers: Object.assign({"Content-Type": "application/json"}, authHeaders()),
@@ -1140,12 +1284,13 @@ function saveOverride() {
   .then(function(d) {
     if (d.success) {
       closeModal("overrideModal");
-      if (currentTab === "channels") loadChannels();
+      toast("Override kaydedildi");
       if (currentTab === "overrides") loadOverrides();
     }
   });
 }
 
+// Init
 document.getElementById("pwdInput").addEventListener("keydown", function(e) {
   if (e.key === "Enter") doLogin();
 });

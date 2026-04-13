@@ -1,7 +1,6 @@
 """
 state.py - VxParser State Management
-Token management, channel resolve, database operations
-Multi-domain fallback, 30min cooldown for failed pings
+v3.2 - Sort order, cache cleanup, logo from catalog, speed optimization
 """
 import sqlite3
 import httpx
@@ -25,8 +24,11 @@ CONFIG = {
         "https://kool.to",
         "https://oha.to"
     ],
-    "APP_VERSION": "3.1.8",
+    "APP_VERSION": "3.2.0",
     "CATALOG_GROUPS": ["Turkey", "Germany"],
+    "RESOLVE_CACHE_TTL": 180,       # 3 min cache
+    "RESOLVE_CACHE_MAX": 500,       # max cached channels
+    "CACHE_CLEANUP_INTERVAL": 300,  # cleanup every 5 min
 }
 
 # ===== GLOBALS =====
@@ -34,15 +36,16 @@ DATA_READY = False
 STARTUP_LOGS = []
 VAVOO_TOKEN = ""
 VAVOO_TOKEN_EXPIRES = 0
-VAVOO_TOKEN_COOLDOWN = 0  # timestamp when cooldown ends
+VAVOO_TOKEN_COOLDOWN = 0
 WATCHED_SIG = ""
 DB_PATH = "/tmp/vxparser.db"
 RESOLVE_CACHE = {}
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin")
 ADMIN_SESSIONS = {}
-CATALOG_DOMAIN = CONFIG["BASE_URLS"][0]  # working catalog domain
-RESOLVE_DOMAIN = CONFIG["BASE_URLS"][0]  # working resolve domain
-LIVE2_DOMAIN = CONFIG["BASE_URLS"][0]    # working live2 domain
+CATALOG_DOMAIN = CONFIG["BASE_URLS"][0]
+RESOLVE_DOMAIN = CONFIG["BASE_URLS"][0]
+LIVE2_DOMAIN = CONFIG["BASE_URLS"][0]
+_last_cache_cleanup = 0
 
 def add_log(msg):
     log.info(msg)
@@ -74,6 +77,13 @@ def init_db():
         ts TEXT,
         msg TEXT
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS sort_order (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS hidden_channels (
+        ch_id INTEGER PRIMARY KEY
+    )""")
     conn.commit()
     conn.close()
 
@@ -90,7 +100,27 @@ def get_all_channels(ordered=True):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
+
     if ordered:
+        # Check if there's a custom sort order
+        c.execute("SELECT value FROM sort_order WHERE key = 'channel'")
+        sort_row = c.fetchone()
+        if sort_row:
+            try:
+                sort_items = json.loads(sort_row[0])
+                sort_map = {}
+                for i, item in enumerate(sort_items):
+                    sort_map[str(item.get("id", ""))] = i
+                # Build custom ORDER BY using CASE
+                channels = c.execute("SELECT * FROM channels").fetchall()
+                channels = [dict(r) for r in channels]
+                channels.sort(key=lambda ch: sort_map.get(str(ch["id"]), 99999))
+                conn.close()
+                return channels
+            except Exception:
+                pass
+
+        # Default sort: group priority + name
         c.execute("""SELECT * FROM channels ORDER BY CASE grp
             WHEN 'TR ULUSAL' THEN 1 WHEN 'TR HABER' THEN 2
             WHEN 'TR BELGESEL' THEN 3 WHEN 'TR COCUK' THEN 4
@@ -112,6 +142,13 @@ def update_channel_hls(ch_id, hls_url):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("UPDATE channels SET hls = ? WHERE id = ?", (hls_url, ch_id))
+    conn.commit()
+    conn.close()
+
+def update_channel_logo(ch_id, logo_url):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE channels SET logo = ? WHERE id = ?", (logo_url, ch_id))
     conn.commit()
     conn.close()
 
@@ -140,9 +177,44 @@ def get_all_overrides():
     conn.close()
     return rows
 
+def get_hidden_channels():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT ch_id FROM hidden_channels")
+    ids = [r[0] for r in c.fetchall()]
+    conn.close()
+    return ids
+
+# ===== CACHE MANAGEMENT =====
+def cleanup_resolve_cache():
+    """Remove expired entries and limit cache size"""
+    global _last_cache_cleanup
+    now = time.time()
+    if now - _last_cache_cleanup < CONFIG["CACHE_CLEANUP_INTERVAL"]:
+        return
+    _last_cache_cleanup = now
+
+    # Remove expired
+    expired = [k for k, v in RESOLVE_CACHE.items() if v.get("expires", 0) <= now]
+    for k in expired:
+        del RESOLVE_CACHE[k]
+
+    # If still too large, remove oldest
+    if len(RESOLVE_CACHE) > CONFIG["RESOLVE_CACHE_MAX"]:
+        sorted_keys = sorted(RESOLVE_CACHE.keys(), key=lambda k: RESOLVE_CACHE[k].get("created", 0))
+        while len(RESOLVE_CACHE) > CONFIG["RESOLVE_CACHE_MAX"]:
+            del RESOLVE_CACHE[sorted_keys.pop(0)]
+
+    if expired:
+        add_log(f"Cache temizlendi: {len(expired)} son kullanilmis, toplam: {len(RESOLVE_CACHE)}")
+
+def clear_resolve_cache():
+    """Clear entire resolve cache"""
+    RESOLVE_CACHE.clear()
+    add_log("Tum resolve cache temizlendi")
+
 # ===== LOKKE SIGNATURE =====
 async def get_watched_sig():
-    """Get mediahubmx-signature from Lokke (POST with full body)"""
     global WATCHED_SIG
     if WATCHED_SIG:
         return WATCHED_SIG
@@ -189,24 +261,18 @@ async def get_watched_sig():
                 add_log(f"Lokke addonSig alindi ({len(sig)} char)")
                 return sig
             else:
-                add_log(f"Lokke: addonSig bulunamadi")
+                add_log("Lokke: addonSig bulunamadi")
     except Exception as e:
         add_log(f"Lokke hata: {e}")
     return ""
 
-# ===== VAVOO TOKEN (with 30min cooldown) =====
+# ===== VAVOO TOKEN =====
 async def get_vavoo_token():
-    """Get Vavoo auth token from ping2 (4-domain fallback + 30min cooldown)"""
     global VAVOO_TOKEN, VAVOO_TOKEN_EXPIRES, VAVOO_TOKEN_COOLDOWN
-
-    # Still valid?
     if VAVOO_TOKEN and time.time() < VAVOO_TOKEN_EXPIRES:
         return VAVOO_TOKEN
-
-    # Cooldown active?
     if time.time() < VAVOO_TOKEN_COOLDOWN:
         return ""
-
     for base_url in CONFIG["BASE_URLS"]:
         try:
             ping_url = base_url + "/api/app/ping2"
@@ -237,35 +303,20 @@ async def get_vavoo_token():
                         VAVOO_TOKEN_COOLDOWN = 0
                         add_log(f"Vavoo token alindi ({base_url})")
                         return token
-                    else:
-                        add_log(f"Vavoo {base_url}: token bos")
-                else:
-                    add_log(f"Vavoo {base_url}: HTTP {r.status_code}")
         except Exception as e:
             add_log(f"Vavoo {base_url}: {e}")
-
-    # All domains failed - set 30min cooldown
     VAVOO_TOKEN_COOLDOWN = time.time() + 1800
     add_log("Vavoo token BASARISIZ - 30dk cooldown aktif")
     return ""
 
 # ===== RESOLVE CHANNEL =====
 async def resolve_channel(ch_id):
-    """
-    Resolve a channel to a playable stream URL.
-    
-    IMPORTANT: live2/play3 URLs return 404 when fetched directly!
-    They MUST be resolved through MediaHubMX resolve endpoint.
-    
-    Priority:
-    1. Override (manual URL)
-    2. Y1: HLS catalog URL + MediaHubMX resolve (addonSig) - BEST
-    3. Y1.5: live2 URL + MediaHubMX resolve (addonSig)
-    4. Y2: live2 URL + direct proxy (likely 404, last resort)
-    """
     ch = get_channel(ch_id)
     if not ch:
         return {"success": False, "error": "Kanal bulunamadi", "channel_id": ch_id}
+
+    # Cleanup cache periodically
+    cleanup_resolve_cache()
 
     # Check override first
     ov = get_override(ch_id)
@@ -277,40 +328,35 @@ async def resolve_channel(ch_id):
     url = ch.get("url", "")
     hls = ch.get("hls", "")
 
-    # Y1: Resolve HLS catalog URL through MediaHubMX (BEST - has proper stream URLs)
+    # Y1: Resolve HLS catalog URL through MediaHubMX (BEST)
     if hls:
-        add_log(f"[{ch_id}] Y1-Resolve deneniyor (catalog HLS): {ch_name}")
+        add_log(f"[{ch_id}] Y1-Resolve: {ch_name}")
         resolved = await resolve_mediahubmx(hls)
         if resolved:
             add_log(f"[{ch_id}] Y1-Resolve BASARILI: {ch_name} -> {resolved[:80]}")
             return {"success": True, "method": f"Y1-Resolve: {ch_name}", "url": resolved, "channel_id": ch_id}
-        add_log(f"[{ch_id}] Y1-Resolve basarisiz: {ch_name}")
 
     # Y1.5: Resolve live2 URL through MediaHubMX
     if url:
-        add_log(f"[{ch_id}] Y1.5-Resolve deneniyor (live2 URL): {ch_name}")
+        add_log(f"[{ch_id}] Y1.5-Resolve: {ch_name}")
         resolved = await resolve_mediahubmx(url)
         if resolved:
             add_log(f"[{ch_id}] Y1.5-Resolve BASARILI: {ch_name} -> {resolved[:80]}")
             return {"success": True, "method": f"Y1.5-Resolve: {ch_name}", "url": resolved, "channel_id": ch_id}
-        add_log(f"[{ch_id}] Y1.5-Resolve basarisiz: {ch_name}")
 
-    # Y2: Direct proxy of live2 URL (likely 404 but try anyway)
+    # Y2: Direct proxy (last resort)
     if url:
-        add_log(f"[{ch_id}] Y2-Direct (son care): {ch_name} - muhtemelen calismaz!")
         return {"success": True, "method": f"Y2-Direct: {ch_name}", "url": url, "channel_id": ch_id}
 
-    return {"success": False, "error": "Resolve edilemedi (HLS yok, URL yok)", "method": "FAILED", "channel_id": ch_id}
+    return {"success": False, "error": "Resolve edilemedi", "method": "FAILED", "channel_id": ch_id}
 
 # ===== MEDIAHUBMX RESOLVE =====
 async def resolve_mediahubmx(url):
-    """Resolve a stream URL via MediaHubMX (multi-domain fallback)"""
     global WATCHED_SIG
     if not WATCHED_SIG:
         WATCHED_SIG = await get_watched_sig()
     if not WATCHED_SIG:
         return None
-
     for domain in CONFIG["BASE_URLS"]:
         try:
             headers = {
@@ -334,19 +380,15 @@ async def resolve_mediahubmx(url):
                         resolved_url = result[0].get("url", "")
                         if resolved_url:
                             return resolved_url
-                else:
-                    add_log(f"Resolve {domain}: HTTP {r.status_code}")
         except Exception as e:
             add_log(f"Resolve {domain}: {e}")
     return None
 
-# ===== CATALOG FETCH (multi-domain) =====
+# ===== CATALOG FETCH =====
 async def fetch_catalog(group, cursor=0):
-    """Fetch MediaHubMX catalog for a group (domain fallback)"""
     global WATCHED_SIG
     if not WATCHED_SIG:
         return {}
-
     for domain in CONFIG["BASE_URLS"]:
         try:
             headers = {
@@ -375,19 +417,14 @@ async def fetch_catalog(group, cursor=0):
                     if isinstance(result, dict) and "items" in result:
                         CATALOG_DOMAIN = domain
                         return result
-                    else:
-                        add_log(f"Catalog {domain}/{group}: unexpected format")
-                else:
-                    add_log(f"Catalog {domain}/{group}: HTTP {r.status_code}")
         except Exception as e:
             add_log(f"Catalog {domain}/{group}: {e}")
     return {}
 
 async def fetch_all_catalog(group_name):
-    """Fetch all pages of a catalog"""
     all_items = []
     cursor = 0
-    for _ in range(50):  # max 50 pages safety
+    for _ in range(50):
         result = await fetch_catalog(group_name, cursor)
         if not result or not isinstance(result, dict):
             break
@@ -403,7 +440,6 @@ async def fetch_all_catalog(group_name):
 
 # ===== CHANNEL FETCHING =====
 async def fetch_channels():
-    """Fetch channels from live2 (domain fallback)"""
     global LIVE2_DOMAIN
     for domain in CONFIG["BASE_URLS"]:
         try:
@@ -424,8 +460,6 @@ async def fetch_channels():
                         LIVE2_DOMAIN = domain
                         add_log(f"live2: {len(channels)} kanal ({domain})")
                         return channels
-                else:
-                    add_log(f"live2 {domain}: HTTP {r.status_code}")
         except Exception as e:
             add_log(f"live2 {domain}: {e}")
     return []
@@ -509,7 +543,7 @@ def clean_name(name):
 # ===== STARTUP SEQUENCE =====
 async def startup_sequence():
     global DATA_READY
-    add_log("=== VxParser Basliyor ===")
+    add_log("=== VxParser v3.2 Basliyor ===")
     init_db()
     add_log("Veritabani hazir")
 
@@ -527,7 +561,7 @@ async def startup_sequence():
     if token:
         add_log("Vavoo token: OK")
     else:
-        add_log("Vavoo token: BASARISIZ (Y3-Direct yine calisir)")
+        add_log("Vavoo token: BASARISIZ (Y1-Resolve yine calisir)")
 
     # 3. Fetch channels
     add_log("Kanallar cekiliyor (live2)...")
@@ -581,9 +615,9 @@ async def startup_sequence():
     conn.close()
     add_log(f"Veritabanina kaydedildi: {len(filtered)} kanal")
 
-    # 6. Try catalog for HLS links (best-effort, non-blocking)
+    # 6. Catalog for HLS links + logos
     if sig:
-        add_log("MediaHubMX catalog deneniyor (best-effort)...")
+        add_log("MediaHubMX catalog deneniyor...")
         try:
             id_lookup = {}
             for ch in filtered:
@@ -595,6 +629,7 @@ async def startup_sequence():
                         id_lookup[sid[:l]] = ch["id"]
 
             total_hls = 0
+            total_logos = 0
             for group_name in CONFIG["CATALOG_GROUPS"]:
                 add_log(f"Catalog: {group_name}...")
                 items = await fetch_all_catalog(group_name)
@@ -603,6 +638,7 @@ async def startup_sequence():
                 for item in items:
                     cat_url = item.get("url", "")
                     cat_name = item.get("name", "")
+                    cat_logo = item.get("logo", "") or item.get("icon", "") or ""
                     if not cat_url:
                         continue
 
@@ -625,12 +661,18 @@ async def startup_sequence():
                                 break
 
                     if matched_id:
+                        # Update HLS link
                         update_channel_hls(matched_id, cat_url)
                         total_hls += 1
+                        # Update logo if we have a better one from catalog
+                        if cat_logo and cat_logo.startswith("http"):
+                            update_channel_logo(matched_id, cat_logo)
+                            total_logos += 1
 
             add_log(f"HLS linkleri: {total_hls} kanal eslesti")
+            add_log(f"Logo guncelleme: {total_logos} kanal")
         except Exception as e:
             add_log(f"Catalog hatasi: {e}")
 
     DATA_READY = True
-    add_log("=== VxParser HAZIR (Y3-Direct aktif) ===")
+    add_log("=== VxParser v3.2 HAZIR ===")

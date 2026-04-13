@@ -1,6 +1,6 @@
 """
-server.py - VxParser Entry Point
-Starts FastAPI + runs startup sequence
+server.py - VxParser Entry Point v3.2
+FastAPI + startup + cache cleanup
 """
 import asyncio
 import logging
@@ -21,7 +21,6 @@ import state
 from video import app
 
 async def run_startup():
-    """Run startup sequence in background"""
     try:
         await state.startup_sequence()
     except Exception as e:
@@ -29,12 +28,22 @@ async def run_startup():
         import traceback
         state.add_log(traceback.format_exc())
 
+async def cache_cleanup_loop():
+    """Periodic cache cleanup to prevent memory issues"""
+    while True:
+        await asyncio.sleep(state.CONFIG["CACHE_CLEANUP_INTERVAL"])
+        try:
+            state.cleanup_resolve_cache()
+        except Exception as e:
+            state.add_log(f"Cache cleanup error: {e}")
+
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(run_startup())
+    asyncio.create_task(cache_cleanup_loop())
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    print(f"VxParser starting on port {port}...")
+    print(f"VxParser v3.2 starting on port {port}...")
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
