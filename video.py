@@ -13,6 +13,20 @@ import secrets
 
 app = FastAPI(title="VxParser")
 
+def get_proxy_headers():
+    """Build headers for proxying to Vavoo CDN - include token if available"""
+    h = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "identity",
+    }
+    # Add Vavoo token as cookie if available
+    if state.VAVOO_TOKEN:
+        h["Cookie"] = f"token={state.VAVOO_TOKEN}"
+    # Set Referer based on URL domain
+    return h
+
 VAVOO_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Referer": "https://vavoo.to/",
@@ -32,29 +46,94 @@ def add_log(msg):
 async def proxy_stream(url, ch_id):
     """Fetch and proxy a stream URL, rewriting HLS segments through self"""
     try:
-        async with httpx.AsyncClient(timeout=20, verify=False, follow_redirects=True) as client:
-            r = await client.get(url, headers=VAVOO_HEADERS)
+        # Build proper headers with Referer matching the URL domain
+        headers = get_proxy_headers()
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        if parsed.hostname:
+            headers["Referer"] = f"{parsed.scheme}://{parsed.hostname}/"
+            headers["Origin"] = f"{parsed.scheme}://{parsed.hostname}"
+
+        add_log(f"[{ch_id}] Proxy fetch: {url[:120]}")
+
+        # First try WITHOUT follow_redirects to see what we get
+        async with httpx.AsyncClient(timeout=15, verify=False, follow_redirects=False) as client:
+            r = await client.get(url, headers=headers)
+
+            # Log response details
+            ct = r.headers.get("content-type", "")
+            add_log(f"[{ch_id}] Upstream: HTTP {r.status_code} | CT: {ct} | Size: {len(r.content)}")
+
+            # Handle redirects manually
+            if r.status_code in (301, 302, 303, 307, 308):
+                location = r.headers.get("location", "")
+                add_log(f"[{ch_id}] Redirect -> {location[:150]}")
+                if location:
+                    if not location.startswith("http"):
+                        base = f"{parsed.scheme}://{parsed.hostname}"
+                        location = base + location
+                    # Follow the redirect
+                    r2 = await client.get(location, headers=headers)
+                    ct2 = r2.headers.get("content-type", "")
+                    add_log(f"[{ch_id}] Redirect target: HTTP {r2.status_code} | CT: {ct2} | Size: {len(r2.content)}")
+                    if r2.status_code == 200:
+                        text = r2.text
+                        final_url = str(r2.url)
+                        return _handle_hls_response(text, final_url, ch_id)
+                    else:
+                        return JSONResponse({"error": f"redirect target HTTP {r2.status_code}", "location": location[:200]}, status_code=502)
+                return JSONResponse({"error": "redirect no location"}, status_code=502)
+
             if r.status_code != 200:
-                return JSONResponse({"error": f"upstream {r.status_code}", "url": url[:100]}, status_code=502)
+                add_log(f"[{ch_id}] Upstream error: {r.text[:300]}")
+                return JSONResponse({"error": f"upstream {r.status_code}", "body": r.text[:200]}, status_code=502)
 
             text = r.text
-            base = url.rsplit("/", 1)[0] + "/"
+            # Check if response looks like HLS
+            if not text.strip().startswith("#"):
+                add_log(f"[{ch_id}] WARNING: Not HLS! First 200: {text[:200]}")
+                # Maybe it's JSON error or HTML
+                if text.strip().startswith("{") or text.strip().startswith("<"):
+                    return JSONResponse({"error": "not HLS", "body": text[:500]}, status_code=502)
 
-            def rewrite(line):
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    return line
-                if line.startswith("http"):
-                    return f"/channel/{ch_id}/stream?url={line}"
-                abs_url = base + line if not line.startswith("/") else f"https://vavoo.to{line}"
-                return f"/channel/{ch_id}/stream?url={abs_url}"
+            final_url = str(r.url)
+            return _handle_hls_response(text, final_url, ch_id)
 
-            rewritten = "\n".join(rewrite(l) for l in text.split("\n"))
-            return PlainTextResponse(rewritten, media_type="application/vnd.apple.mpegurl")
     except httpx.TimeoutException:
+        add_log(f"[{ch_id}] Proxy TIMEOUT")
         return JSONResponse({"error": "timeout"}, status_code=504)
     except Exception as e:
+        add_log(f"[{ch_id}] Proxy ERROR: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+def _handle_hls_response(text, base_url, ch_id):
+    """Parse HLS playlist and rewrite segment URLs through our proxy"""
+    base = base_url.rsplit("/", 1)[0] + "/"
+
+    # Detect if master playlist (has #EXT-X-STREAM-INF) or media playlist
+    lines = text.split("\n")
+    is_master = any("#EXT-X-STREAM-INF" in l for l in lines)
+
+    rewritten = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            rewritten.append(line)
+        elif stripped.startswith("http"):
+            rewritten.append(f"/channel/{ch_id}/stream?url={stripped}")
+        else:
+            # Relative URL
+            abs_url = base + stripped if not stripped.startswith("/") else base.split("://", 1)[0] + "://" + base.split("://", 1)[1].split("/")[0] + stripped
+            rewritten.append(f"/channel/{ch_id}/stream?url={abs_url}")
+
+    result = "\n".join(rewritten)
+
+    # Log a summary
+    seg_count = sum(1 for l in lines if l.strip() and not l.strip().startswith("#"))
+    add_log(f"[{ch_id}] HLS OK: {len(lines)} lines, {seg_count} segments, master={is_master}")
+
+    return PlainTextResponse(result, media_type="application/vnd.apple.mpegurl")
 
 # ===== M3U BUILD =====
 def build_m3u(host):
@@ -130,32 +209,56 @@ async def channel_stream(ch_id: int):
 
 @app.get("/channel/{ch_id}/stream")
 async def channel_substream(ch_id: int, url: str):
-    """Proxy sub-segments for HLS"""
+    """Proxy sub-segments/variant playlists for HLS"""
     if not url:
         return JSONResponse({"error": "no url"}, status_code=400)
     try:
-        async with httpx.AsyncClient(timeout=20, verify=False, follow_redirects=True) as client:
-            r = await client.get(url, headers=VAVOO_HEADERS)
+        headers = get_proxy_headers()
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        if parsed.hostname:
+            headers["Referer"] = f"{parsed.scheme}://{parsed.hostname}/"
+            headers["Origin"] = f"{parsed.scheme}://{parsed.hostname}"
+
+        async with httpx.AsyncClient(timeout=15, verify=False, follow_redirects=True) as client:
+            r = await client.get(url, headers=headers)
             if r.status_code != 200:
-                return JSONResponse({"error": f"upstream {r.status_code}"}, status_code=502)
+                add_log(f"[{ch_id}] Seg error: HTTP {r.status_code} for {url[:100]}")
+                return JSONResponse({"error": f"upstream {r.status_code}", "url": url[:100]}, status_code=502)
+
             content_type = r.headers.get("content-type", "")
+
+            # If it's another m3u8 (variant playlist), rewrite and return as HLS
             if "mpegurl" in content_type or ".m3u8" in url:
                 text = r.text
-                base = url.rsplit("/", 1)[0] + "/"
+                final_url = str(r.url)
+                base = final_url.rsplit("/", 1)[0] + "/"
                 def rewrite(line):
                     line = line.strip()
                     if not line or line.startswith("#"):
                         return line
                     if line.startswith("http"):
                         return f"/channel/{ch_id}/stream?url={line}"
-                    abs_url = base + line if not line.startswith("/") else f"https://vavoo.to{line}"
+                    abs_url = base + line if not line.startswith("/") else base.split("://", 1)[0] + "://" + base.split("://", 1)[1].split("/")[0] + line
                     return f"/channel/{ch_id}/stream?url={abs_url}"
                 rewritten = "\n".join(rewrite(l) for l in text.split("\n"))
                 return PlainTextResponse(rewritten, media_type="application/vnd.apple.mpegurl")
-            return StreamingResponse(iter([r.content]), media_type=content_type or "video/MP2T", headers={"Content-Length": str(len(r.content))})
+
+            # Binary segment (.ts, .aac, etc.)
+            ct = content_type or "video/MP2T"
+            return StreamingResponse(
+                iter([r.content]),
+                media_type=ct,
+                headers={
+                    "Content-Length": str(len(r.content)),
+                    "Cache-Control": "max-age=2",
+                }
+            )
     except httpx.TimeoutException:
+        add_log(f"[{ch_id}] Seg TIMEOUT: {url[:100]}")
         return JSONResponse({"error": "timeout"}, status_code=504)
     except Exception as e:
+        add_log(f"[{ch_id}] Seg ERROR: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
 # ===== API ROUTES =====
@@ -233,6 +336,60 @@ async def reload():
         asyncio.create_task(state.startup_sequence())
         return JSONResponse({"status": "reloading"})
     return JSONResponse({"status": "already_ready"})
+
+@app.get("/debug/{ch_id}")
+async def debug_channel(ch_id: int):
+    """Debug endpoint: fetch upstream URL and show raw response"""
+    ch = state.get_channel(ch_id)
+    if not ch:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    url = ch.get("url", "")
+    hls = ch.get("hls", "")
+    result = {
+        "channel_id": ch_id,
+        "name": ch.get("name", ""),
+        "url_field": url,
+        "hls_field": hls,
+    }
+
+    # Try fetching the URL directly
+    test_url = url if url else hls
+    if not test_url:
+        return JSONResponse({**result, "error": "No URL"})
+
+    try:
+        headers = get_proxy_headers()
+        from urllib.parse import urlparse
+        parsed = urlparse(test_url)
+        if parsed.hostname:
+            headers["Referer"] = f"{parsed.scheme}://{parsed.hostname}/"
+
+        # Don't follow redirects to see the chain
+        async with httpx.AsyncClient(timeout=15, verify=False, follow_redirects=False) as client:
+            r = await client.get(test_url, headers=headers)
+            result["status_code"] = r.status_code
+            result["content_type"] = r.headers.get("content-type", "")
+            result["content_length"] = len(r.content)
+            result["headers"] = dict(r.headers)
+            result["body_preview"] = r.text[:1000]
+
+            if r.status_code in (301, 302, 303, 307, 308):
+                result["redirect_location"] = r.headers.get("location", "")
+                # Follow redirect once
+                loc = result["redirect_location"]
+                if loc:
+                    if not loc.startswith("http"):
+                        loc = f"{parsed.scheme}://{parsed.hostname}{loc}"
+                    r2 = await client.get(loc, headers=headers)
+                    result["redirect_status"] = r2.status_code
+                    result["redirect_ct"] = r2.headers.get("content-type", "")
+                    result["redirect_body"] = r2.text[:1000]
+                    result["final_url"] = str(r2.url)
+    except Exception as e:
+        result["fetch_error"] = str(e)
+
+    return JSONResponse(result)
 
 # ===== ADMIN API =====
 
