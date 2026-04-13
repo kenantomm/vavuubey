@@ -592,8 +592,8 @@ function filterChannels(){
   const tb=document.getElementById('chBody');
   tb.innerHTML=list.slice(0,500).map(c=>{
     const badge=c.has_hls?'<span class="badge hls">HLS</span>':(c.url?'<span class="badge auth">URL</span>':'<span class="badge none">YOK</span>');
-    const logo=c.logo?'<img class="logo-img" src="'+c.logo+'" onerror="this.style.display=\'none\'">':'<div class="logo-img"></div>';
-    return '<tr><td>'+c.lid+'</td><td>'+logo+'</td><td>'+c.name+'</td><td>'+c.grp+'</td><td>'+badge+'</td><td><button class="btn-sm" onclick="openTest('+c.lid+',\''+c.name.replace(/'/g,"")+'\')">Test</button></td></tr>';
+    const logo=c.logo?'<img class="logo-img" src="'+c.logo+'">':'<div class="logo-img"></div>';
+    return `<tr><td>${c.lid}</td><td>${logo}</td><td>${c.name}</td><td>${c.grp}</td><td>${badge}</td><td><button class="btn-sm" onclick="openTest(${c.lid},this.dataset.n)" data-n="${c.name.replace(/"/g,'&quot;')}">Test</button></td></tr>`;
   }).join('');
 }
 
