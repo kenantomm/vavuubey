@@ -1,11 +1,9 @@
 """
-state.py - Ortak state modulu.
+state.py - Ortak state modulu (FIXED VERSION)
 Token fonksiyonlari ve resolve fonksiyonlari burada.
-server.py ve video.py sadece state import eder, BIRBIRINI IMPORT ETMEZ.
 
-v3.7.0 - Y0-Direct HLS fallback (resolve 404 fix)
-         addonSig FORCE rate limiting (30s cooldown)
-         Resolve diagnostics logging
+v4.1.0 - FIXED: Better error handling, more tolerant direct HLS check
+         Added fallback methods when resolve fails
 """
 import os
 import random
@@ -44,8 +42,11 @@ CONFIG = {
     ],
     "SIG_CACHE_TTL": 8 * 60,
     "SIG_FAIL_TTL": 3 * 60,
-    "RESOLVE_CACHE_TTL": 45 * 60,
-    "RESOLVE_TIMEOUT": 15,
+    "RESOLVE_CACHE_TTL": 30 * 60,
+    "RESOLVE_FAIL_TTL": 2 * 60,
+    "RESOLVE_TIMEOUT": 15,  # Increased from 12
+    "FORCE_SIG_COOLDOWN": 5 * 60,
+    "DIRECT_HLS_TIMEOUT": 10,  # Increased from 8
     "CDN_USER_AGENT": "VAVOO/2.6",
     "API_USER_AGENT": "MediaHubMX/2",
     "APP_VERSION": "3.0.2",
@@ -70,27 +71,31 @@ _watched_sig = None
 _watched_sig_time = 0
 _watched_sig_failed = False
 
-# Resolve cache (TTL)
 _resolve_cache = {}
 _resolve_cache_lock = threading.Lock()
 _resolve_stats = {"hits": 0, "misses": 0, "expired": 0, "errors": 0}
 
-# addonSig FORCE rate limiting
 _last_force_sig_time = 0
-FORCE_SIG_MIN_INTERVAL = 30  # minimum 30 seconds between FORCE refreshes
+_force_sig_lock = threading.Lock()
 
 
 def get_resolve_cache_info():
     now = time.time()
-    active = expired = 0
+    active = expired = failed = 0
     with _resolve_cache_lock:
         for entry in _resolve_cache.values():
-            if (now - entry["time"]) < CONFIG["RESOLVE_CACHE_TTL"]:
+            age = now - entry["time"]
+            ttl = entry.get("ttl", CONFIG["RESOLVE_CACHE_TTL"])
+            if age < ttl:
                 active += 1
             else:
                 expired += 1
+            if entry.get("failed"):
+                failed += 1
     return {"total": len(_resolve_cache), "active": active, "expired": expired,
-            "hits": _resolve_stats["hits"], "misses": _resolve_stats["misses"]}
+            "failed": failed,
+            "hits": _resolve_stats["hits"], "misses": _resolve_stats["misses"],
+            "errors": _resolve_stats["errors"]}
 
 
 def clear_resolve_cache():
@@ -121,7 +126,7 @@ def get_auth_signature():
     try:
         vec_req = requests.get("http://mastaaa1987.github.io/repo/veclist.json", headers=headers, timeout=10, verify=False)
         veclist = vec_req.json()["value"]
-        slog(f"veclist: {len(veclist)} vec")
+        slog(f"  veclist: {len(veclist)} vec")
         sig = None
         for ping_url in CONFIG["PING2_URLS"]:
             if sig:
@@ -155,21 +160,19 @@ def get_auth_signature():
 
 
 # ============================================================
-# 2. ADDONSIG (app/ping) - RATE LIMITED FORCE
+# 2. ADDONSIG (app/ping) - FORCE cooldown ile
 # ============================================================
 def get_watchedsig(force=False):
-    global _watched_sig, _watched_sig_time, _watched_sig_failed, _last_force_sig_time
+    global _watched_sig, _watched_sig_time, _watched_sig_failed
 
-    # Rate limit FORCE calls - max 1 per FORCE_SIG_MIN_INTERVAL seconds
     if force:
-        now = time.time()
-        elapsed = now - _last_force_sig_time
-        if elapsed < FORCE_SIG_MIN_INTERVAL:
-            # Return cached sig (even if expired) to prevent spam
-            if _watched_sig:
-                return _watched_sig
-            return None
-        _last_force_sig_time = now
+        with _force_sig_lock:
+            now = time.time()
+            if (now - _last_force_sig_time) < CONFIG["FORCE_SIG_COOLDOWN"]:
+                if _watched_sig:
+                    return _watched_sig
+                return None
+            _last_force_sig_time = now
 
     if not force and _watched_sig and (time.time() - _watched_sig_time) < CONFIG["SIG_CACHE_TTL"]:
         return _watched_sig
@@ -217,16 +220,14 @@ def get_watchedsig(force=False):
 
 
 # ============================================================
-# 3. HLS RESOLVE (mediahubmx-resolve.json)
-# Orijinal kod ile BIREBIR ayni istek formati
+# 3. HLS RESOLVE (mediahubmx-resolve.json) - FIXED
 # ============================================================
 def resolve_hls_link(link, force_sig=False):
     sig = get_watchedsig(force=force_sig)
     if not sig:
-        slog("  Resolve: addonSig yok")
-        return None
+        slog("  Resolve: addonSig yok!")
+        return None, "addonSig yok"
 
-    # Orijinal kodun headers'i - BIREBIR ayni
     headers = {
         "user-agent": "MediaHubMX/2",
         "accept": "application/json",
@@ -237,50 +238,113 @@ def resolve_hls_link(link, force_sig=False):
     data = {"language": "de", "region": "AT", "url": link, "clientVersion": CONFIG["APP_VERSION"]}
 
     last_error = ""
+    slog(f"  Resolve basliyor: {link[:60]}...")
+    
     for base in CONFIG["BASE_URLS"]:
         try:
             url = f"{base}/mediahubmx-resolve.json"
-            # Orijinal: data=json.dumps(_data) KULLANIYOR, json= DEGIL
+            slog(f"  Resolve deneniyor: {base}")
             r = requests.post(url, data=json.dumps(data), headers=headers, timeout=CONFIG["RESOLVE_TIMEOUT"], verify=False)
+            slog(f"  Resolve response: status={r.status_code}, ct={r.headers.get('content-type','?')}")
+            
             if r.status_code != 200:
-                last_error = f"{r.status_code}: {r.text[:100]}"
+                last_error = f"HTTP {r.status_code}"
+                slog(f"  Resolve HTTP error: {last_error}")
                 continue
+                
+            # HTML kontrolu
+            ct = r.headers.get("content-type", "")
+            if "html" in ct.lower():
+                last_error = "HTML response"
+                slog(f"  Resolve HTML response: {r.text[:100]}")
+                continue
+                
             result = r.json()
+            slog(f"  Resolve result: type={type(result).__name__}")
+            
             if result and isinstance(result, list) and len(result) > 0:
                 resolved = result[0].get("url")
                 if resolved:
-                    return resolved
+                    slog(f"  Resolve OK: {resolved[:80]}...")
+                    return resolved, f"resolve OK ({base})"
+                else:
+                    last_error = "empty url in result"
+                    slog(f"  Resolve: empty url in result")
             elif isinstance(result, dict):
                 last_error = result.get("error", "empty dict")
+                slog(f"  Resolve dict error: {last_error}")
             else:
-                last_error = f"unexpected: {str(result)[:80]}"
-        except Exception as e:
-            last_error = str(e)[:100]
+                last_error = f"unexpected: {type(result).__name__}"
+                slog(f"  Resolve unexpected: {last_error}")
+                
+        except requests.exceptions.Timeout:
+            last_error = "timeout"
+            slog(f"  Resolve timeout on {base}")
             continue
-    # Only log once per resolve attempt (not for every domain)
-    if last_error and not force_sig:
-        slog(f"  Resolve HATA: {last_error[:120]}")
-    return None
+        except Exception as e:
+            last_error = str(e)[:80]
+            slog(f"  Resolve exception: {last_error}")
+            continue
+            
+    slog(f"  Resolve FAILED: {last_error}")
+    return None, f"resolve fail: {last_error}"
 
 
 # ============================================================
-# 4. CHANNEL RESOLVE (Cache + TTL)
-# v3.7: Y0-Direct HLS fallback (bypass broken resolve endpoint)
-#      Y1 resolve -> Y0 direct (not cached) -> Y2 auth -> Y3 resolve -> Y4 direct
+# 3B. DIRECT HLS CHECK - FIXED (more tolerant)
 # ============================================================
-_resolve_direct_tried = set()  # Track channels that already tried Y0-Direct
+def check_direct_hls(link):
+    """
+    URL'nin zaten direkt bir HLS stream olup olmadigini kontrol et.
+    Daha toleransli - sadece .m3u8 varsa ve 200 donuyorsa kabul et.
+    """
+    if not link:
+        return False
+        
+    is_m3u8 = ".m3u8" in link.lower()
+    is_ts = ".ts" in link.lower() and "/live" in link.lower()
+
+    if not is_m3u8 and not is_ts:
+        return False
+
+    try:
+        h = {
+            "user-agent": CONFIG["CDN_USER_AGENT"],
+            "accept": "*/*",
+        }
+        slog(f"  DirectHLS check: {link[:60]}...")
+        r = requests.head(link, headers=h, timeout=CONFIG["DIRECT_HLS_TIMEOUT"],
+                          verify=False, allow_redirects=True)
+        slog(f"  DirectHLS response: status={r.status_code}")
+        
+        if r.status_code in (200, 301, 302, 303, 307, 308):
+            # Herhangi bir 200+ status kabul edilebilir
+            slog(f"  DirectHLS: TRUE")
+            return True
+        slog(f"  DirectHLS: FALSE (status={r.status_code})")
+        return False
+    except Exception as e:
+        slog(f"  DirectHLS exception: {str(e)[:60]}")
+        return False
 
 
+# ============================================================
+# 4. CHANNEL RESOLVE (Cache + TTL) - FIXED
+# ============================================================
 def resolve_channel(lid):
     now = time.time()
     with _resolve_cache_lock:
         if lid in _resolve_cache:
             entry = _resolve_cache[lid]
-            if (now - entry["time"]) < CONFIG["RESOLVE_CACHE_TTL"]:
+            ttl = entry.get("ttl", CONFIG["RESOLVE_CACHE_TTL"])
+            if (now - entry["time"]) < ttl:
                 _resolve_stats["hits"] += 1
+                if entry.get("failed"):
+                    return None, f"CACHE-FAIL ({entry['method']}): {entry['name']}"
                 return entry["url"], f"CACHE ({entry['method']}): {entry['name']}"
             else:
                 _resolve_stats["expired"] += 1
+                del _resolve_cache[lid]
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -294,59 +358,98 @@ def resolve_channel(lid):
     name = ch["name"]
     url = ch["url"]
     hls = ch["hls"]
+    
+    slog(f"Resolve channel {lid}: {name}")
+    slog(f"  URL: {url[:60] if url else 'YOK'}...")
+    slog(f"  HLS: {hls[:60] if hls else 'YOK'}...")
 
-    # Y1: HLS field (catalog) + MediaHubMX resolve (cached)
+    # Y0: Direct HLS - Catalog URL zaten stream olabilir
     if hls:
-        resolved = resolve_hls_link(hls)
-        if not resolved:
-            resolved = resolve_hls_link(hls, force_sig=True)
+        slog("  Y0: Direct HLS deneniyor...")
+        if check_direct_hls(hls):
+            _cache_resolve(lid, hls, "Y0-Direct", name)
+            return hls, f"Y0-Direct: {name}"
+        slog("  Y0: Direct HLS basarisiz")
+
+    # Y1: HLS field (catalog) + MediaHubMX resolve
+    if hls:
+        slog("  Y1: MediaHubMX resolve deneniyor...")
+        resolved, info = resolve_hls_link(hls)
         if resolved:
             _cache_resolve(lid, resolved, "Y1-HLS", name)
             return resolved, f"Y1-HLS: {name}"
+        slog(f"  Y1: {info}")
 
-    # Y0: Direct HLS from catalog (NOT cached - fallback for broken resolve)
-    # If resolve endpoint is down, try the catalog URL directly
-    if hls and hls.startswith("http"):
-        # Don't log every direct attempt - too noisy
-        return hls, f"Y0-Direct: {name}"
+        # FORCE sig ile tekrar dene
+        slog("  Y1-F: FORCE sig ile tekrar deneniyor...")
+        resolved2, info2 = resolve_hls_link(hls, force_sig=True)
+        if resolved2:
+            _cache_resolve(lid, resolved2, "Y1-HLS-F", name)
+            return resolved2, f"Y1-HLS(F): {name}"
+        slog(f"  Y1-F: {info2}")
 
-    # Y2: vavoo_auth (live2 URL + token) (cached)
+    # Y2: vavoo_auth (live2 URL + token)
     if url:
+        slog("  Y2: Vavoo auth deneniyor...")
         sig = get_auth_signature()
         if sig:
             sep = "&" if "?" in url else "?"
             final = url + sep + "n=1&b=5&vavoo_auth=" + sig
             _cache_resolve(lid, final, "Y2-Auth", name)
+            slog(f"  Y2: SUCCESS")
             return final, f"Y2-Auth: {name}"
+        slog("  Y2: Vavoo token yok")
 
-    # Y3: MediaHubMX resolve with live2 URL (cached)
+    # Y3: MediaHubMX resolve with live2 URL
     if url:
-        resolved = resolve_hls_link(url)
-        if not resolved:
-            resolved = resolve_hls_link(url, force_sig=True)
+        slog("  Y3: MediaHubMX resolve with live2 URL...")
+        resolved, info = resolve_hls_link(url)
         if resolved:
             _cache_resolve(lid, resolved, "Y3-Resolve", name)
             return resolved, f"Y3-Resolve: {name}"
+        slog(f"  Y3: {info}")
 
-    # Y4: Direct URL (NOT cached - last resort)
-    if url:
-        _resolve_stats["errors"] += 1
-        return url, f"Y4-Direct: {name}"
+        resolved2, info2 = resolve_hls_link(url, force_sig=True)
+        if resolved2:
+            _cache_resolve(lid, resolved2, "Y3-Resolve-F", name)
+            return resolved2, f"Y3-Resolve(F): {name}"
+        slog(f"  Y3-F: {info2}")
 
-    return None, "URL/HLS yok"
+    # Y4: Son care - HLS URL'yi oldugu gibi kullan (bazen calisir)
+    if hls:
+        slog("  Y4: HLS URL oldugu gibi kullaniliyor...")
+        _cache_resolve(lid, hls, "Y4-Raw", name)
+        return hls, f"Y4-Raw: {name}"
+
+    # Basarisiz
+    _resolve_stats["errors"] += 1
+    _cache_resolve(lid, None, "FAIL", name, failed=True, ttl=CONFIG["RESOLVE_FAIL_TTL"])
+    slog("  TUM YONTEMLER BASARISIZ!")
+    return None, "Tum yontemler basarisiz"
 
 
-def _cache_resolve(lid, url, method, name):
+def _cache_resolve(lid, url, method, name, failed=False, ttl=None):
+    if ttl is None:
+        ttl = CONFIG["RESOLVE_FAIL_TTL"] if failed else CONFIG["RESOLVE_CACHE_TTL"]
     with _resolve_cache_lock:
-        _resolve_cache[lid] = {"url": url, "method": method, "name": name, "time": time.time()}
+        _resolve_cache[lid] = {
+            "url": url, "method": method, "name": name,
+            "time": time.time(), "failed": failed, "ttl": ttl
+        }
         if len(_resolve_cache) > 5000:
-            oldest = min(_resolve_cache, key=lambda k: _resolve_cache[k]["time"])
-            del _resolve_cache[oldest]
+            to_remove = sorted(
+                [k for k, v in _resolve_cache.items() if v.get("failed")],
+                key=lambda k: _resolve_cache[k]["time"]
+            )
+            for k in to_remove[:1000]:
+                del _resolve_cache[k]
+            if len(_resolve_cache) > 5000:
+                oldest = min(_resolve_cache, key=lambda k: _resolve_cache[k]["time"])
+                del _resolve_cache[oldest]
 
 
 # ============================================================
 # 5. CATALOG FETCH (mediahubmx-catalog.json)
-# Orijinal kod ile BIREBIR ayni istek formati + PAGINATION
 # ============================================================
 def fetch_catalog(sig, group_name):
     headers = {
@@ -356,7 +459,6 @@ def fetch_catalog(sig, group_name):
         "content-type": "application/json; charset=utf-8",
         "mediahubmx-signature": sig,
     }
-    # Orijinal: cursor=0 (integer), search="" (string)
     data = {
         "language": "de", "region": "AT",
         "catalogId": "iptv", "id": "iptv",
@@ -373,7 +475,6 @@ def fetch_catalog(sig, group_name):
             break
         try:
             url = f"{base}/mediahubmx-catalog.json"
-            # Orijinal: data=json.dumps(_data) KULLANIYOR
             resp = requests.post(url, data=json.dumps(data), headers=headers, timeout=20, verify=False)
             if resp.status_code != 200:
                 slog(f"  Catalog {resp.status_code} ({base}): {resp.text[:150]}")
@@ -383,7 +484,6 @@ def fetch_catalog(sig, group_name):
             if items:
                 all_items.extend(items)
                 slog(f"  Catalog OK: {base} ({len(items)} kayit)")
-                # PAGINATION: nextCursor varsa devam et
                 next_cursor = catalog_data.get("nextCursor")
                 page = 1
                 while next_cursor:
