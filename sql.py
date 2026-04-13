@@ -1,3 +1,0 @@
-# helper/sql.py
-
-epg = []
