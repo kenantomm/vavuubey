@@ -3,8 +3,9 @@ state.py - Ortak state modulu.
 Token fonksiyonlari ve resolve fonksiyonlari burada.
 server.py ve video.py sadece state import eder, BIRBIRINI IMPORT ETMEZ.
 
-v3.5.0 - Catalog/Resolve orijinal kod ile birebir eslestirildi
-         Catalog pagination (nextCursor) destegi eklendi
+v3.6.0 - Resolve logging eklendi
+         Catalog isim eslestirme icin normalize destek
+         Resolve hata mesajlari detaylandirildi
 """
 import os
 import random
@@ -206,6 +207,7 @@ def get_watchedsig(force=False):
 def resolve_hls_link(link, force_sig=False):
     sig = get_watchedsig(force=force_sig)
     if not sig:
+        slog("  Resolve: addonSig yok")
         return None
 
     # Orijinal kodun headers'i - BIREBIR ayni
@@ -218,18 +220,29 @@ def resolve_hls_link(link, force_sig=False):
     }
     data = {"language": "de", "region": "AT", "url": link, "clientVersion": CONFIG["APP_VERSION"]}
 
+    last_error = ""
     for base in CONFIG["BASE_URLS"]:
         try:
             url = f"{base}/mediahubmx-resolve.json"
             # Orijinal: data=json.dumps(_data) KULLANIYOR, json= DEGIL
             r = requests.post(url, data=json.dumps(data), headers=headers, timeout=CONFIG["RESOLVE_TIMEOUT"], verify=False)
+            if r.status_code != 200:
+                last_error = f"{r.status_code}: {r.text[:100]}"
+                continue
             result = r.json()
             if result and isinstance(result, list) and len(result) > 0:
                 resolved = result[0].get("url")
                 if resolved:
                     return resolved
-        except Exception:
+            elif isinstance(result, dict):
+                last_error = result.get("error", "empty dict")
+            else:
+                last_error = f"unexpected: {str(result)[:80]}"
+        except Exception as e:
+            last_error = str(e)[:100]
             continue
+    if last_error:
+        slog(f"  Resolve HATA: {last_error}")
     return None
 
 
@@ -260,7 +273,7 @@ def resolve_channel(lid):
     url = ch["url"]
     hls = ch["hls"]
 
-    # Y1: HLS field + resolve
+    # Y1: HLS field (catalog) + MediaHubMX resolve
     if hls:
         resolved = resolve_hls_link(hls)
         if not resolved:
@@ -269,16 +282,7 @@ def resolve_channel(lid):
             _cache_resolve(lid, resolved, "Y1-HLS", name)
             return resolved, f"Y1-HLS: {name}"
 
-    # Y1.5: URL field + resolve
-    if url:
-        resolved = resolve_hls_link(url)
-        if not resolved:
-            resolved = resolve_hls_link(url, force_sig=True)
-        if resolved:
-            _cache_resolve(lid, resolved, "Y1.5-URL", name)
-            return resolved, f"Y1.5-URL: {name}"
-
-    # Y2: vavoo_auth
+    # Y2: vavoo_auth (live2 URL + token)
     if url:
         sig = get_auth_signature()
         if sig:
@@ -287,12 +291,21 @@ def resolve_channel(lid):
             _cache_resolve(lid, final, "Y2-Auth", name)
             return final, f"Y2-Auth: {name}"
 
-    # Y3: Direct
+    # Y3: MediaHubMX resolve with live2 URL (son carek)
+    if url:
+        resolved = resolve_hls_link(url)
+        if not resolved:
+            resolved = resolve_hls_link(url, force_sig=True)
+        if resolved:
+            _cache_resolve(lid, resolved, "Y3-Resolve", name)
+            return resolved, f"Y3-Resolve: {name}"
+
+    # Y4: Direct URL (son sans)
     if url:
         _resolve_stats["errors"] += 1
-        return url, f"Y3-Direct: {name}"
+        return url, f"Y4-Direct: {name}"
 
-    return None, "URL yok"
+    return None, "URL/HLS yok"
 
 
 def _cache_resolve(lid, url, method, name):
