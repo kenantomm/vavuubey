@@ -50,6 +50,13 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/ping")
+@app.get("/pong")
+async def ping_pong():
+    """UptimeRobot / cron keep-alive endpoint. Render uyumasin!"""
+    return {"status": "pong", "ready": state.DATA_READY}
+
+
 # ============================================================
 # API STATUS (Xtream uyumlu)
 # ============================================================

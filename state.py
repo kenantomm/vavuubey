@@ -19,8 +19,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 CONFIG = {
     # addonSig (MediaHubMX imzasi) almak icin ping endpointleri
     "PING_URLS": [
-        "https://www.lokke.app/api/app/ping",
         "https://www.vavoo.tv/api/app/ping",
+        "https://www.lokke.app/api/app/ping",
     ],
     # API cagrilari icin base URL'ler (fallback sirasiyla)
     "BASE_URLS": [
@@ -42,8 +42,9 @@ CONFIG = {
         "https://oha.to/live2/index?output=json",
     ],
     # Cache suresi (sn)
-    "SIG_CACHE_TTL": 8 * 60,        # 8 dakika
-    "RESOLVE_TIMEOUT": 15,          # 15 saniye
+    "SIG_CACHE_TTL": 8 * 60,         # 8 dakika (basarili)
+    "SIG_FAIL_TTL": 30 * 60,         # 30 dakika (basarisiz - sonsuz donguyu onle)
+    "RESOLVE_TIMEOUT": 15,           # 15 saniye
     "CDN_USER_AGENT": "VAVOO/2.6",
     "API_USER_AGENT": "MediaHubMX/2",
     "APP_VERSION": "3.1.8",
@@ -64,8 +65,10 @@ PORT = 10000
 # Token cache
 _vavoo_sig = None
 _vavoo_sig_time = 0
+_vavoo_sig_failed = False     # HATA durumunda cache
 _watched_sig = None
 _watched_sig_time = 0
+_watched_sig_failed = False   # HATA durumunda cache
 
 
 def slog(msg):
@@ -76,50 +79,18 @@ def slog(msg):
 
 
 # ============================================================
-# YARDIMCI: URL dene (fallback)
-# ============================================================
-def _try_urls(url_list, method="GET", headers=None, json_data=None, form_data=None, timeout=15, key_to_check=None):
-    """
-    Birden fazla URL'yi sirayla dener. Ilk basarili sonucu dondurur.
-    Returns: (response_json_or_text, success, tried_url)
-    """
-    for url in url_list:
-        try:
-            if method == "GET":
-                r = requests.get(url, headers=headers, timeout=timeout, verify=False)
-            elif method == "POST_JSON":
-                r = requests.post(url, json=json_data, headers=headers, timeout=timeout, verify=False)
-            elif method == "POST_FORM":
-                r = requests.post(url, data=form_data, headers=headers, timeout=timeout, verify=False)
-            else:
-                continue
-
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                    if key_to_check:
-                        if data.get(key_to_check):
-                            return data, True, url
-                        else:
-                            slog(f"  {url} -> 200 ama '{key_to_check}' yok, keys={list(data.keys())[:5]}")
-                    else:
-                        return data, True, url
-                except:
-                    return r.text, True, url
-            else:
-                slog(f"  {url} -> status={r.status_code}")
-        except Exception as e:
-            slog(f"  {url} -> HATA: {str(e)[:80]}")
-    return None, False, ""
-
-
-# ============================================================
 # 1. VAVOO TOKEN (ping2) - vavoo_auth icin
 # ============================================================
 def get_auth_signature():
-    global _vavoo_sig, _vavoo_sig_time
+    global _vavoo_sig, _vavoo_sig_time, _vavoo_sig_failed
+
+    # Basarili cache
     if _vavoo_sig and (time.time() - _vavoo_sig_time) < CONFIG["SIG_CACHE_TTL"]:
         return _vavoo_sig
+
+    # BASARISIZ cache - 30 dk boyunca tekrar deneme (sonsuz donguyu onle!)
+    if _vavoo_sig_failed and (time.time() - _vavoo_sig_time) < CONFIG["SIG_FAIL_TTL"]:
+        return None
 
     slog("Vavoo Token (ping2) aliniyor...")
     headers = {"User-Agent": CONFIG["CDN_USER_AGENT"], "Accept": "application/json"}
@@ -129,11 +100,9 @@ def get_auth_signature():
         slog(f"veclist: {len(veclist)} vec")
 
         sig = None
-        # Tum ping2 URL'lerini dene
         for ping_url in CONFIG["PING2_URLS"]:
             if sig:
                 break
-            slog(f"  Deneniyor: {ping_url}")
             for i in range(3):
                 vec = {"vec": random.choice(veclist)}
                 try:
@@ -142,17 +111,24 @@ def get_auth_signature():
                         sig = req["signed"]
                         slog(f"  Token alindi: {ping_url}")
                         break
-                except Exception as e:
+                except Exception:
                     continue
 
+        # Cache sonucu
+        _vavoo_sig_time = time.time()
         if sig:
             _vavoo_sig = sig
-            _vavoo_sig_time = time.time()
+            _vavoo_sig_failed = False
             slog("Vavoo Token alindi!")
             return sig
         else:
-            slog("Vavoo Token ALINAMADI (tum URL'ler denendi)")
+            _vavoo_sig = None
+            _vavoo_sig_failed = True
+            slog(f"Vavoo Token ALINAMADI (30dk bekleyecek)")
     except Exception as e:
+        _vavoo_sig = None
+        _vavoo_sig_failed = True
+        _vavoo_sig_time = time.time()
         slog(f"Vavoo Token HATASI: {e}")
     return None
 
@@ -161,9 +137,15 @@ def get_auth_signature():
 # 2. ADDONSIG (app/ping) - MediaHubMX imzasi icin
 # ============================================================
 def get_watchedsig():
-    global _watched_sig, _watched_sig_time
+    global _watched_sig, _watched_sig_time, _watched_sig_failed
+
+    # Basarili cache
     if _watched_sig and (time.time() - _watched_sig_time) < CONFIG["SIG_CACHE_TTL"]:
         return _watched_sig
+
+    # BASARISIZ cache
+    if _watched_sig_failed and (time.time() - _watched_sig_time) < CONFIG["SIG_FAIL_TTL"]:
+        return None
 
     slog("addonSig (app/ping) aliniyor...")
     headers = {"user-agent": "okhttp/4.11.0", "accept": "application/json", "content-type": "application/json; charset=utf-8"}
@@ -185,24 +167,24 @@ def get_watchedsig():
         "iap": {"supported": False},
     }
 
-    # Tum PING_URL'leri dene
     for ping_url in CONFIG["PING_URLS"]:
         try:
-            slog(f"  Deneniyor: {ping_url}")
             resp = requests.post(ping_url, json=data, headers=headers, timeout=15, verify=False)
             result = resp.json()
             sig = result.get("addonSig")
             if sig:
                 _watched_sig = sig
                 _watched_sig_time = time.time()
+                _watched_sig_failed = False
                 slog(f"  addonSig alindi: {ping_url}")
                 return sig
-            else:
-                slog(f"  {ping_url} -> addonSig yok, keys={list(result.keys())[:5]}")
-        except Exception as e:
-            slog(f"  {ping_url} -> HATA: {str(e)[:80]}")
+        except Exception:
+            continue
 
-    slog("addonSig ALINAMADI (tum URL'ler denendi)")
+    _watched_sig = None
+    _watched_sig_failed = True
+    _watched_sig_time = time.time()
+    slog("addonSig ALINAMADI (30dk bekleyecek)")
     return None
 
 
@@ -226,7 +208,6 @@ def resolve_hls_link(link):
         "clientVersion": CONFIG["APP_VERSION"],
     }
 
-    # Tum BASE_URL'leri dene
     for base in CONFIG["BASE_URLS"]:
         try:
             url = f"{base}/mediahubmx-resolve.json"
@@ -235,9 +216,8 @@ def resolve_hls_link(link):
             if result and isinstance(result, list) and len(result) > 0:
                 resolved = result[0].get("url")
                 if resolved:
-                    slog(f"  Resolve OK: {base}")
                     return resolved
-        except Exception as e:
+        except Exception:
             continue
 
     return None
@@ -274,7 +254,6 @@ def resolve_channel(lid):
             return resolved, f"Y1-HLS: {name}"
 
     # Y1.5: URL field + Lokke resolve
-    # Catalog bos olsa bile, live2 URL'sini resolve et
     if url:
         resolved = resolve_hls_link(url)
         if resolved:
@@ -296,13 +275,9 @@ def resolve_channel(lid):
 
 
 # ============================================================
-# 5. CATALOG FETCH (server.py'den cagrilir) - Tum BASE_URL fallback
+# 5. CATALOG FETCH - Tum BASE_URL fallback
 # ============================================================
 def fetch_catalog(sig, group_name):
-    """
-    MediaHubMX catalog'tan HLS linklerini cek.
-    Tum BASE_URL'leri fallback olarak dener.
-    """
     headers = {
         "user-agent": CONFIG["API_USER_AGENT"],
         "accept": "application/json",
@@ -319,7 +294,6 @@ def fetch_catalog(sig, group_name):
     for base in CONFIG["BASE_URLS"]:
         try:
             url = f"{base}/mediahubmx-catalog.json"
-            slog(f"  Catalog deneniyor: {url}")
             resp = requests.post(url, json=data, headers=headers, timeout=20, verify=False)
             catalog_data = resp.json()
             items = catalog_data.get("items", [])
@@ -327,9 +301,11 @@ def fetch_catalog(sig, group_name):
                 slog(f"  Catalog OK: {base} ({len(items)} kayit)")
                 return items
             else:
-                slog(f"  Catalog bos: {base} status={resp.status_code} keys={list(catalog_data.keys())[:5]}")
+                # HATA DETAYI: error mesajini logla
+                err_msg = catalog_data.get("error", "")
+                slog(f"  Catalog 400 ({base}): {err_msg}")
         except Exception as e:
-            slog(f"  Catalog HATA: {base} -> {str(e)[:80]}")
+            slog(f"  Catalog HATA ({base}): {str(e)[:80]}")
 
     return []
 
