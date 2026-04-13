@@ -147,7 +147,7 @@ def remap_groups():
     conn = sqlite3.connect(state.DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM categories")
-    c.execute("UPDATE channels SET cid=0, grp=''")
+    c.execute("UPDATE channels SET cid=0, grp='', sort_order=9999")
     conn.commit()
 
     for idx, gn in enumerate(state.GROUP_ORDER):
@@ -155,13 +155,20 @@ def remap_groups():
     conn.commit()
 
     c.execute("SELECT lid, name FROM channels")
+    channels_list = c.fetchall()
+
+    # Her gruptaki kanal sirasi icin sayac (benzersiz sort_order)
+    group_counters = {}
+
     updated = 0
-    for lid, name in c.fetchall():
+    for lid, name in channels_list:
         assigned = False
         for gi, gn in enumerate(state.GROUP_ORDER):
             for kw in state.GROUP_RULES.get(gn, []):
                 if kw.lower() in name.lower():
-                    c.execute("UPDATE channels SET cid=?,grp=?,sort_order=? WHERE lid=?", (gi+1, gn, gi+1, lid))
+                    group_counters[gn] = group_counters.get(gn, 0) + 1
+                    ch_sort = (gi + 1) * 10000 + group_counters[gn]
+                    c.execute("UPDATE channels SET cid=?,grp=?,sort_order=? WHERE lid=?", (gi+1, gn, ch_sort, lid))
                     updated += 1
                     assigned = True
                     break
@@ -171,7 +178,9 @@ def remap_groups():
             c.execute("SELECT cid FROM categories WHERE name='DE SONSTIGE'")
             row = c.fetchone()
             if row:
-                c.execute("UPDATE channels SET cid=?,grp='DE SONSTIGE',sort_order=9998 WHERE lid=?", (row[0], lid))
+                group_counters["DE SONSTIGE"] = group_counters.get("DE SONSTIGE", 0) + 1
+                ch_sort = 980000 + group_counters["DE SONSTIGE"]
+                c.execute("UPDATE channels SET cid=?,grp='DE SONSTIGE',sort_order=? WHERE lid=?", (row[0], ch_sort, lid))
     conn.commit()
     conn.close()
     state.slog(f"Grup remap: {updated} kanal")
@@ -187,7 +196,7 @@ def startup_sequence():
         state.slog(f"PORT={state.PORT} DB={state.DB_PATH}")
         state.slog(f"BASE_URLS: {state.CONFIG['BASE_URLS']}")
         state.slog(f"PING_URLS: {state.CONFIG['PING_URLS']}")
-        state.slog(f"APP_VERSION: {state.CONFIG['APP_VERSION']} (v3.3.0 - Resolve Cache TTL Fix)")
+        state.slog(f"APP_VERSION: {state.CONFIG['APP_VERSION']} (v3.3.0 - Cache TTL + Group/Channel Mgmt)")
 
         state.slog("[1/5] addonSig (app/ping)...")
         lokke = state.get_watchedsig()

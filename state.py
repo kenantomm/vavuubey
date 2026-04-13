@@ -3,7 +3,7 @@ state.py - Ortak state modulu.
 Token fonksiyonlari ve resolve fonksiyonlari burada.
 server.py ve video.py sadece state import eder, BIRBIRINI IMPORT ETMEZ.
 
-v3.3.0 - Resolve cache TTL fix (1 saat sonrasi stream olumu bug fix)
+v3.4.0 - Catalog/Resolve Validation error fix, clientVersion update
 """
 import os
 import random
@@ -51,7 +51,7 @@ CONFIG = {
     "RESOLVE_TIMEOUT": 15,           # 15 saniye
     "CDN_USER_AGENT": "VAVOO/2.6",
     "API_USER_AGENT": "MediaHubMX/2",
-    "APP_VERSION": "3.3.0",
+    "APP_VERSION": "3.0.2",
 }
 
 # ============================================================
@@ -257,16 +257,29 @@ def resolve_hls_link(link, force_sig=False):
         "clientVersion": CONFIG["APP_VERSION"],
     }
 
+    last_error = ""
     for base in CONFIG["BASE_URLS"]:
         try:
             url = f"{base}/mediahubmx-resolve.json"
             r = requests.post(url, json=data, headers=headers, timeout=CONFIG["RESOLVE_TIMEOUT"], verify=False)
+            if r.status_code != 200:
+                last_error = f"HTTP {r.status_code}"
+                try:
+                    err_body = r.text[:200]
+                    slog(f"  Resolve {r.status_code} ({base}): {err_body}")
+                except Exception:
+                    pass
+                continue
             result = r.json()
             if result and isinstance(result, list) and len(result) > 0:
                 resolved = result[0].get("url")
                 if resolved:
                     return resolved
-        except Exception:
+            elif isinstance(result, dict):
+                last_error = result.get("error", str(result))[:100]
+                slog(f"  Resolve bos ({base}): {last_error}")
+        except Exception as e:
+            last_error = str(e)[:80]
             continue
 
     return None
@@ -336,16 +349,17 @@ def resolve_channel(lid):
     if url:
         # live2/play3 gibi direkt URL'leri resolve etme (calismaz!)
         if "/live2/" in url or "/play3/" in url or "/play/" in url:
-            slog(f"  Y1.5 atlandi (live2 direkt URL): {name}")
-
-        resolved = resolve_hls_link(url)
-        if not resolved:
-            slog(f"  Y1.5 ilk deneme basarisiz, addonSig force-refresh... ({name})")
-            resolved = resolve_hls_link(url, force_sig=True)
-        
-        if resolved:
-            _cache_resolve(lid, resolved, f"Y1.5-URL", name)
-            return resolved, f"Y1.5-URL-Resolve: {name}"
+            # live2 direkt URL - resolve etme, dogrudan Y2'ye gec
+            pass
+        else:
+            resolved = resolve_hls_link(url)
+            if not resolved:
+                slog(f"  Y1.5 ilk deneme basarisiz, addonSig force-refresh... ({name})")
+                resolved = resolve_hls_link(url, force_sig=True)
+            
+            if resolved:
+                _cache_resolve(lid, resolved, f"Y1.5-URL", name)
+                return resolved, f"Y1.5-URL-Resolve: {name}"
 
     # --- Y2: Standart vavoo_auth Token ---
     if url:
@@ -392,7 +406,7 @@ def fetch_catalog(sig, group_name):
     data = {
         "language": "de", "region": "AT",
         "catalogId": "iptv", "id": "iptv",
-        "adult": False, "sort": "name",
+        "adult": False, "search": "", "sort": "name",
         "clientVersion": CONFIG["APP_VERSION"],
         "filter": {"group": group_name},
     }
@@ -401,13 +415,18 @@ def fetch_catalog(sig, group_name):
         try:
             url = f"{base}/mediahubmx-catalog.json"
             resp = requests.post(url, json=data, headers=headers, timeout=20, verify=False)
+            if resp.status_code != 200:
+                try:
+                    slog(f"  Catalog {resp.status_code} ({base}): {resp.text[:200]}")
+                except Exception:
+                    slog(f"  Catalog {resp.status_code} ({base})")
+                continue
             catalog_data = resp.json()
             items = catalog_data.get("items", [])
             if items:
                 slog(f"  Catalog OK: {base} ({len(items)} kayit)")
                 return items
             else:
-                # HATA DETAYI: error mesajini logla
                 err_msg = catalog_data.get("error", "")
                 slog(f"  Catalog 400 ({base}): {err_msg}")
         except Exception as e:
