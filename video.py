@@ -389,6 +389,28 @@ async def debug_channel(ch_id: int):
     except Exception as e:
         result["fetch_error"] = str(e)
 
+    # Also try MediaHubMX resolve with HLS URL
+    if hls:
+        try:
+            add_log(f"[debug {ch_id}] MediaHubMX resolve deneniyor: {hls[:80]}")
+            resolved = await state.resolve_mediahubmx(hls)
+            result["resolve_hls"] = resolved
+            if resolved:
+                add_log(f"[debug {ch_id}] Resolve BASARILI: {resolved[:100]}")
+        except Exception as e:
+            result["resolve_error"] = str(e)
+
+    # Also try resolve with live2 URL
+    if url:
+        try:
+            add_log(f"[debug {ch_id}] MediaHubMX resolve deneniyor (live2): {url[:80]}")
+            resolved2 = await state.resolve_mediahubmx(url)
+            result["resolve_url"] = resolved2
+            if resolved2:
+                add_log(f"[debug {ch_id}] Resolve (live2) BASARILI: {resolved2[:100]}")
+        except Exception as e:
+            result["resolve_url_error"] = str(e)
+
     return JSONResponse(result)
 
 # ===== ADMIN API =====

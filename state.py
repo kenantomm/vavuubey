@@ -249,11 +249,19 @@ async def get_vavoo_token():
     add_log("Vavoo token BASARISIZ - 30dk cooldown aktif")
     return ""
 
-# ===== RESOLVE CHANNEL (Y3-Direct FIRST) =====
+# ===== RESOLVE CHANNEL =====
 async def resolve_channel(ch_id):
     """
     Resolve a channel to a playable stream URL.
-    Priority: Y3-Direct > Y1.5 (URL+Lokke) > Y2 (URL+Vavoo) > Y1 (HLS+Lokke)
+    
+    IMPORTANT: live2/play3 URLs return 404 when fetched directly!
+    They MUST be resolved through MediaHubMX resolve endpoint.
+    
+    Priority:
+    1. Override (manual URL)
+    2. Y1: HLS catalog URL + MediaHubMX resolve (addonSig) - BEST
+    3. Y1.5: live2 URL + MediaHubMX resolve (addonSig)
+    4. Y2: live2 URL + direct proxy (likely 404, last resort)
     """
     ch = get_channel(ch_id)
     if not ch:
@@ -262,39 +270,37 @@ async def resolve_channel(ch_id):
     # Check override first
     ov = get_override(ch_id)
     if ov and ov.get("enabled") and ov.get("url"):
+        add_log(f"[{ch_id}] Override: {ch.get('name','')}")
         return {"success": True, "method": "Override", "url": ov["url"], "channel_id": ch_id}
 
     ch_name = ch.get("name", "")
     url = ch.get("url", "")
     hls = ch.get("hls", "")
 
-    # Y3-Direct: URL field is already a valid .m3u8 stream
-    if url and ".m3u8" in url:
-        add_log(f"[{ch_id}] Y3-Direct: {ch_name}")
-        return {"success": True, "method": f"Y3-Direct: {ch_name}", "url": url, "channel_id": ch_id}
-
-    # Y2.5: URL field exists but not .m3u8 - try direct proxy anyway
-    if url:
-        add_log(f"[{ch_id}] Y3-Direct (non-m3u8): {ch_name}")
-        return {"success": True, "method": f"Y3-Direct: {ch_name}", "url": url, "channel_id": ch_id}
-
-    # Y1.5: Has HLS from catalog, try Lokke resolve
+    # Y1: Resolve HLS catalog URL through MediaHubMX (BEST - has proper stream URLs)
     if hls:
-        sig = await get_watched_sig()
-        if sig:
-            resolved = await resolve_mediahubmx(hls)
-            if resolved:
-                add_log(f"[{ch_id}] Y1.5-Lokke: {ch_name}")
-                return {"success": True, "method": f"Y1.5-Lokke: {ch_name}", "url": resolved, "channel_id": ch_id}
-
-    # Y1: Try HLS + Lokke
-    if hls:
+        add_log(f"[{ch_id}] Y1-Resolve deneniyor (catalog HLS): {ch_name}")
         resolved = await resolve_mediahubmx(hls)
         if resolved:
-            add_log(f"[{ch_id}] Y1-Resolve: {ch_name}")
+            add_log(f"[{ch_id}] Y1-Resolve BASARILI: {ch_name} -> {resolved[:80]}")
             return {"success": True, "method": f"Y1-Resolve: {ch_name}", "url": resolved, "channel_id": ch_id}
+        add_log(f"[{ch_id}] Y1-Resolve basarisiz: {ch_name}")
 
-    return {"success": False, "error": "Resolve edilemedi", "method": "FAILED", "channel_id": ch_id}
+    # Y1.5: Resolve live2 URL through MediaHubMX
+    if url:
+        add_log(f"[{ch_id}] Y1.5-Resolve deneniyor (live2 URL): {ch_name}")
+        resolved = await resolve_mediahubmx(url)
+        if resolved:
+            add_log(f"[{ch_id}] Y1.5-Resolve BASARILI: {ch_name} -> {resolved[:80]}")
+            return {"success": True, "method": f"Y1.5-Resolve: {ch_name}", "url": resolved, "channel_id": ch_id}
+        add_log(f"[{ch_id}] Y1.5-Resolve basarisiz: {ch_name}")
+
+    # Y2: Direct proxy of live2 URL (likely 404 but try anyway)
+    if url:
+        add_log(f"[{ch_id}] Y2-Direct (son care): {ch_name} - muhtemelen calismaz!")
+        return {"success": True, "method": f"Y2-Direct: {ch_name}", "url": url, "channel_id": ch_id}
+
+    return {"success": False, "error": "Resolve edilemedi (HLS yok, URL yok)", "method": "FAILED", "channel_id": ch_id}
 
 # ===== MEDIAHUBMX RESOLVE =====
 async def resolve_mediahubmx(url):
