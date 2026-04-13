@@ -196,7 +196,7 @@ def startup_sequence():
         state.slog(f"PORT={state.PORT} DB={state.DB_PATH}")
         state.slog(f"BASE_URLS: {state.CONFIG['BASE_URLS']}")
         state.slog(f"PING_URLS: {state.CONFIG['PING_URLS']}")
-        state.slog(f"APP_VERSION: {state.CONFIG['APP_VERSION']} (v3.3.0 - Cache TTL + Group/Channel Mgmt)")
+        state.slog(f"APP_VERSION: {state.CONFIG['APP_VERSION']} (v3.5.0 - Catalog Fix + Mobile Admin)")
 
         state.slog("[1/5] addonSig (app/ping)...")
         lokke = state.get_watchedsig()

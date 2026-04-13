@@ -3,7 +3,8 @@ state.py - Ortak state modulu.
 Token fonksiyonlari ve resolve fonksiyonlari burada.
 server.py ve video.py sadece state import eder, BIRBIRINI IMPORT ETMEZ.
 
-v3.4.0 - Catalog/Resolve Validation error fix, clientVersion update
+v3.5.0 - Catalog/Resolve orijinal kod ile birebir eslestirildi
+         Catalog pagination (nextCursor) destegi eklendi
 """
 import os
 import random
@@ -17,38 +18,33 @@ import threading
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ============================================================
-# CONFIG - Tum URL'ler ve ayarlar
+# CONFIG
 # ============================================================
 CONFIG = {
-    # addonSig (MediaHubMX imzasi) almak icin ping endpointleri
     "PING_URLS": [
         "https://www.vavoo.tv/api/app/ping",
         "https://www.lokke.app/api/app/ping",
     ],
-    # API cagrilari icin base URL'ler (fallback sirasiyla)
     "BASE_URLS": [
         "https://vavoo.to",
         "https://kool.to",
         "https://oha.to",
     ],
-    # vavoo_auth token almak icin ping2 endpointleri
     "PING2_URLS": [
         "https://www.vavoo.to/api/box/ping2",
         "https://www.vavoo.tv/api/box/ping2",
         "https://kool.to/api/box/ping2",
         "https://oha.to/api/box/ping2",
     ],
-    # live2 kanal listesi icin URL'ler
     "LIVE2_URLS": [
         "https://www.vavoo.to/live2/index?output=json",
         "https://kool.to/live2/index?output=json",
         "https://oha.to/live2/index?output=json",
     ],
-    # Cache suresi (sn)
-    "SIG_CACHE_TTL": 8 * 60,         # 8 dakika (basarili)
-    "SIG_FAIL_TTL": 3 * 60,          # 3 dakika (basarisiz - HIZLI retry!)
-    "RESOLVE_CACHE_TTL": 45 * 60,    # 45 dakika - CDN URL suresinden once yenile
-    "RESOLVE_TIMEOUT": 15,           # 15 saniye
+    "SIG_CACHE_TTL": 8 * 60,
+    "SIG_FAIL_TTL": 3 * 60,
+    "RESOLVE_CACHE_TTL": 45 * 60,
+    "RESOLVE_TIMEOUT": 15,
     "CDN_USER_AGENT": "VAVOO/2.6",
     "API_USER_AGENT": "MediaHubMX/2",
     "APP_VERSION": "3.0.2",
@@ -66,73 +62,52 @@ DB_PATH = "/tmp/vxparser.db"
 M3U_PATH = "/tmp/playlist.m3u"
 PORT = 10000
 
-# Token cache
 _vavoo_sig = None
 _vavoo_sig_time = 0
-_vavoo_sig_failed = False     # HATA durumunda cache
+_vavoo_sig_failed = False
 _watched_sig = None
 _watched_sig_time = 0
-_watched_sig_failed = False   # HATA durumunda cache
+_watched_sig_failed = False
 
-# ============================================================
-# RESOLVE CACHE (TTL destekli) - 1 saat bug fix
-# ============================================================
-_resolve_cache = {}            # {lid: {"url": str, "time": float, "method": str}}
+# Resolve cache (TTL)
+_resolve_cache = {}
 _resolve_cache_lock = threading.Lock()
 _resolve_stats = {"hits": 0, "misses": 0, "expired": 0, "errors": 0}
 
 
 def get_resolve_cache_info():
-    """Cache durumu hakkinda bilgi dondur."""
     now = time.time()
-    active = 0
-    expired = 0
+    active = expired = 0
     with _resolve_cache_lock:
-        for lid, entry in _resolve_cache.items():
+        for entry in _resolve_cache.values():
             if (now - entry["time"]) < CONFIG["RESOLVE_CACHE_TTL"]:
                 active += 1
             else:
                 expired += 1
-    return {
-        "total_cached": len(_resolve_cache),
-        "active": active,
-        "expired": expired,
-        "ttl_seconds": CONFIG["RESOLVE_CACHE_TTL"],
-        "hits": _resolve_stats["hits"],
-        "misses": _resolve_stats["misses"],
-        "expired_count": _resolve_stats["expired"],
-        "errors": _resolve_stats["errors"],
-    }
+    return {"total": len(_resolve_cache), "active": active, "expired": expired,
+            "hits": _resolve_stats["hits"], "misses": _resolve_stats["misses"]}
 
 
 def clear_resolve_cache():
-    """Tum resolve cache'i temizle."""
     with _resolve_cache_lock:
         _resolve_cache.clear()
-        _resolve_stats["hits"] = 0
-        _resolve_stats["misses"] = 0
-        _resolve_stats["expired"] = 0
-        _resolve_stats["errors"] = 0
+        _resolve_stats["hits"] = _resolve_stats["misses"] = _resolve_stats["expired"] = _resolve_stats["errors"] = 0
 
 
 def slog(msg):
-    timestamp = time.strftime("%H:%M:%S")
-    entry = f"[{timestamp}] {msg}"
+    ts = time.strftime("%H:%M:%S")
+    entry = f"[{ts}] {msg}"
     STARTUP_LOGS.append(entry)
     print(entry)
 
 
 # ============================================================
-# 1. VAVOO TOKEN (ping2) - vavoo_auth icin
+# 1. VAVOO TOKEN (ping2)
 # ============================================================
 def get_auth_signature():
     global _vavoo_sig, _vavoo_sig_time, _vavoo_sig_failed
-
-    # Basarili cache
     if _vavoo_sig and (time.time() - _vavoo_sig_time) < CONFIG["SIG_CACHE_TTL"]:
         return _vavoo_sig
-
-    # BASARISIZ cache - 3 dk boyunca tekrar deneme
     if _vavoo_sig_failed and (time.time() - _vavoo_sig_time) < CONFIG["SIG_FAIL_TTL"]:
         return None
 
@@ -142,12 +117,11 @@ def get_auth_signature():
         vec_req = requests.get("http://mastaaa1987.github.io/repo/veclist.json", headers=headers, timeout=10, verify=False)
         veclist = vec_req.json()["value"]
         slog(f"veclist: {len(veclist)} vec")
-
         sig = None
         for ping_url in CONFIG["PING2_URLS"]:
             if sig:
                 break
-            for i in range(3):
+            for _ in range(3):
                 vec = {"vec": random.choice(veclist)}
                 try:
                     req = requests.post(ping_url, data=vec, headers=headers, timeout=10, verify=False).json()
@@ -157,8 +131,6 @@ def get_auth_signature():
                         break
                 except Exception:
                     continue
-
-        # Cache sonucu
         _vavoo_sig_time = time.time()
         if sig:
             _vavoo_sig = sig
@@ -178,24 +150,17 @@ def get_auth_signature():
 
 
 # ============================================================
-# 2. ADDONSIG (app/ping) - MediaHubMX imzasi icin
+# 2. ADDONSIG (app/ping)
 # ============================================================
 def get_watchedsig(force=False):
-    """
-    addonSig al. force=True olursa cache'i atla ve her zaman yeni al.
-    """
     global _watched_sig, _watched_sig_time, _watched_sig_failed
-
-    # Basarili cache (force ile atla)
     if not force and _watched_sig and (time.time() - _watched_sig_time) < CONFIG["SIG_CACHE_TTL"]:
         return _watched_sig
-
-    # BASARISIZ cache (force ile atla)
     if not force and _watched_sig_failed and (time.time() - _watched_sig_time) < CONFIG["SIG_FAIL_TTL"]:
         return None
 
     tag = " (FORCE)" if force else ""
-    slog(f"addonSig (app/ping) aliniyor{tag}...")
+    slog(f"addonSig aliniyor{tag}...")
     headers = {"user-agent": "okhttp/4.11.0", "accept": "application/json", "content-type": "application/json; charset=utf-8"}
     data = {
         "token": "", "reason": "boot", "locale": "de", "theme": "dark",
@@ -214,7 +179,6 @@ def get_watchedsig(force=False):
         "proxy": {"supported": ["ss"], "engine": "cu", "enabled": False, "autoServer": True, "id": 0},
         "iap": {"supported": False},
     }
-
     for ping_url in CONFIG["PING_URLS"]:
         try:
             resp = requests.post(ping_url, json=data, headers=headers, timeout=15, verify=False)
@@ -228,7 +192,6 @@ def get_watchedsig(force=False):
                 return sig
         except Exception:
             continue
-
     _watched_sig = None
     _watched_sig_failed = True
     _watched_sig_time = time.time()
@@ -237,88 +200,53 @@ def get_watchedsig(force=False):
 
 
 # ============================================================
-# 3. HLS RESOLVE (mediahubmx) - Tum BASE_URL fallback
+# 3. HLS RESOLVE (mediahubmx-resolve.json)
+# Orijinal kod ile BIREBIR ayni istek formati
 # ============================================================
 def resolve_hls_link(link, force_sig=False):
-    """HLS linkini cozen fonksiyon. force_sig=True olursa addonSig'i yenile."""
     sig = get_watchedsig(force=force_sig)
     if not sig:
         return None
 
+    # Orijinal kodun headers'i - BIREBIR ayni
     headers = {
-        "user-agent": CONFIG["API_USER_AGENT"],
+        "user-agent": "MediaHubMX/2",
         "accept": "application/json",
         "content-type": "application/json; charset=utf-8",
+        "accept-encoding": "gzip",
         "mediahubmx-signature": sig,
     }
-    data = {
-        "language": "de", "region": "AT",
-        "url": link,
-        "clientVersion": CONFIG["APP_VERSION"],
-    }
+    data = {"language": "de", "region": "AT", "url": link, "clientVersion": CONFIG["APP_VERSION"]}
 
-    last_error = ""
     for base in CONFIG["BASE_URLS"]:
         try:
             url = f"{base}/mediahubmx-resolve.json"
-            r = requests.post(url, json=data, headers=headers, timeout=CONFIG["RESOLVE_TIMEOUT"], verify=False)
-            if r.status_code != 200:
-                last_error = f"HTTP {r.status_code}"
-                try:
-                    err_body = r.text[:200]
-                    slog(f"  Resolve {r.status_code} ({base}): {err_body}")
-                except Exception:
-                    pass
-                continue
+            # Orijinal: data=json.dumps(_data) KULLANIYOR, json= DEGIL
+            r = requests.post(url, data=json.dumps(data), headers=headers, timeout=CONFIG["RESOLVE_TIMEOUT"], verify=False)
             result = r.json()
             if result and isinstance(result, list) and len(result) > 0:
                 resolved = result[0].get("url")
                 if resolved:
                     return resolved
-            elif isinstance(result, dict):
-                last_error = result.get("error", str(result))[:100]
-                slog(f"  Resolve bos ({base}): {last_error}")
-        except Exception as e:
-            last_error = str(e)[:80]
+        except Exception:
             continue
-
     return None
 
 
 # ============================================================
-# 4. CHANNEL RESOLVE (Cache + TTL) - video.py'den cagrilir
+# 4. CHANNEL RESOLVE (Cache + TTL)
 # ============================================================
 def resolve_channel(lid):
-    """
-    Kanal ID'sine gore stream URL'ini coz.
-    
-    RESOLVE CACHE MEKANIZMASI (v3.3.0):
-    - Basarili resolve'ler 45 dakika cache'lenir
-    - Cache suresi dolunca otomatik yeniden resolve
-    - Cache miss/expired durumunda Y1 -> Y1.5 -> Y2 -> Y3 sirasiyla denenir
-    - Y1/Y1.5 basarisiz olursa addonSig 1 kez force-refresh edilip tekrar denenir
-    - Basarisiz sonuclar cache'lenmez (her istekte tekrar denenir)
-    
-    Y1:   HLS field + Lokke resolve (catalog'tan gelen) - EN IYI
-    Y1.5: URL field + Lokke resolve
-    Y2:   URL + vavoo_auth token
-    Y3:   Direkt URL (son care - genelde calismaz)
-    """
-    # --- CACHE CHECK ---
     now = time.time()
-    cached = None
     with _resolve_cache_lock:
         if lid in _resolve_cache:
             entry = _resolve_cache[lid]
-            age = now - entry["time"]
-            if age < CONFIG["RESOLVE_CACHE_TTL"]:
+            if (now - entry["time"]) < CONFIG["RESOLVE_CACHE_TTL"]:
                 _resolve_stats["hits"] += 1
-                return entry["url"], f"CACHE ({entry['method']}): {entry['name']} [{int(age)}s]"
+                return entry["url"], f"CACHE ({entry['method']}): {entry['name']}"
             else:
                 _resolve_stats["expired"] += 1
-                cached = entry  # Eski cache var ama suresi doldu
 
-    # --- DB'DEN KANAL BILGISI CEK ---
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
@@ -326,123 +254,127 @@ def resolve_channel(lid):
     ch = c.fetchone()
     conn.close()
     if not ch:
-        _resolve_stats["misses"] += 1
-        return None, "Kanal bulunamadi (DB'de yok)"
+        return None, "Kanal bulunamadi"
 
     name = ch["name"]
     url = ch["url"]
     hls = ch["hls"]
 
-    # --- Y1: HLS field + Lokke resolve (catalog'tan gelen) ---
+    # Y1: HLS field + resolve
     if hls:
         resolved = resolve_hls_link(hls)
         if not resolved:
-            # ILK DENEME BASARISIZ -> addonSig'i force-refresh et ve TEKRAR DENE
-            slog(f"  Y1 ilk deneme basarisiz, addonSig force-refresh... ({name})")
             resolved = resolve_hls_link(hls, force_sig=True)
-        
         if resolved:
-            _cache_resolve(lid, resolved, f"Y1-HLS", name)
+            _cache_resolve(lid, resolved, "Y1-HLS", name)
             return resolved, f"Y1-HLS: {name}"
 
-    # --- Y1.5: URL field + Lokke resolve ---
+    # Y1.5: URL field + resolve
     if url:
-        # live2/play3 gibi direkt URL'leri resolve etme (calismaz!)
-        if "/live2/" in url or "/play3/" in url or "/play/" in url:
-            # live2 direkt URL - resolve etme, dogrudan Y2'ye gec
-            pass
-        else:
-            resolved = resolve_hls_link(url)
-            if not resolved:
-                slog(f"  Y1.5 ilk deneme basarisiz, addonSig force-refresh... ({name})")
-                resolved = resolve_hls_link(url, force_sig=True)
-            
-            if resolved:
-                _cache_resolve(lid, resolved, f"Y1.5-URL", name)
-                return resolved, f"Y1.5-URL-Resolve: {name}"
+        resolved = resolve_hls_link(url)
+        if not resolved:
+            resolved = resolve_hls_link(url, force_sig=True)
+        if resolved:
+            _cache_resolve(lid, resolved, "Y1.5-URL", name)
+            return resolved, f"Y1.5-URL: {name}"
 
-    # --- Y2: Standart vavoo_auth Token ---
+    # Y2: vavoo_auth
     if url:
         sig = get_auth_signature()
         if sig:
             sep = "&" if "?" in url else "?"
             final = url + sep + "n=1&b=5&vavoo_auth=" + sig
-            _cache_resolve(lid, final, f"Y2-Auth", name)
+            _cache_resolve(lid, final, "Y2-Auth", name)
             return final, f"Y2-Auth: {name}"
 
-    # --- Y3: Direkt URL (son care) ---
+    # Y3: Direct
     if url:
         _resolve_stats["errors"] += 1
         return url, f"Y3-Direct: {name}"
 
-    _resolve_stats["misses"] += 1
-    return None, f"URL yok: {name}"
+    return None, "URL yok"
 
 
 def _cache_resolve(lid, url, method, name):
-    """Basarili resolve sonucunu cache'le."""
     with _resolve_cache_lock:
-        _resolve_cache[lid] = {
-            "url": url,
-            "method": method,
-            "name": name,
-            "time": time.time(),
-        }
-        # Cache'i temiz tut (max 5000 kayit)
+        _resolve_cache[lid] = {"url": url, "method": method, "name": name, "time": time.time()}
         if len(_resolve_cache) > 5000:
-            oldest_lid = min(_resolve_cache, key=lambda k: _resolve_cache[k]["time"])
-            del _resolve_cache[oldest_lid]
+            oldest = min(_resolve_cache, key=lambda k: _resolve_cache[k]["time"])
+            del _resolve_cache[oldest]
 
 
 # ============================================================
-# 5. CATALOG FETCH - Tum BASE_URL fallback
+# 5. CATALOG FETCH (mediahubmx-catalog.json)
+# Orijinal kod ile BIREBIR ayni istek formati + PAGINATION
 # ============================================================
 def fetch_catalog(sig, group_name):
     headers = {
-        "user-agent": CONFIG["API_USER_AGENT"],
+        "accept-encoding": "gzip",
+        "user-agent": "MediaHubMX/2",
         "accept": "application/json",
+        "content-type": "application/json; charset=utf-8",
         "mediahubmx-signature": sig,
     }
+    # Orijinal: cursor=0 (integer), search="" (string)
     data = {
         "language": "de", "region": "AT",
         "catalogId": "iptv", "id": "iptv",
         "adult": False, "search": "", "sort": "name",
-        "clientVersion": CONFIG["APP_VERSION"],
         "filter": {"group": group_name},
+        "cursor": 0,
+        "clientVersion": CONFIG["APP_VERSION"],
     }
 
+    all_items = []
+
     for base in CONFIG["BASE_URLS"]:
+        if all_items:
+            break
         try:
             url = f"{base}/mediahubmx-catalog.json"
-            resp = requests.post(url, json=data, headers=headers, timeout=20, verify=False)
+            # Orijinal: data=json.dumps(_data) KULLANIYOR
+            resp = requests.post(url, data=json.dumps(data), headers=headers, timeout=20, verify=False)
             if resp.status_code != 200:
-                try:
-                    slog(f"  Catalog {resp.status_code} ({base}): {resp.text[:200]}")
-                except Exception:
-                    slog(f"  Catalog {resp.status_code} ({base})")
+                slog(f"  Catalog {resp.status_code} ({base}): {resp.text[:150]}")
                 continue
             catalog_data = resp.json()
             items = catalog_data.get("items", [])
             if items:
+                all_items.extend(items)
                 slog(f"  Catalog OK: {base} ({len(items)} kayit)")
-                return items
+                # PAGINATION: nextCursor varsa devam et
+                next_cursor = catalog_data.get("nextCursor")
+                page = 1
+                while next_cursor:
+                    page += 1
+                    data["cursor"] = next_cursor
+                    try:
+                        resp2 = requests.post(url, data=json.dumps(data), headers=headers, timeout=20, verify=False)
+                        cd2 = resp2.json()
+                        items2 = cd2.get("items", [])
+                        if items2:
+                            all_items.extend(items2)
+                            slog(f"  Catalog sayfa {page}: +{len(items2)} kayit")
+                        next_cursor = cd2.get("nextCursor")
+                    except Exception as e:
+                        slog(f"  Catalog sayfa {page} HATA: {str(e)[:60]}")
+                        break
+                break
             else:
                 err_msg = catalog_data.get("error", "")
-                slog(f"  Catalog 400 ({base}): {err_msg}")
+                slog(f"  Catalog bos ({base}): {err_msg}")
         except Exception as e:
             slog(f"  Catalog HATA ({base}): {str(e)[:80]}")
 
-    return []
+    return all_items
 
 
 # ============================================================
 # 6. EPG DATA (XMLTV)
 # ============================================================
 def get_epg_data():
-    import sqlite3
     from datetime import datetime, timedelta
     import xml.etree.ElementTree as ET
-
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
@@ -450,31 +382,19 @@ def get_epg_data():
         c.execute("SELECT lid, name, grp FROM channels ORDER BY lid")
         channels = c.fetchall()
         conn.close()
-
         tv = ET.Element("tv")
         tv.set("generator-info-name", "VxParser")
-        tv.set("source-info-url", CONFIG["BASE_URLS"][0])
-
         now = datetime.utcnow()
-
         for ch in channels:
-            lid = ch["lid"]
-            name = ch["name"]
-
             ch_el = ET.SubElement(tv, "channel")
-            ch_el.set("id", str(lid))
-            display = ET.SubElement(ch_el, "display-name")
-            display.text = name
-
+            ch_el.set("id", str(ch["lid"]))
+            ET.SubElement(ch_el, "display-name").text = ch["name"]
             prog = ET.SubElement(tv, "programme")
             prog.set("start", now.strftime("%Y%m%d%H%M%S") + " +0000")
             prog.set("stop", (now + timedelta(hours=6)).strftime("%Y%m%d%H%M%S") + " +0000")
-            prog.set("channel", str(lid))
-            title = ET.SubElement(prog, "title")
-            title.text = name
-            desc = ET.SubElement(prog, "desc")
-            desc.text = f"{name} - Live"
-
+            prog.set("channel", str(ch["lid"]))
+            ET.SubElement(prog, "title").text = ch["name"]
+            ET.SubElement(prog, "desc").text = f"{ch['name']} - Live"
         return ET.tostring(tv, encoding="unicode", xml_declaration=True)
     except Exception as e:
         slog(f"EPG HATASI: {e}")
