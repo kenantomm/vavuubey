@@ -12,3 +12,5 @@ services:
         value: "10000"
       - key: DB_PATH
         value: "/tmp/vxparser.db"
+      - key: PYTHONUNBUFFERED
+        value: "1"
