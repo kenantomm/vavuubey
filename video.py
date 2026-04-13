@@ -1,14 +1,14 @@
 """
-video.py - FastAPI uygulama v9.0.0
+video.py - FastAPI uygulama v10.0.0
 Profesyonel mobil admin panel, grup/kanal yonetimi
-v9.0: mvGrp isim conflict FIX, mobil touch iyilestirme
+v10.0: Resolve chain detayli log, Direct HLS destek
 """
 import os, sqlite3, threading, re
 from fastapi import FastAPI, Request, Query, HTTPException
 from fastapi.responses import PlainTextResponse, RedirectResponse, Response
 import state
 
-app = FastAPI(title="VxParser IPTV Proxy", version="9.0.0")
+app = FastAPI(title="VxParser IPTV Proxy", version="10.0.0")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASS", "admin123")
 ORD = "COALESCE(cat.sort_order,9999), c.sort_order, c.name"
 
@@ -63,8 +63,9 @@ async def test_ch(sid: str):
     ch = cu.fetchone(); c.close()
     if not ch: return {"error": f"Kanal {sid} yok"}
     url, method = state.resolve_channel(sid)
+    hls_direct = state.check_direct_hls(ch["hls"]) if ch["hls"] else False
     return {"lid": ch["lid"], "name": ch["name"], "url": ch["url"], "hls": ch["hls"],
-            "grp": ch["grp"], "resolve_method": method, "resolved_url": url}
+            "grp": ch["grp"], "hls_direct": hls_direct, "resolve_method": method, "resolved_url": url}
 
 @app.get("/channel/{sid}")
 async def play_ch(sid: str):
@@ -396,7 +397,7 @@ html{scroll-behavior:smooth}
 
 <!-- APP -->
 <div id="app" style="display:none">
-  <div class="topbar"><h1>VxParser</h1><span class="ver">v3.6</span></div>
+  <div class="topbar"><h1>VxParser</h1><span class="ver">v4.0</span></div>
 
   <div class="content">
     <!-- DASHBOARD -->
