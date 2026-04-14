@@ -3,9 +3,6 @@ server.py - VxParser Render entry point
 Kanallari ceker, DB olusturur, grup remap yapar.
 video.py'yi IMPORT ETMEZ - circular import onlemek icin.
 Hem server hem video state.py'yi kullanir.
-
-v3.7.0 - Catalog URL format diagnostics
-         Y0-Direct HLS resolve fallback
 """
 import os
 import re
@@ -107,24 +104,7 @@ def fetch_vavoo_channels():
 
 
 # ============================================================
-# NAME NORMALIZATION - Catalog/Live2 isim eslestirme
-# Orijinal kod ile ayni normalization: HD/FHD/UHD/HEVC vs kaldirma
-# ============================================================
-def normalize_ch_name(name):
-    """Kanal ismini normalize et - catalog ve live2 eslestirme icin"""
-    n = name or ""
-    n = re.sub(r'[^\x00-\x7F]+', '', n)  # non-ASCII kaldir
-    n = re.sub(r'\s+(HD|FHD|UHD|HEVC|H\.265|H265|4K|SD|RAW|HDR|DOLBY|AT|AUSTRIA|GERMANY|DEUTSCHLAND|DE|1080|720|S-ANHALT|SACHSEN|MATCH TIME)\b', '', n, flags=re.IGNORECASE)
-    n = re.sub(r'\s*[\[\(][^\]\)]*[\]\)]\s*', ' ', n)  # [backup], (BACKUP) vs
-    n = re.sub(r'\s*\+\s*', ' ', n)  # + kaldir
-    n = re.sub(r'\s+(\\(BACKUP\\)|BACKUP)', '', n, flags=re.IGNORECASE)
-    n = re.sub(r'\s+', ' ', n).strip()
-    return n.lower()
-
-
-# ============================================================
 # HLS LINKLERI CEK (catalog) - Tum BASE_URL fallback
-# v3.7: Catalog URL format diagnostics
 # ============================================================
 def fetch_hls_links():
     state.slog("HLS linkleri cekiliyor...")
@@ -133,98 +113,30 @@ def fetch_hls_links():
         state.slog("addonSig yok, HLS atlanacak")
         return False
 
+    updated = 0
     import sqlite3
-    total_updated = 0
 
-    # GRUP ISIMLERI: Live2'den gelen EXACT isimler
-    # Referans kod: group == "Germany" (Deutschland DEGIL!)
-    catalog_groups = ["Turkey", "Germany"]
-
-    for group_name in catalog_groups:
+    for group_name in ["Turkey", "Deutschland"]:
         state.slog(f"  {group_name} catalog cekiliyor...")
         items = state.fetch_catalog(sig, group_name)
 
-        if not items:
-            state.slog(f"  {group_name}: catalog BOS")
-            continue
+        if items:
+            conn = sqlite3.connect(state.DB_PATH)
+            c = conn.cursor()
+            for item in items:
+                hls_url = item.get("url", "")
+                name_clean = re.sub(r"[^\x00-\x7F]+", "", item.get("name", ""))
+                if hls_url and name_clean:
+                    c.execute("UPDATE channels SET hls=? WHERE name=?", (hls_url, name_clean))
+                    updated += 1
+            conn.commit()
+            conn.close()
+            state.slog(f"  {group_name}: {len(items)} HLS link guncellendi")
+        else:
+            state.slog(f"  {group_name}: catalog BOS (HLS link alinamadi)")
 
-        state.slog(f"  {group_name}: {len(items)} catalog kayit")
-
-        conn = sqlite3.connect(state.DB_PATH)
-        c = conn.cursor()
-
-        # 1. Adim: Catalog isimlerini normalize edip map olustur
-        catalog_name_map = {}
-        catalog_url_map = {}
-        url_samples = []  # URL format diagnostics
-        for item in items:
-            hls_url = item.get("url", "")
-            raw_name = item.get("name", "")
-            norm_name = normalize_ch_name(raw_name)
-            if hls_url and norm_name and len(norm_name) >= 2:
-                # Ayni normalize isimde birden fazla varsa, ilkini kullan
-                if norm_name not in catalog_name_map:
-                    catalog_name_map[norm_name] = hls_url
-                # URL tabanli matching icin: URL son kismini kaydet
-                u = re.sub(r'.*/', '', hls_url)
-                if len(u) > 14:
-                    uid = u[:len(u)-12]
-                    if uid not in catalog_url_map:
-                        catalog_url_map[uid] = hls_url
-                # Collect URL samples for diagnostics
-                if len(url_samples) < 3:
-                    url_samples.append(hls_url[:100])
-
-        state.slog(f"  {group_name}: {len(catalog_name_map)} normalize isim, {len(catalog_url_map)} URL uid hazir")
-
-        # Log URL format samples (diagnostics)
-        if url_samples:
-            state.slog(f"  {group_name}: URL ornekleri:")
-            for s in url_samples:
-                state.slog(f"    {s}")
-
-        # 2. Adim: Tum kanallari normalize edip eslestir
-        c.execute("SELECT lid, name, url FROM channels")
-        channels = c.fetchall()
-        matched_by_name = 0
-        matched_by_url = 0
-
-        for lid, ch_name, ch_url in channels:
-            ch_norm = normalize_ch_name(ch_name)
-            hls_url = None
-
-            # A) Exact name match (normalized)
-            if ch_norm and ch_norm in catalog_name_map:
-                hls_url = catalog_name_map[ch_norm]
-                matched_by_name += 1
-
-            # B) URL tabanli match (referans kod ile ayni yontem)
-            if not hls_url and ch_url:
-                u = re.sub(r'.*/', '', ch_url)
-                if len(u) > 14:
-                    uid = u[:len(u)-12]
-                    if uid and uid in catalog_url_map:
-                        hls_url = catalog_url_map[uid]
-                        matched_by_url += 1
-
-            # C) Partial name match (catalog isim kanal isminde varsa)
-            if not hls_url and ch_norm and len(ch_norm) >= 4:
-                for cat_norm, cat_url in catalog_name_map.items():
-                    if len(cat_norm) >= 4 and (cat_norm in ch_norm or ch_norm in cat_norm):
-                        hls_url = cat_url
-                        matched_by_name += 1
-                        break
-
-            if hls_url:
-                c.execute("UPDATE channels SET hls=? WHERE lid=?", (hls_url, lid))
-                total_updated += 1
-
-        conn.commit()
-        conn.close()
-        state.slog(f"  {group_name}: isim={matched_by_name} url={matched_by_url} toplam={matched_by_name+matched_by_url} eslesti")
-
-    state.slog(f"HLS toplam: {total_updated} kanal guncellendi")
-    return total_updated > 0
+    state.slog(f"HLS toplam: {updated} link guncellendi")
+    return updated > 0
 
 
 # ============================================================
@@ -284,7 +196,7 @@ def startup_sequence():
         state.slog(f"PORT={state.PORT} DB={state.DB_PATH}")
         state.slog(f"BASE_URLS: {state.CONFIG['BASE_URLS']}")
         state.slog(f"PING_URLS: {state.CONFIG['PING_URLS']}")
-        state.slog(f"APP_VERSION: {state.CONFIG['APP_VERSION']} (v3.7.0 - Direct HLS Fallback)")
+        state.slog(f"APP_VERSION: {state.CONFIG['APP_VERSION']} (v3.5.0 - Catalog Fix + Mobile Admin)")
 
         state.slog("[1/5] addonSig (app/ping)...")
         lokke = state.get_watchedsig()
