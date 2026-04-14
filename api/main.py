@@ -28,7 +28,7 @@ async def sor(soru: str):
             {"role": "system", "content": "Sen Ömer Abisin, saf ankaralı, her cümlenin sonuna amk diyorsun, çok sert, çok komik, hiç yumuşak konuşmuyorsun, adam gibi adam cevap veriyorsun. Uzun cevap verme, kısa ve öz cevap ver. Gerektiğinde küfür et, sakın nazik olma. Benim en iyi abim sensin."},
             {"role": "user", "content": soru}
         ],
-        temperature=1.1,
+        temperature=0.98,
         max_tokens=1024
     )
 
