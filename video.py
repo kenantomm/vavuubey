@@ -3,9 +3,9 @@ video.py - FastAPI uygulama v10.0.0
 Profesyonel mobil admin panel, grup/kanal yonetimi
 v10.0: Resolve chain detayli log, Direct HLS destek
 """
-import os, sqlite3, threading, re
+import os, sqlite3, threading, re, sys
 from fastapi import FastAPI, Request, Query, HTTPException
-from fastapi.responses import PlainTextResponse, RedirectResponse, Response
+from fastapi.responses import PlainTextResponse, RedirectResponse, Response, HTMLResponse
 import state
 
 app = FastAPI(title="VxParser IPTV Proxy", version="10.0.0")
@@ -24,10 +24,63 @@ def get_host(r: Request) -> str:
 
 # ============ STATUS ============
 @app.get("/")
-async def root():
-    return {"status": "ready" if state.DATA_READY else "loading", "error": state.STARTUP_ERROR,
-            "load_time": round(state.LOAD_TIME,1) if state.DATA_READY else None,
-            "message": "Hazir!" if state.DATA_READY else "Yukleniyor..."}
+async def root(request: Request):
+    c = get_db(); cu = c.cursor()
+    cu.execute("SELECT COUNT(*) FROM channels"); total = cu.fetchone()[0]
+    cu.execute("SELECT COUNT(*) FROM categories"); cats = cu.fetchone()[0]
+    cu.execute("SELECT COUNT(*) FROM channels WHERE hls!='' AND hls IS NOT NULL"); hls = cu.fetchone()[0]
+    c.close()
+
+    status = "OK" if state.DATA_READY else "LOADING"
+    pct = (hls*100//total) if total else 0
+    error = state.STARTUP_ERROR or "None"
+    logs = "\n".join([f"• {line}" for line in state.STARTUP_LOGS[-15:]])
+
+    html = f"""<!DOCTYPE html>
+<html lang="tr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VxParser Admin</title>
+<style>*{{margin:0;padding:0;box-sizing:border-box}}body{{font-family:system-ui;background:#0f172a;color:#e2e8f0;overflow-x:hidden}}
+.header{{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:30px 20px;text-align:center}}
+.header h1{{font-size:32px;margin-bottom:10px}}.status{{display:inline-block;padding:8px 16px;background:{'#10b981' if state.DATA_READY else '#f59e0b'};border-radius:20px;font-size:14px;font-weight:600;margin-top:10px}}
+.container{{max-width:1200px;margin:20px auto;padding:0 20px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin-bottom:30px}}
+.card{{background:#1e293b;padding:20px;border-radius:8px;border-left:4px solid #667eea}}.card h3{{font-size:13px;color:#94a3b8;margin-bottom:10px;text-transform:uppercase}}
+.card .num{{font-size:36px;font-weight:bold;color:#f1f5f9}}.card .sub{{font-size:12px;color:#64748b;margin-top:5px}}.section{{margin-bottom:30px}}
+.section h2{{font-size:20px;margin-bottom:15px;color:#f1f5f9;border-bottom:2px solid #667eea;padding-bottom:10px}}
+.buttons{{display:flex;gap:10px;flex-wrap:wrap}}.btn{{padding:10px 20px;background:#667eea;color:white;border:none;border-radius:6px;cursor:pointer;font-weight:500;transition:background 0.3s}}
+.btn:hover{{background:#764ba2}}.btn.danger{{background:#ef4444}}.btn.danger:hover{{background:#dc2626}}
+.info-box{{background:#1e293b;padding:15px;border-radius:6px;border:1px solid #334155;font-family:monospace;font-size:13px;line-height:1.6}}
+.success{{color:#10b981}}.error{{color:#ef4444}}.warn{{color:#f59e0b}}.logs{{background:#0f172a;padding:10px;border-radius:6px;border:1px solid #334155;max-height:250px;overflow-y:auto;font-size:12px;line-height:1.4;color:#94a3b8}}</style>
+</head><body>
+<div class="header"><h1>VxParser IPTV</h1><div class="status">{status}</div></div>
+<div class="container">
+<div class="grid">
+<div class="card"><h3>Toplam Kanallar</h3><div class="num">{total}</div></div>
+<div class="card"><h3>Kategoriler</h3><div class="num">{cats}</div></div>
+<div class="card"><h3>HLS Eşleme</h3><div class="num">{pct}%</div><div class="sub">{hls}/{total}</div></div>
+<div class="card"><h3>Yükleme</h3><div class="num">{round(state.LOAD_TIME,1)}s</div></div>
+</div>
+
+<div class="section"><h2>Kontroller</h2><div class="buttons">
+<button class="btn" onclick="reload()">🔄 Yenile</button>
+<button class="btn" onclick="clearCache()">🗑️ Cache</button>
+<button class="btn danger" onclick="exit()">❌ Çıkış</button>
+</div></div>
+
+<div class="section"><h2>Durum</h2><div class="info-box">
+<p><strong>Vavoo Token:</strong> <span class="{'success' if state._vavoo_sig else 'error'}">{'✓ Aktif' if state._vavoo_sig else '✗ Yok'}</span></p>
+<p><strong>Lokke Token:</strong> <span class="{'success' if state._watched_sig else 'error'}">{'✓ Aktif' if state._watched_sig else '✗ Yok'}</span></p>
+<p><strong>Hata:</strong> <span class="{'error' if error != 'None' else 'success'}">{error}</span></p>
+<p><strong>Cache:</strong> {len(state._resolve_cache)} entry</p>
+</div></div>
+
+<div class="section"><h2>Son Loglar</h2><div class="logs">{logs or '<span class="warn">Log yok</span>'}</div></div>
+</div>
+
+<script>function reload(){{fetch('/reload').then(r=>r.json()).then(()=>setTimeout(()=>location.reload(),1500))}}
+function clearCache(){{fetch('/clear-cache').then(r=>r.json()).then(()=>alert('Cache temizlendi'))}}
+function exit(){{if(confirm('Çıkış yaptığınızda sunucu durur. Emin misiniz?'))location.href='/shutdown'}}</script>
+</body></html>"""
+    return HTMLResponse(content=html)
 
 @app.get("/health")
 async def health(): return {"status": "ok"}
@@ -213,8 +266,15 @@ async def adm_resolve(sid:str):
     return {"channel_id":sid,"resolve_method":method,"resolved_url":url,"success":bool(url),"resolve_cache":state.get_resolve_cache_info()}
 
 @app.post("/api/admin/cache/clear")
+@app.get("/clear-cache")
 async def adm_cache():
     state.clear_resolve_cache(); return {"ok":True}
+
+@app.get("/shutdown")
+async def shutdown():
+    import sys
+    threading.Thread(target=lambda: (os.system("exit 0") if os.name != 'nt' else os.system("taskkill /F /PID " + str(os.getpid()))), daemon=True).start()
+    return {"ok": True, "message": "Shutting down..."}
 
 # ============ ADMIN AUTH ============
 @app.post("/api/admin/login")
