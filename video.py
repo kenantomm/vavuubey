@@ -1,3 +1,4 @@
+"""
 video.py - FastAPI uygulama v10.0.0
 Profesyonel mobil admin panel, grup/kanal yonetimi
 v10.0: Resolve chain detayli log, Direct HLS destek
