@@ -1,4 +1,4 @@
-app = "omerabi-api"
+app = "omerabi-api"  # senin app adın
 
 [http_service]
   internal_port = 8080
