@@ -3,8 +3,9 @@ state.py - Ortak state modulu.
 Token fonksiyonlari ve resolve fonksiyonlari burada.
 server.py ve video.py sadece state import eder, BIRBIRINI IMPORT ETMEZ.
 
-v3.5.0 - Catalog/Resolve orijinal kod ile birebir eslestirildi
-         Catalog pagination (nextCursor) destegi eklendi
+v3.7.0 - Y0-Direct HLS fallback (resolve 404 fix)
+         addonSig FORCE rate limiting (30s cooldown)
+         Resolve diagnostics logging
 """
 import os
 import random
@@ -73,6 +74,10 @@ _watched_sig_failed = False
 _resolve_cache = {}
 _resolve_cache_lock = threading.Lock()
 _resolve_stats = {"hits": 0, "misses": 0, "expired": 0, "errors": 0}
+
+# addonSig FORCE rate limiting
+_last_force_sig_time = 0
+FORCE_SIG_MIN_INTERVAL = 30  # minimum 30 seconds between FORCE refreshes
 
 
 def get_resolve_cache_info():
@@ -150,10 +155,22 @@ def get_auth_signature():
 
 
 # ============================================================
-# 2. ADDONSIG (app/ping)
+# 2. ADDONSIG (app/ping) - RATE LIMITED FORCE
 # ============================================================
 def get_watchedsig(force=False):
-    global _watched_sig, _watched_sig_time, _watched_sig_failed
+    global _watched_sig, _watched_sig_time, _watched_sig_failed, _last_force_sig_time
+
+    # Rate limit FORCE calls - max 1 per FORCE_SIG_MIN_INTERVAL seconds
+    if force:
+        now = time.time()
+        elapsed = now - _last_force_sig_time
+        if elapsed < FORCE_SIG_MIN_INTERVAL:
+            # Return cached sig (even if expired) to prevent spam
+            if _watched_sig:
+                return _watched_sig
+            return None
+        _last_force_sig_time = now
+
     if not force and _watched_sig and (time.time() - _watched_sig_time) < CONFIG["SIG_CACHE_TTL"]:
         return _watched_sig
     if not force and _watched_sig_failed and (time.time() - _watched_sig_time) < CONFIG["SIG_FAIL_TTL"]:
@@ -206,6 +223,7 @@ def get_watchedsig(force=False):
 def resolve_hls_link(link, force_sig=False):
     sig = get_watchedsig(force=force_sig)
     if not sig:
+        slog("  Resolve: addonSig yok")
         return None
 
     # Orijinal kodun headers'i - BIREBIR ayni
@@ -218,24 +236,41 @@ def resolve_hls_link(link, force_sig=False):
     }
     data = {"language": "de", "region": "AT", "url": link, "clientVersion": CONFIG["APP_VERSION"]}
 
+    last_error = ""
     for base in CONFIG["BASE_URLS"]:
         try:
             url = f"{base}/mediahubmx-resolve.json"
             # Orijinal: data=json.dumps(_data) KULLANIYOR, json= DEGIL
             r = requests.post(url, data=json.dumps(data), headers=headers, timeout=CONFIG["RESOLVE_TIMEOUT"], verify=False)
+            if r.status_code != 200:
+                last_error = f"{r.status_code}: {r.text[:100]}"
+                continue
             result = r.json()
             if result and isinstance(result, list) and len(result) > 0:
                 resolved = result[0].get("url")
                 if resolved:
                     return resolved
-        except Exception:
+            elif isinstance(result, dict):
+                last_error = result.get("error", "empty dict")
+            else:
+                last_error = f"unexpected: {str(result)[:80]}"
+        except Exception as e:
+            last_error = str(e)[:100]
             continue
+    # Only log once per resolve attempt (not for every domain)
+    if last_error and not force_sig:
+        slog(f"  Resolve HATA: {last_error[:120]}")
     return None
 
 
 # ============================================================
 # 4. CHANNEL RESOLVE (Cache + TTL)
+# v3.7: Y0-Direct HLS fallback (bypass broken resolve endpoint)
+#      Y1 resolve -> Y0 direct (not cached) -> Y2 auth -> Y3 resolve -> Y4 direct
 # ============================================================
+_resolve_direct_tried = set()  # Track channels that already tried Y0-Direct
+
+
 def resolve_channel(lid):
     now = time.time()
     with _resolve_cache_lock:
@@ -260,7 +295,7 @@ def resolve_channel(lid):
     url = ch["url"]
     hls = ch["hls"]
 
-    # Y1: HLS field + resolve
+    # Y1: HLS field (catalog) + MediaHubMX resolve (cached)
     if hls:
         resolved = resolve_hls_link(hls)
         if not resolved:
@@ -269,16 +304,13 @@ def resolve_channel(lid):
             _cache_resolve(lid, resolved, "Y1-HLS", name)
             return resolved, f"Y1-HLS: {name}"
 
-    # Y1.5: URL field + resolve
-    if url:
-        resolved = resolve_hls_link(url)
-        if not resolved:
-            resolved = resolve_hls_link(url, force_sig=True)
-        if resolved:
-            _cache_resolve(lid, resolved, "Y1.5-URL", name)
-            return resolved, f"Y1.5-URL: {name}"
+    # Y0: Direct HLS from catalog (NOT cached - fallback for broken resolve)
+    # If resolve endpoint is down, try the catalog URL directly
+    if hls and hls.startswith("http"):
+        # Don't log every direct attempt - too noisy
+        return hls, f"Y0-Direct: {name}"
 
-    # Y2: vavoo_auth
+    # Y2: vavoo_auth (live2 URL + token) (cached)
     if url:
         sig = get_auth_signature()
         if sig:
@@ -287,12 +319,21 @@ def resolve_channel(lid):
             _cache_resolve(lid, final, "Y2-Auth", name)
             return final, f"Y2-Auth: {name}"
 
-    # Y3: Direct
+    # Y3: MediaHubMX resolve with live2 URL (cached)
+    if url:
+        resolved = resolve_hls_link(url)
+        if not resolved:
+            resolved = resolve_hls_link(url, force_sig=True)
+        if resolved:
+            _cache_resolve(lid, resolved, "Y3-Resolve", name)
+            return resolved, f"Y3-Resolve: {name}"
+
+    # Y4: Direct URL (NOT cached - last resort)
     if url:
         _resolve_stats["errors"] += 1
-        return url, f"Y3-Direct: {name}"
+        return url, f"Y4-Direct: {name}"
 
-    return None, "URL yok"
+    return None, "URL/HLS yok"
 
 
 def _cache_resolve(lid, url, method, name):
