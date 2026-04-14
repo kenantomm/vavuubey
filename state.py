@@ -32,10 +32,7 @@ CONFIG = {
         "https://oha.to",
     ],
     "PING2_URLS": [
-        "https://www.vavoo.to/api/box/ping2",
         "https://www.vavoo.tv/api/box/ping2",
-        "https://kool.to/api/box/ping2",
-        "https://oha.to/api/box/ping2",
     ],
     "LIVE2_URLS": [
         "https://www.vavoo.to/live2/index?output=json",
@@ -117,21 +114,23 @@ def get_auth_signature():
         return None
 
     slog("Vavoo Token (ping2) aliniyor...")
-    headers = {"User-Agent": CONFIG["CDN_USER_AGENT"], "Accept": "application/json"}
+    headers = {"User-Agent": CONFIG["CDN_USER_AGENT"], "Accept": "application/json", "Content-Type": "application/json"}
     try:
         vec_req = requests.get("http://mastaaa1987.github.io/repo/veclist.json", headers=headers, timeout=10, verify=False)
         veclist = vec_req.json()["value"]
-        slog(f"veclist: {len(veclist)} vec")
+        slog(f"  veclist: {len(veclist)} vec")
         sig = None
         for ping_url in CONFIG["PING2_URLS"]:
             if sig:
                 break
-            for _ in range(3):
+            for _ in range(5):
                 vec = {"vec": random.choice(veclist)}
                 try:
-                    req = requests.post(ping_url, data=vec, headers=headers, timeout=10, verify=False).json()
-                    if req.get("signed"):
-                        sig = req["signed"]
+                    req = requests.post(ping_url, json=vec, headers=headers, timeout=10, verify=False).json()
+                    # Response: {"response": {"signed": "eyJ...", ...}}
+                    signed = req.get("response", {}).get("signed") or req.get("signed")
+                    if signed:
+                        sig = signed
                         slog(f"  Token alindi: {ping_url}")
                         break
                 except Exception:
